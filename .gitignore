@@ -1,0 +1,19 @@
+# 编译与环境文件
+build/
+cmake-*/
+__pycache__/
+venv/
+.ipynb_checkpoints/
+
+# 测试结果与大文件
+results/
+charts/
+*.dat
+*.json
+ycsb*.pdf
+ycsb*.png
+
+# 忽略所有以 ycsb- 开头的文件夹（解压后的工具包）
+benchmark/ycsb-*/
+# 忽略 YCSB 的压缩包
+benchmark/*.tar.gz
