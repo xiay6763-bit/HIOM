@@ -30,8 +30,7 @@ static constexpr char PREFILL_FILE[] = "/ycsb_prefill.dat";
             ->Iterations(1) \
             ->Unit(BM_TIME_UNIT) \
             ->UseRealTime() \
-            ->ThreadRange(1, NUM_MAX_THREADS) \
-//            ->ThreadRange(1, 18) \
+            ->Threads(1)->Threads(4)->Threads(8)->Threads(16)->Threads(24)->Threads(32)->Threads(36)
 
 #define DEFINE_BM(fixture, workload, data) \
             BENCHMARK_TEMPLATE2_DEFINE_F(fixture, workload ## _tp, KeyType8, ValueType200)(benchmark::State& state) { \
