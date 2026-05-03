@@ -54,6 +54,41 @@ class HotTier {
         bool valid{false};
     };
 
+    // 2-bit per-slot state machine (M4 Phase A). Each BucketMeta::state
+    // field packs 16 slots × 2 bits into a 32-bit atomic word.
+    //
+    //   kUnpinned (00) — slot is durable in ColdTier (or empty);
+    //                    SIEVE may evict.
+    //   kPinned   (01) — upsert_pinned set this; commit-buffer holds
+    //                    the corresponding entry, flusher hasn't
+    //                    touched yet. SIEVE skips.
+    //   kInFlush  (11) — flusher CAS'd ownership and is performing
+    //                    the cold-tier write. SIEVE skips.
+    //   reserved  (10) — unused.
+    //
+    // Transitions are the only correctness gate: write-path enters the
+    // slot at kPinned (upsert_pinned), flusher transitions kPinned →
+    // kInFlush via CAS to take ownership, then kInFlush → kUnpinned
+    // after the cold-tier write is durable. Failed CAS is silently
+    // skipped — entry's fp64+offset are authoritative for the cold
+    // write either way; the slot may have been overwritten by a same-
+    // fp update or evicted, in which case "leave its state alone" is
+    // the correct behaviour.
+    enum class SlotState : std::uint8_t {
+        kUnpinned = 0b00,
+        kPinned   = 0b01,
+        kInFlush  = 0b11,
+    };
+
+    // CAS state[ref] from `from` to `to`. Returns true on success.
+    // Used by HiOM's flusher to drive the PINNED → IN_FLUSH → UNPINNED
+    // transitions; failure means another writer reset the slot or it
+    // was evicted, and the caller should leave the state alone.
+    bool cas_slot_state(SlotRef ref, SlotState from, SlotState to) {
+        if (!ref.valid) return false;
+        return cas_state(meta_[ref.bucket_idx], ref.slot_idx, from, to);
+    }
+
     // num_buckets must be a power of two and at least 1.
     // Total slot capacity = num_buckets × kSlotsPerBucket.
     explicit HotTier(std::size_t num_buckets_pow2)
@@ -174,7 +209,7 @@ class HotTier {
                             std::memory_order_acq_rel,
                             std::memory_order_acquire)) {
                         set_visited(m, i);
-                        set_pinned(m, i);
+                        force_pinned(m, i);
                         return SlotRef{bidx,
                                        static_cast<std::uint8_t>(i), true};
                     }
@@ -206,7 +241,7 @@ class HotTier {
                     std::memory_order_acquire)) {
                 size_.fetch_add(1, std::memory_order_relaxed);
                 clear_visited(m, target_idx);
-                set_pinned(m, target_idx);
+                force_pinned(m, target_idx);
                 return SlotRef{bidx,
                                static_cast<std::uint8_t>(target_idx), true};
             }
@@ -216,15 +251,16 @@ class HotTier {
         return SlotRef{};
     }
 
-    // Clear the PINNED bit for the slot referenced by ref. Caller is
-    // expected to have obtained ref from upsert_pinned and to call
-    // unpin only once the corresponding cold-tier write is durable.
-    // Idempotent (clearing an already-clear bit is a no-op).
+    // Force the slot's state back to kUnpinned, regardless of current
+    // state. Most call sites prefer the surgical
+    // cas_slot_state(kInFlush, kUnpinned) — this method is for the
+    // destructor / shutdown path where we want unconditional release
+    // even if a transient race left the slot stuck.
     void unpin(SlotRef ref) {
         if (!ref.valid) return;
         assert(ref.bucket_idx < num_buckets_);
         assert(ref.slot_idx < kSlotsPerBucket);
-        clear_pinned(meta_[ref.bucket_idx], ref.slot_idx);
+        force_unpinned(meta_[ref.bucket_idx], ref.slot_idx);
     }
 
     // Sets visited bit on hit. NOT const because of the side effect.
@@ -313,16 +349,14 @@ class HotTier {
     // visited: bit i = 1 iff slot i has been hit/updated since last
     //   eviction sweep cleared it.
     // hand: SIEVE hand pointer in [0, 16); next sweep starts here.
-    // pinned: bit i = 1 iff slot i is PINNED — flusher hasn't yet
-    //   committed the entry to the cold tier, so SIEVE eviction must
-    //   skip it. Cleared by HotTier::unpin once the cold-tier write
-    //   is durable. (M3 Phase B.)
+    // state: M4 Phase A. 16 × 2-bit per-slot state machine packed into
+    //   one 32-bit atomic word; encoding above (SlotState). Replaces
+    //   the M3 1-bit `pinned` flag.
     struct alignas(8) BucketMeta {
         std::atomic<std::uint16_t> visited{0};
-        std::atomic<std::uint8_t> hand{0};
-        std::uint8_t pad0{0};
-        std::atomic<std::uint16_t> pinned{0};
-        std::uint16_t pad1{0};
+        std::atomic<std::uint8_t>  hand{0};
+        std::uint8_t               pad0{0};
+        std::atomic<std::uint32_t> state{0};
     };
     static_assert(sizeof(BucketMeta) == 8, "BucketMeta must be 8 bytes");
 
@@ -362,8 +396,8 @@ class HotTier {
         std::uint8_t hand = m.hand.load(std::memory_order_relaxed);
         for (std::size_t k = 0; k < 2 * kSlotsPerBucket; ++k) {
             const std::size_t i = (hand + k) % kSlotsPerBucket;
-            const std::uint16_t pin = m.pinned.load(std::memory_order_relaxed);
-            if (((pin >> i) & 1) != 0) continue;  // PINNED slot
+            // Skip any non-kUnpinned slot (PINNED or IN_FLUSH).
+            if (get_state(m, i) != SlotState::kUnpinned) continue;
             const std::uint16_t vis = m.visited.load(std::memory_order_relaxed);
             const bool visited_bit = ((vis >> i) & 1) != 0;
             if (visited_bit) {
@@ -413,17 +447,68 @@ class HotTier {
                             std::memory_order_relaxed);
     }
 
-    static void set_pinned(BucketMeta& m, std::size_t slot_idx) {
-        const std::uint16_t bit
-            = static_cast<std::uint16_t>(std::uint16_t(1) << slot_idx);
-        m.pinned.fetch_or(bit, std::memory_order_relaxed);
+    // -- M4 Phase A state machine helpers ------------------------------
+    //
+    // state[i] occupies bits (2*i) and (2*i+1) of BucketMeta::state.
+    // Encoding: see SlotState above.
+
+    static SlotState get_state(const BucketMeta& m, std::size_t i) {
+        const std::uint32_t st = m.state.load(std::memory_order_acquire);
+        return static_cast<SlotState>((st >> (2 * i)) & 0b11u);
     }
-    static void clear_pinned(BucketMeta& m, std::size_t slot_idx) {
-        const std::uint16_t bit
-            = static_cast<std::uint16_t>(std::uint16_t(1) << slot_idx);
-        m.pinned.fetch_and(static_cast<std::uint16_t>(~bit),
-                           std::memory_order_relaxed);
+
+    // CAS state[i] from `from` to `to`. Returns true on success.
+    // Loops on benign CAS failure (state changed in another bit-pair);
+    // returns false iff state[i] != from when we last looked.
+    static bool cas_state(BucketMeta& m, std::size_t i,
+                          SlotState from, SlotState to) {
+        const std::uint32_t shift = static_cast<std::uint32_t>(2 * i);
+        const std::uint32_t mask = static_cast<std::uint32_t>(0b11u) << shift;
+        const std::uint32_t from_bits
+            = (static_cast<std::uint32_t>(from) & 0b11u) << shift;
+        const std::uint32_t to_bits
+            = (static_cast<std::uint32_t>(to) & 0b11u) << shift;
+        std::uint32_t cur = m.state.load(std::memory_order_acquire);
+        while ((cur & mask) == from_bits) {
+            const std::uint32_t desired = (cur & ~mask) | to_bits;
+            if (m.state.compare_exchange_weak(
+                    cur, desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+            // CAS failure can be spurious or due to a race on a
+            // different bit-pair; loop continues with the refreshed
+            // `cur`. We only return false if state[i] != from.
+        }
+        return false;
     }
+
+    // Force state[i] to kPinned. Used by upsert_pinned, where the
+    // slot was just claimed via CAS on slot.packed; concurrent races
+    // (rare: same-fp updates while flusher holds IN_FLUSH) can leave
+    // residual kInFlush bits which we clobber here. Implemented as
+    // fetch_or + fetch_and on the bit-pair: transient kInFlush is
+    // observable but harmless because flusher's CAS(kInFlush,
+    // kUnpinned) just no-ops.
+    static void force_pinned(BucketMeta& m, std::size_t i) {
+        const std::uint32_t shift = static_cast<std::uint32_t>(2 * i);
+        const std::uint32_t pin_bit  = std::uint32_t{0b01} << shift;
+        const std::uint32_t flush_bit = std::uint32_t{0b10} << shift;
+        m.state.fetch_or(pin_bit, std::memory_order_release);
+        m.state.fetch_and(~flush_bit, std::memory_order_release);
+    }
+
+    // Force state[i] to kUnpinned (clear both bits). Used by
+    // HotTier::unpin when the caller wants unconditional release;
+    // distinct from cas_state(kInFlush, kUnpinned) which fails if
+    // state changed under us.
+    static void force_unpinned(BucketMeta& m, std::size_t i) {
+        const std::uint32_t shift = static_cast<std::uint32_t>(2 * i);
+        const std::uint32_t mask = std::uint32_t{0b11} << shift;
+        m.state.fetch_and(~mask, std::memory_order_release);
+    }
+    // ------------------------------------------------------------------
 
     static std::uint64_t pack(std::uint32_t fp, std::uint32_t off) {
         return (static_cast<std::uint64_t>(fp) << 32)

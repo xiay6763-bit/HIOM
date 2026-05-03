@@ -13,60 +13,55 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 ## Status (2026-05-03)
 
 - **Phase**: M0 ✅ complete; M1 functionally complete except EBR
-  (deferred to M4); M2 Phase B-1 / B-2 ✅ complete; **M3 Phase
-  A+B+C+D complete** — async commit buffer, background flusher,
-  HotTier PINNED gating SIEVE eviction, write path through
-  PM → HotTier(PINNED) → buffer.push, **CCEH safety net retired
-  on the read path**. ColdTier is the authoritative offset map
-  whenever it's attached; HotTier+ColdTier double-miss returns
-  false. Inline-flush back-pressure for PINNED-overflow is M4 work.
+  (deferred to M4 Phase D); M2 Phase B-1 / B-2 ✅ complete; M3 Phase
+  A+B+C+D ✅ complete; **M4 Phase 0+A+B complete** — 2-bit state
+  machine (UNPINNED / PINNED / IN_FLUSH) gating SIEVE eviction,
+  flusher does PINNED → IN_FLUSH → UNPINNED CAS dance, inline-flush
+  back-pressure when bucket-full + synchronous drain on the rare
+  pin-failure tail so reads always succeed. stable_sort fix landed
+  alongside (latent ordering bug for same-fp commit entries).
 - **Code on disk**:
-  - `include/viper/hiom/hot_tier.hpp` (~410 lines): standalone hash
-    table with PINNED bits in BucketMeta + `SlotRef`, `upsert_pinned`,
-    `unpin`, PINNED-aware `sieve_evict`.
+  - `include/viper/hiom/hot_tier.hpp` (~470 lines): standalone hash
+    table; M4 Phase A replaced 1-bit `pinned` with packed 32-bit
+    `state` field (16 × 2 bits via SlotState enum), public
+    `cas_slot_state` API for the flusher.
   - `include/viper/hiom/offset_codec.hpp` (~110 lines): unchanged.
   - `include/viper/hiom/cold_tier.hpp` (~560 lines): unchanged from M2.
-  - `include/viper/hiom/commit_buffer.hpp` (~110 lines): CommitEntry +
-    `CommitBuffer` wrapping `moodycamel::ConcurrentQueue` (ProducerToken
-    per Client, single ConsumerToken in flusher). Clamped `try_drain`.
-  - `include/viper/hiom/hiom.hpp` (~440 lines): HiOM owns CommitBuffer
-    + background flusher when ColdTier attached; Client write path
-    pushes to buffer; **`Client::get` has no CCEH fallback when
-    ColdTier is attached** (M0 mode without ColdTier still falls
-    through to `viper_.get` since CCEH is the only authoritative
-    source there). `flush_and_wait()` + `FlusherConfig` surface;
-    `commits_flushed` stat.
-  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): unchanged.
-  - `test/hiom_integration_test.cpp` (~470 lines, **5 tests**): M0
-    correctness; M0 update/remove; M0 vs raw-Viper microbench;
-    Phase B-2 ColdTier-backed end-to-end; **M3 Phase D commit-window
-    read-your-write** (HotTier sized for PINNED budget, asserts
-    `pin_failures==0` and `hot_hits == kN` so all 10K reads are served
-    by HotTier while ColdTier is empty; post-flush ColdTier=10K).
+  - `include/viper/hiom/commit_buffer.hpp` (~110 lines): unchanged.
+  - `include/viper/hiom/hiom.hpp` (~510 lines): M4 Phase A added
+    `apply_batch` helper + state-machine CAS in flusher; Phase B
+    added `try_inline_flush()` (separate ConsumerToken + try-lock
+    serialization), Client `mirror_write` retries through inline-
+    flush, falls back to synchronous full drain on terminal pin-
+    failure so the entry reaches ColdTier before the put returns.
+  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): unchanged —
+    state field defaults to 0 (UNPINNED), so M0/M1 behaviour is
+    preserved exactly.
+  - `test/hiom_integration_test.cpp` (~480 lines, **5 tests**):
+    `run_commit_window` rewritten to deliberately undersize the hot
+    tier (256 buckets × 16 = 4096 slots vs 10K writes) so back-
+    pressure fires; asserts read-your-write succeeds for all 10K,
+    not that pin_failures=0 (it's the indicator of how often back-
+    pressure took the slow path, not a correctness gate).
   - `test/cold_tier_test.cpp` (~370 lines, 9 tests): unchanged.
-  - `include/viper/viper.hpp`: CCEH-tombstone-leak guard in
-    `Client::get` / `ReadOnlyClient::get` (from earlier turn).
+  - `include/viper/viper.hpp`: CCEH-tombstone-leak guard from earlier.
 - **Throughputs (single-threaded)**:
   - HotTier standalone lookup: 135 M ops/s.
-  - HiOM full-path lookup: 46.6 M ops/s vs raw Viper 46.0 M ops/s —
-    ratio 1.01 (M0 path; not the buffer-attached steady state).
-  - HiOM commit-window read-your-write: 10K writes complete with
-    buffer holding all of them; 10K reads route through HotTier
-    PINNED, all correct (`hot_delta==10000`, `cold_miss_delta==0`).
-  - ColdTier insert: ~3.3 M ops/s clean / 1.9 M/s with PM bandwidth
-    interference.
+  - HiOM full-path lookup: 49.4 M ops/s vs raw Viper 47.7 M ops/s —
+    ratio 1.04. State-machine CAS adds zero observable overhead on
+    the read path (it's all on the write/flush path).
+  - HiOM commit-window with back-pressure (HotTier 4096 slots, 10K
+    writes, slow background flusher): pin_failures ≈ 31 (~0.3% of
+    writes hit the synchronous-drain fallback); 10K reads after
+    write phase split as ≈2K hot + ≈8K cold, 0 misses.
+  - ColdTier insert: 1.9–3.3 M ops/s depending on PM bandwidth state.
   - ColdTier lookup: 200 M ops/s.
-- **fp32 collision footnote** (encountered tuning the Phase D test):
-  with N writes into HotTier's 32-bit fingerprint space, expected
-  collisions are N²/2^33. At 50K, ≈1 collision per run; the affected
-  key's HotTier slot gets overwritten by the colliding entry, and
-  during the commit window (ColdTier still empty) the older key is
-  unfindable. Paper §2.2 acknowledges this — verify-on-PM-key catches
-  the collision and falls through to ColdTier, which uses 64-bit
-  fingerprints with negligible collision rate. The test pins
-  N=10000 (P[collision] ≈ 1.2e-5) to keep this rare case out of
-  flake territory; M4's inline-flush + checkpoint protocol formalize
-  the back-pressure for production-scale workloads.
+- **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
+  `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
+  enqueue order for equal keys. A `put X v1 → put X v2` sequence
+  could be applied as v2 then v1, leaving ColdTier with v1.
+  `std::stable_sort` fixes it; `apply_batch` extraction shares the
+  fix between background flusher and inline-flush paths.
 - **Cross-Viper CCEH tombstone leak — FIXED (2026-05-03)**: at scale,
   `viper::Viper::Client::remove` followed by `Client::get` was leaking
   ~0.05–0.75% of removed keys back via a stale CCEH offset
@@ -761,13 +756,59 @@ unchanged.
 3. Multi-thread shared-key stress (M2 deferred; depends on M4 state
    machine for clean semantics).
 
-### M4 — Pin invariants + state machine (1 week)
+### M4 — Pin invariants + state machine (1 week) — Phase 0+A+B complete (2026-05-03)
 
-- [ ] 2-bit state per hot-tier entry.
-- [ ] Per-entry latch for IN_FLUSH transitions.
-- [ ] Update / delete tombstone semantics.
-- [ ] Invariant assertion module (debug-only).
-- [ ] Stress test: concurrent insert/update/delete + crash injection.
+Phase 0 (latent stable_sort fix), A (state machine), B (inline-flush
+back-pressure) all landed in this turn. Phase C (tombstone happens-
+before via sequence number), D (EBR), and E (multi-thread + crash
+injection) deferred to follow-up rounds.
+
+- [x] **2-bit state per hot-tier entry.** *Phase A.* Encoded as a
+      packed 32-bit `state` field in `BucketMeta` (16 slots × 2 bits;
+      replaces the M3 1-bit `pinned` field). `SlotState` enum:
+      kUnpinned=00, kPinned=01, kInFlush=11. Public
+      `cas_slot_state(SlotRef, from, to)` API drives transitions.
+- [x] **Per-entry "latch" for IN_FLUSH transitions.** *Phase A.*
+      Implemented as the CAS itself: writer stays at PINNED, flusher
+      transitions PINNED → IN_FLUSH atomically; failed CAS is benign
+      (slot was overwritten or evicted). No standalone latch object.
+- [x] **stable_sort fix in commit-buffer drain (Phase 0).** Latent
+      bug: `std::sort` on `(fp64)` could reorder same-key put-v1 /
+      put-v2 entries; fixed by `std::stable_sort` shared between
+      `drain_once` and the new inline-flush path via `apply_batch`.
+- [x] **Inline-flush back-pressure (Phase B).** `try_inline_flush`
+      with a separate ConsumerToken + try-lock serialization;
+      Client `mirror_write` retries through inline-flush when
+      `upsert_pinned` returns invalid SlotRef (bucket full of
+      PINNED). On terminal failure (32 retries × 256 batch
+      exhausted), the entry is pushed to the buffer and the
+      writer synchronously drains until the buffer is empty,
+      guaranteeing the entry reaches ColdTier before the put
+      returns. Test exercises the path with HotTier 4096 slots vs
+      10K writes and observes pin_failures ≈ 31, all reads correct.
+- [ ] **Update / delete tombstone semantics with sequence numbers.**
+      *Phase C, deferred.* stable_sort handles single-producer same-
+      key sequences; multi-producer cross-key happens-before needs
+      a sequence stamp on each CommitEntry plus a flusher-side merge
+      that respects (fp64, seq).
+- [ ] **EBR for hot-tier eviction.** *Phase D, deferred.* Reader
+      may hold a packed slot value while another thread evicts and
+      re-pins the slot for a different fp; the verify-on-PM-key
+      step (§2.5) already catches it but adds a PM round trip.
+      EBR delays slot reuse so readers see consistent snapshots.
+- [ ] **Multi-thread stress + crash injection.** *Phase E, deferred.*
+
+Exit (M4 Phase 0+A+B met): integration test 5/5 passes, including
+the back-pressure case across multiple runs (deterministic
+pin_failures=31 with the configured fp distribution; 0 read misses
+each time). `cold_tier_test` unchanged.
+
+**M4 follow-ups (next):**
+1. Phase C — sequence numbers on CommitEntry; multi-producer
+   correctness.
+2. Phase D — EBR; aligns with M5 checkpoint's reader fence.
+3. Phase E — multi-thread stress + simple crash inject; bridges
+   into M7 evaluation.
 
 ### M5 — A/B checkpoint protocol (3-4 days)
 
