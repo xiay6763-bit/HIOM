@@ -1016,12 +1016,23 @@ void Viper<K, V>::remove_client(Viper::Client* client) {
 
 template <typename K, typename V>
 inline bool Viper<K, V>::check_key_equality(const K& key, const KVOffset offset_to_compare) {
-    if constexpr (!using_fp) {
-        throw std::runtime_error("Should not use key checker without fingerprints!");
-    }
-
     if (offset_to_compare.is_tombstone()) {
         return false;
+    }
+
+    // Reject offsets pointing at slots whose free-bit is set. CCEH can
+    // leak stale entries via Segment::Insert's tombstone path (when a
+    // tombstone-insert claims an earlier-freed INVALID slot in the
+    // probe window before reaching the actual key, leaving the original
+    // entry intact); without this check, viper_.get on a removed key
+    // can resurrect the freed PM slot's value. The bitset is the
+    // ground-truth occupancy marker (set by invalidate_record on
+    // remove). String/var-size pages use a different occupancy scheme
+    // (var_entry.is_set), so this guard is fixed-size only.
+    if constexpr (!std::is_same_v<K, std::string>) {
+        const auto [block, page, slot] = offset_to_compare.get_offsets();
+        const auto& v_page = this->v_blocks_[block]->v_pages[page];
+        if (v_page.free_slots[slot]) return false;
     }
 
     const ReadOnlyClient client = get_read_only_client();
@@ -1205,13 +1216,23 @@ bool Viper<K, V>::Client::put(const K& key, const V& value) {
 template <typename K, typename V>
 bool Viper<K, V>::Client::get(const K& key, V* value) {
     auto key_check_fn = [&](auto key, auto offset) {
-        if constexpr (using_fp) { return this->viper_.check_key_equality(key, offset); }
-        else { return cceh::CCEH<K>::dummy_key_check(key, offset); }
+        return this->viper_.check_key_equality(key, offset);
     };
 
     while (true) {
         KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
         if (kv_offset.is_tombstone()) {
+            return false;
+        }
+        // Reject CCEH-leaked stale offsets that point at a freed PM
+        // slot. CCEH's tombstone-insert (Segment::Insert in cceh.hpp)
+        // can claim an earlier-freed INVALID slot in the probe window
+        // before reaching the actual key, leaving the original entry
+        // intact; for ≤8B keys, CCEH's Segment::Get returns that stale
+        // offset directly (key_check_fn is not consulted for !using_fp_).
+        // check_key_equality enforces both the bitset free-bit and a
+        // full key compare against the slot's PM contents.
+        if (!this->viper_.check_key_equality(key, kv_offset)) {
             return false;
         }
         if (get_value_from_offset(kv_offset, value)) {
@@ -1229,13 +1250,16 @@ bool Viper<K, V>::Client::get(const K& key, V* value) {
 template <typename K, typename V>
 bool Viper<K, V>::ReadOnlyClient::get(const K& key, V* value) const {
     auto key_check_fn = [&](auto key, auto offset) {
-        if constexpr (using_fp) { return this->viper_.check_key_equality(key, offset); }
-        else { return cceh::CCEH<K>::dummy_key_check(key, offset); }
+        return this->viper_.check_key_equality(key, offset);
     };
 
     while (true) {
         KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
         if (kv_offset.is_tombstone()) {
+            return false;
+        }
+        // Same CCEH-leak guard as Client::get above.
+        if (!this->viper_.check_key_equality(key, kv_offset)) {
             return false;
         }
         if (get_const_value_from_offset(kv_offset, value)) {
@@ -1271,8 +1295,7 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
     }
 
     auto key_check_fn = [&](auto key, auto offset) {
-        if constexpr (using_fp) { return this->viper_.check_key_equality(key, offset); }
-        else { return cceh::CCEH<K>::dummy_key_check(key, offset); }
+        return this->viper_.check_key_equality(key, offset);
     };
 
     while (true) {
@@ -1301,8 +1324,7 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
 template <typename K, typename V>
 bool Viper<K, V>::Client::remove(const K& key) {
     auto key_check_fn = [&](auto key, auto offset) {
-        if constexpr (using_fp) { return this->viper_.check_key_equality(key, offset); }
-        else { return cceh::CCEH<K>::dummy_key_check(key, offset); }
+        return this->viper_.check_key_equality(key, offset);
     };
 
     const KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
@@ -1323,8 +1345,7 @@ void Viper<K, V>::Client::free_occupied_slot(const KVOffset offset_to_delete, co
     }
 
     auto key_check_fn = [&](auto key, auto offset) {
-        if constexpr (using_fp) { return this->viper_.check_key_equality(key, offset); }
-        else { return cceh::CCEH<K>::dummy_key_check(key, offset); }
+        return this->viper_.check_key_equality(key, offset);
     };
 
     if (v_block_number_ == block_number && v_page_number_ == page_number) {
@@ -1592,8 +1613,7 @@ template <typename K, typename V>
 inline typename Viper<K, V>::KVOffset
 Viper<K, V>::Client::hiom_peek_offset(const K& key) {
     auto key_check_fn = [&](auto k, auto offset) {
-        if constexpr (using_fp) { return this->viper_.check_key_equality(k, offset); }
-        else { return cceh::CCEH<K>::dummy_key_check(k, offset); }
+        return this->viper_.check_key_equality(k, offset);
     };
     return this->viper_.map_.Get(key, key_check_fn);
 }

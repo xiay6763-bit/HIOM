@@ -52,15 +52,28 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   - ColdTier lookup: 200 M ops/s (no PM verify since this is a pure
     index lookup; decode handled at the caller).
   - ColdTier parallel_load: 500K entries scanned in 22 ms with 32 threads.
-- **Known cross-Viper issue surfaced during Phase B-2**: at 200K-key
-  scale, `viper::Viper::Client::remove` followed by `Client::get` leaks
-  ~0.04% of keys back through CCEH (CCEH segment-split during heavy
-  insert+remove appears to lose the tombstone). This is a Viper-side
-  bug pre-dating HiOM; ColdTier itself tombstones every removed key
-  correctly. `test/hiom_integration_test.cpp:run_cold_backed` validates
-  ColdTier state directly to sidestep the leak; revisit before M3
-  retires CCEH (otherwise reads of recently-removed keys could resurrect
-  via ColdTier-miss → no-fallback).
+- **Cross-Viper CCEH tombstone leak — FIXED (2026-05-03)**: at scale,
+  `viper::Viper::Client::remove` followed by `Client::get` was leaking
+  ~0.05–0.75% of removed keys back via a stale CCEH offset
+  (rate grows superlinearly: 50K→0.05%, 200K→0.27%, 500K→0.75%). Root
+  cause is in `cceh::Segment::Insert` (cceh.hpp:371-419): when
+  Viper's remove path inserts a tombstone, the loop tries to claim
+  the first INVALID slot it sees in the probe window before checking
+  for the actual key. If an earlier-tombstoned slot in the same
+  window became INVALID between the original Insert and the
+  tombstone Insert, the tombstone "succeeds" by claiming that
+  earlier slot without invalidating the real entry. CCEH's
+  `Segment::Get` for ≤8B keys (`!using_fp_` path) does not call
+  `key_check_fn` and returns the stale offset directly. Fix is in
+  `viper.hpp` rather than CCEH (smaller surface, M3 will retire CCEH
+  anyway): `check_key_equality` now also checks the VPage
+  `free_slots` bitset (ground-truth occupancy marker), and
+  `Client::get` / `ReadOnlyClient::get` invoke it as a guard
+  immediately after the CCEH lookup. Verified via standalone
+  reproducer: 50K/200K/500K all show 0 resurrected keys after fix.
+  Throughput cost: raw Viper get drops from 48.8 M/s to 47.5 M/s
+  (~2.8%, one extra PM 8B key load + compare per get; same cache
+  line as the value, so cost is essentially the compare itself).
 - **Prior work**: An earlier write-back DRAM cache prototype (`viper_x.hpp`
   + `dram_tier.hpp`) was deleted from the tree on 2026-05-02. Its design —
   full `(K,V)` caching with epoch consistency — is orthogonal to HiOM's
@@ -681,8 +694,9 @@ intentional setup on shared `/pmem0`).
    via per-chain lock. Lifts to M3 alongside commit-buffer batching.
 2. Real 100M-entry parallel-load run on PM, verifying ≤ 5 s exit.
 3. CCEH removal — replace the M2 safety-net fallback with a proper
-   ColdTier authoritativeness contract. M3 work, blocks on the
-   pre-existing Viper CCEH-tombstone-leak fix (see Status note above).
+   ColdTier authoritativeness contract. M3 work; the underlying
+   CCEH tombstone leak that previously blocked this is now fixed in
+   `viper.hpp` (see Status note). Removing CCEH itself remains M3.
 
 ### M3 — Commit buffer + group commit (1 week)
 

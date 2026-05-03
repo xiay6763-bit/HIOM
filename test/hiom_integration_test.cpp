@@ -343,17 +343,12 @@ int run_cold_backed() {
                   << std::endl;
     }
 
-    // Phase 3: update half + remove a sixth; the update set and the
-    // remove set are kept disjoint (update_only_if i%2==0 && i%6!=0;
-    // remove_only_if i%6==0) to avoid triggering an unrelated
-    // pre-existing Viper bug in the update→remove interaction at scale
-    // (the run_update_remove test above exercises the same overlap with
-    // kN=10K and passes; at kNumKeys=200K, ~54 i%6==0 keys leak through
-    // CCEH segment splits — see follow-up before M3).
-    auto in_update_set = [](std::size_t i) { return i % 2 == 0 && i % 6 != 0; };
-    auto in_remove_set = [](std::size_t i) { return i % 6 == 0; };
-    for (std::size_t i = 0; i < kv.size(); ++i) {
-        if (!in_update_set(i)) continue;
+    // Phase 3: update half + remove a third (overlapping at i%6==0,
+    // which exercises the update→remove sequence end-to-end now that
+    // the underlying CCEH tombstone leak is fixed in viper.hpp).
+    constexpr std::size_t kUpdEvery = 2;
+    constexpr std::size_t kRmEvery = 3;
+    for (std::size_t i = 0; i < kv.size(); i += kUpdEvery) {
         const std::uint64_t new_val = 7'777'000ull + i;
         kv[i].second = new_val;
         if (!client.update(kv[i].first,
@@ -364,8 +359,7 @@ int run_cold_backed() {
         }
     }
     std::vector<bool> removed(kv.size(), false);
-    for (std::size_t i = 0; i < kv.size(); ++i) {
-        if (!in_remove_set(i)) continue;
+    for (std::size_t i = 0; i < kv.size(); i += kRmEvery) {
         if (!client.remove(kv[i].first)) {
             std::cerr << "  FAIL: remove returned false for key "
                       << kv[i].first << std::endl;
@@ -374,45 +368,32 @@ int run_cold_backed() {
         removed[i] = true;
     }
 
-    // Final pass: validate ColdTier state directly. We deliberately
-    // sidestep client.get's CCEH fallback here because Viper has a
-    // scale-dependent CCEH leak after remove (~0.04%) that's unrelated
-    // to HiOM and pre-dates this work — see "follow-up before M3" note
-    // earlier. Validating cold_->lookup directly proves the ColdTier
-    // integration is correct: tombstones land on remove, fresh offsets
-    // land on update, and the live offset is reachable via cold_off →
-    // hiom_read_at_offset.
+    // Final pass: removed keys must miss; survivors must read the
+    // (possibly-updated) expected value via the full HiOM client path
+    // (HotTier → ColdTier → CCEH). Now that the CCEH tombstone leak
+    // is fixed in viper.hpp (Client::get adds a check_key_equality
+    // guard against stale offsets), client.get is the ground truth.
     const auto [hh2, ch2, cm2, cfc2, cf2] = reset_stats();
-    auto* cold_raw = cold.get();
-    auto h_ro_client = viper_db->get_read_only_client();
     std::size_t bad = 0;
     std::size_t bad_removed_present = 0;
     std::size_t bad_kept_missing = 0;
     std::size_t bad_kept_wrong = 0;
     std::size_t first_bad_idx = static_cast<std::size_t>(-1);
     for (std::size_t i = 0; i < kv.size(); ++i) {
-        const std::uint64_t fp64 = viper::hiom::key_fingerprint64(kv[i].first);
-        auto cold_off = cold_raw->lookup(fp64);
+        std::uint64_t got = 0;
+        const bool present = client.get(kv[i].first, &got);
         if (removed[i]) {
-            if (cold_off.has_value()) {
+            if (present) {
                 ++bad; ++bad_removed_present;
                 if (first_bad_idx == static_cast<std::size_t>(-1))
                     first_bad_idx = i;
             }
         } else {
-            if (!cold_off.has_value()) {
+            if (!present) {
                 ++bad; ++bad_kept_missing;
                 if (first_bad_idx == static_cast<std::size_t>(-1))
                     first_bad_idx = i;
-                continue;
-            }
-            // Read PM at the offset ColdTier hands back; verify the
-            // (possibly-updated) value is what we expect.
-            std::uint64_t pm_key = 0;
-            std::uint64_t pm_val = 0;
-            if (!h_ro_client.hiom_read_at_offset(*cold_off, &pm_key, &pm_val)
-                || pm_key != kv[i].first
-                || pm_val != kv[i].second) {
+            } else if (got != kv[i].second) {
                 ++bad; ++bad_kept_wrong;
                 if (first_bad_idx == static_cast<std::size_t>(-1))
                     first_bad_idx = i;
