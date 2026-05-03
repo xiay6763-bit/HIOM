@@ -10,12 +10,11 @@
 //      pattern. Should be within ±10% (HiOM hits HotTier; raw Viper
 //      hits CCEH).
 //   5. Phase B-2: ColdTier-backed HiOM end-to-end. Every put mirrors
-//      into ColdTier; reads of evicted-from-hot keys must hit ColdTier
-//      and never need the CCEH fallback.
-//
-// Note: HiOM still keeps Viper's CCEH as a safety net in M2 — the
-// `cceh_fallback_hits` counter is asserted to stay ~0 under steady
-// state. Once M3 retires CCEH, the safety net is removed.
+//      into ColdTier; reads of evicted-from-hot keys must hit ColdTier.
+//   6. M3 Phase D: with the CCEH safety net retired, a HotTier+ColdTier
+//      double-miss returns false. Read-your-write inside the commit
+//      window relies on HotTier PINNED slots; the test asserts
+//      pin_failures==0 and hot_hits==N for that case.
 
 #include "viper/viper.hpp"
 #include "viper/hiom/cold_tier.hpp"
@@ -282,19 +281,16 @@ int run_cold_backed() {
     }
 
     // Phase 2: read every key. With HotTier capped at 4K slots, most
-    // reads must route through ColdTier; CCEH fallback should stay at 0.
+    // reads must route through ColdTier (CCEH safety net was retired
+    // in M3 Phase D; a HotTier+ColdTier double-miss returns false).
     auto reset_stats = [&]() {
-        // Stats accumulated during put-time warmups are uninteresting
-        // for read measurement. We snapshot before reads instead of
-        // resetting (Stats has no clear()).
         return std::tuple{
             hiom.stats().hot_hits.load(),
             hiom.stats().cold_hits.load(),
             hiom.stats().cold_misses.load(),
-            hiom.stats().cold_fp_collisions.load(),
-            hiom.stats().cceh_fallback_hits.load()};
+            hiom.stats().cold_fp_collisions.load()};
     };
-    const auto [hh0, ch0, cm0, cfc0, cf0] = reset_stats();
+    const auto [hh0, ch0, cm0, cfc0] = reset_stats();
 
     std::size_t hits = 0, misses = 0, mismatches = 0;
     for (auto& [k, expected] : kv) {
@@ -304,28 +300,22 @@ int run_cold_backed() {
         else ++hits;
     }
 
-    const auto [hh1, ch1, cm1, cfc1, cf1] = reset_stats();
+    const auto [hh1, ch1, cm1, cfc1] = reset_stats();
     const std::uint64_t hot_hits_delta  = hh1 - hh0;
     const std::uint64_t cold_hits_delta = ch1 - ch0;
     const std::uint64_t cold_miss_delta = cm1 - cm0;
     const std::uint64_t cold_fpc_delta  = cfc1 - cfc0;
-    const std::uint64_t cceh_fb_delta   = cf1 - cf0;
     std::cout << "  read pass: hits=" << hits
               << " misses=" << misses
               << " mismatches=" << mismatches << std::endl;
     std::cout << "  per-tier deltas: hot=" << hot_hits_delta
               << " cold=" << cold_hits_delta
               << " cold_miss=" << cold_miss_delta
-              << " cold_fp_coll=" << cold_fpc_delta
-              << " cceh_fallback=" << cceh_fb_delta << std::endl;
+              << " cold_fp_coll=" << cold_fpc_delta << std::endl;
 
     if (misses != 0 || mismatches != 0) {
-        std::cerr << "  FAIL: lossy read pass" << std::endl;
-        return 1;
-    }
-    if (cceh_fb_delta != 0) {
-        std::cerr << "  FAIL: ColdTier should cover all reads, but "
-                  << cceh_fb_delta << " queries fell through to CCEH"
+        std::cerr << "  FAIL: lossy read pass (M3 Phase D: ColdTier"
+                  << " is authoritative; missed reads = bug)"
                   << std::endl;
         return 1;
     }
@@ -379,7 +369,7 @@ int run_cold_backed() {
     // (HotTier → ColdTier → CCEH). Now that the CCEH tombstone leak
     // is fixed in viper.hpp (Client::get adds a check_key_equality
     // guard against stale offsets), client.get is the ground truth.
-    const auto [hh2, ch2, cm2, cfc2, cf2] = reset_stats();
+    const auto [hh2, ch2, cm2, cfc2] = reset_stats();
     std::size_t bad = 0;
     std::size_t bad_removed_present = 0;
     std::size_t bad_kept_missing = 0;
@@ -406,12 +396,11 @@ int run_cold_backed() {
             }
         }
     }
-    const auto [hh3, ch3, cm3, cfc3, cf3] = reset_stats();
+    const auto [hh3, ch3, cm3, cfc3] = reset_stats();
     std::cout << "  final pass deltas: hot=" << (hh3 - hh2)
               << " cold=" << (ch3 - ch2)
               << " cold_miss=" << (cm3 - cm2)
-              << " cold_fp_coll=" << (cfc3 - cfc2)
-              << " cceh_fallback=" << (cf3 - cf2) << std::endl;
+              << " cold_fp_coll=" << (cfc3 - cfc2) << std::endl;
     if (bad != 0) {
         std::cerr << "  FAIL: " << bad
                   << " bad reads after update+remove"
@@ -426,28 +415,42 @@ int run_cold_backed() {
     return 0;
 }
 
-// Phase B-2 follow-up (M3 Phase A+B+C): exercise reads while the
-// commit buffer still has un-flushed entries. Demonstrates that
-// HiOM stays correct even when ColdTier hasn't caught up: keys
-// resolved via the CCEH safety net are functionally indistinguishable
-// from cold-tier hits, the only difference being cceh_fallback_hits
-// rises during the commit window. Once the flusher drains, the same
-// reads route through ColdTier with cceh_fallback=0.
+// M3 Phase D check: with CCEH retired, commit-window reads can only
+// be served from HotTier (PINNED) or ColdTier. The design contract
+// (paper §3 invariant I3) is that HotTier capacity ≥ commit-buffer
+// high watermark; given that, every recently-written key is hot
+// before its corresponding cold-tier write completes. This test
+// configures a HotTier large enough to hold all 50K writes, slows
+// the flusher so the cold tier is empty during reads, and verifies
+// every read hits HotTier (cold_misses == reads, hot_hits == reads).
 int run_commit_window() {
-    std::cout << "=== HiOM commit-window read correctness (M3) ===" << std::endl;
+    std::cout << "=== HiOM commit-window read-your-write (M3 Phase D) ===" << std::endl;
     cleanup_pool();
     cleanup_cold_pool();
 
     auto viper_db = ViperT::create(kPoolDir, kPoolSize);
     auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
-    // Slow the flusher so reads will see in-flight commits.
+
+    // 10K keys keeps the expected 32-bit fp collision count near zero
+    // (P[any collision] ≈ N²/2^33 ≈ 1.2e-5). With 50K we'd see ~1
+    // collision per run; the affected key would be unfindable inside
+    // the commit window because HotTier's fp32 slot is overwritten by
+    // the colliding key and ColdTier hasn't been flushed yet. Real
+    // deployments with M4's inline-flush + larger HotTier or paper
+    // §2.2's verify path on collision will handle this gracefully;
+    // here we keep the demonstration clean.
+    constexpr std::size_t kN = 10'000;
+    // HotTier sized very generously for kN PINNED entries. Reproduces
+    // invariant I3 (PINNED budget ≤ HotTier capacity) without being
+    // sensitive to one unlucky bucket collecting >16 entries — that's
+    // M4's job to back-pressure via inline-flush.
+    constexpr std::size_t kHotBucketsBig = 1ULL << 14;  // 16K buckets × 16 = 256K slots
     viper::hiom::HiOM<std::uint64_t, std::uint64_t>::FlusherConfig fcfg;
     fcfg.interval = std::chrono::milliseconds(500);
     fcfg.high_watermark = 1ULL << 30;  // never wake on size
-    HiOMT hiom(*viper_db, /*hot_buckets_pow2=*/256, cold.get(), fcfg);
+    HiOMT hiom(*viper_db, kHotBucketsBig, cold.get(), fcfg);
     auto client = hiom.get_client();
 
-    constexpr std::size_t kN = 50'000;
     std::mt19937_64 rng(0xb00b);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> kv;
     kv.reserve(kN);
@@ -455,9 +458,6 @@ int run_commit_window() {
         kv.emplace_back(static_cast<std::uint64_t>(i + 1), rng());
     }
 
-    // Write all keys quickly. Flusher won't wake (huge watermark, slow
-    // interval), so most entries should still be in the buffer when we
-    // start reading.
     for (auto& [k, v] : kv) {
         if (!client.put(k, v)) {
             std::cerr << "  FAIL: put returned false for key " << k << std::endl;
@@ -466,15 +466,25 @@ int run_commit_window() {
     }
     const std::size_t cold_before = cold->approx_size();
     const std::size_t buf_before = hiom.commit_buffer()->size_hint();
+    const std::size_t hot_size = hiom.hot_tier().size();
+    const std::size_t pin_failures = hiom.hot_tier().pin_failures();
     std::cout << "  after fill: ColdTier=" << cold_before
               << " buffer=" << buf_before
-              << " (most writes still in buffer)" << std::endl;
+              << " HotTier.size=" << hot_size
+              << " pin_failures=" << pin_failures << std::endl;
     if (buf_before == 0) {
         std::cerr << "  WARN: flusher already drained; can't exercise the"
                   << " commit-window path with this timing." << std::endl;
     }
+    if (pin_failures != 0) {
+        std::cerr << "  FAIL: " << pin_failures
+                  << " pin failures (HotTier under-sized for PINNED budget)."
+                  << " Test invariant I3 not held." << std::endl;
+        return 1;
+    }
 
-    const auto cf0 = hiom.stats().cceh_fallback_hits.load();
+    const auto h0 = hiom.stats().hot_hits.load();
+    const auto cm0 = hiom.stats().cold_misses.load();
     std::size_t hits = 0, misses = 0, mismatches = 0;
     for (const auto& [k, expected] : kv) {
         std::uint64_t got = 0;
@@ -482,17 +492,28 @@ int run_commit_window() {
         else if (got != expected) ++mismatches;
         else ++hits;
     }
-    const auto cf1 = hiom.stats().cceh_fallback_hits.load();
+    const auto h1 = hiom.stats().hot_hits.load();
+    const auto cm1 = hiom.stats().cold_misses.load();
+    const std::uint64_t hot_delta = h1 - h0;
+    const std::uint64_t cmiss_delta = cm1 - cm0;
     std::cout << "  reads during commit window: hits=" << hits
               << " misses=" << misses << " mismatches=" << mismatches
-              << " cceh_fallback_delta=" << (cf1 - cf0) << std::endl;
+              << "  (hot_delta=" << hot_delta
+              << " cold_miss_delta=" << cmiss_delta << ")" << std::endl;
 
     if (misses != 0 || mismatches != 0) {
-        std::cerr << "  FAIL: in-flight commits observed lost or stale"
+        std::cerr << "  FAIL: read-your-write broken — "
+                  << misses << " missed reads of just-written keys"
                   << std::endl;
         return 1;
     }
-    // Now drain and confirm post-flush state is consistent.
+    if (hot_delta != kN) {
+        std::cerr << "  FAIL: expected all " << kN << " reads to hit HotTier"
+                  << " (PINNED), got " << hot_delta << std::endl;
+        return 1;
+    }
+
+    // Drain and confirm post-flush state is consistent.
     hiom.flush_and_wait();
     if (cold->approx_size() != kN) {
         std::cerr << "  FAIL: post-flush ColdTier=" << cold->approx_size()

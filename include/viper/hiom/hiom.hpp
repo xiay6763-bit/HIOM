@@ -90,7 +90,6 @@ class HiOM {
         std::atomic<std::uint64_t> cold_hits{0};
         std::atomic<std::uint64_t> cold_misses{0};
         std::atomic<std::uint64_t> cold_fp_collisions{0};
-        std::atomic<std::uint64_t> cceh_fallback_hits{0};
         std::atomic<std::uint64_t> commits_flushed{0};
     };
 
@@ -171,9 +170,16 @@ class HiOM {
                 hiom_.stats_.hot_misses.fetch_add(1, std::memory_order_relaxed);
             }
 
-            // ColdTier consultation, when attached. ColdTier returns a
-            // full KVOffset directly (no codec round-trip needed).
             if (hiom_.cold_ != nullptr) {
+                // M3 Phase D: ColdTier is authoritative when attached.
+                // No CCEH fallback. A double-miss (HotTier + ColdTier)
+                // returns false even if Viper's CCEH still has the
+                // entry — the design contract is that all writes pass
+                // through the commit buffer and are eventually visible
+                // in ColdTier; reads of recently-written keys must hit
+                // the still-PINNED HotTier slot before then. This is
+                // the §3 invariant I3 surface (HotTier capacity ≥
+                // commit-buffer high watermark).
                 const std::uint64_t fp64 = key_fingerprint64(key);
                 if (auto cold_off = hiom_.cold_->lookup(fp64)) {
                     if (verify_and_read_offset(key, *cold_off, value)) {
@@ -188,15 +194,16 @@ class HiOM {
                     hiom_.stats_.cold_misses.fetch_add(
                         1, std::memory_order_relaxed);
                 }
+                return false;
             }
 
-            // Final fallback: Viper's CCEH. With ColdTier attached this
-            // can fire transiently for entries that are still in the
-            // commit buffer (not yet flushed). We do NOT warm the hot
-            // tier here — that path goes through the buffer too and
-            // would race with the in-flight commit.
+            // M0/M1 mode (no ColdTier): CCEH is authoritative. This
+            // path is exercised by the legacy hit-mostly tests; not
+            // the steady-state path once ColdTier is wired up.
             if (!viper_.get(key, value)) return false;
-            hiom_.stats_.cceh_fallback_hits.fetch_add(
+            mirror_into_hot_with_offset(key,
+                                        viper_.hiom_peek_offset(key));
+            hiom_.stats_.hot_warmups.fetch_add(
                 1, std::memory_order_relaxed);
             return true;
         }
