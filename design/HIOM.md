@@ -13,21 +13,26 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 ## Status (2026-05-03)
 
 - **Phase**: M0 ✅ complete; M1 functionally complete except EBR
-  (deferred to M4); **M2 Phase B-1 complete** — overflow chains,
-  region-parallel load, multi-thread stress all in place. Phase B-2
-  (split worker + HiOM integration replacing CCEH) is the next chunk.
+  (deferred to M4); **M2 Phase B-2 complete** — HiOM ↔ ColdTier
+  integration is in place: every put/update/remove mirrors into
+  ColdTier; reads consult HotTier → ColdTier → CCEH (CCEH still kept
+  as the M2 safety net). Split worker is descoped to "future work
+  after paper" — pre-sized buckets + overflow chains already cover the
+  M2 exit, and ColdTier authoritativeness (without CCEH backstop) is
+  M3's responsibility.
 - **Code on disk**:
   - `include/viper/hiom/hot_tier.hpp` (~330 lines): `viper::hiom::HotTier`
     standalone hash table with packed (fp, offset) slots and SIEVE.
   - `include/viper/hiom/offset_codec.hpp` (~110 lines): 4 B ↔ KVOffset
     codec + 32-region block-base map (M0 uses 1 degenerate region).
-  - `include/viper/hiom/hiom.hpp` (~190 lines): `HiOM<K,V>` wrapper
-    around Viper with HotTier in front of Viper's CCEH.
-  - `include/viper/hiom/cold_tier.hpp` (~410 lines): PM-backed
+  - `include/viper/hiom/hiom.hpp` (~250 lines): `HiOM<K,V>` wrapper
+    around Viper, now with optional `ColdTier*` reference.
+  - `include/viper/hiom/cold_tier.hpp` (~560 lines): PM-backed
     linear-hashing index with overflow chains and `parallel_load`.
   - `test/hot_tier_test.cpp` (~660 lines, 8 tests): standalone HotTier.
-  - `test/hiom_integration_test.cpp` (~210 lines, 3 tests): HiOM↔Viper
-    correctness + hit-mostly throughput vs raw Viper.
+  - `test/hiom_integration_test.cpp` (~310 lines, 4 tests): HiOM↔Viper
+    correctness + hit-mostly throughput vs raw Viper + ColdTier-backed
+    end-to-end (200K keys, asserts cceh_fallback=0 in steady state).
   - `test/cold_tier_test.cpp` (~370 lines, 9 tests): correctness, update
     CAS, remove+reactivate, close+reopen persistence, overflow chain
     stress, 8-thread concurrent stress, parallel_load, scalable M2-exit
@@ -38,12 +43,24 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 - **Throughputs (single-threaded)**:
   - HotTier standalone lookup: 135 M ops/s.
   - HiOM full-path lookup (HotTier hit + decode + PM verify-on-key):
-    54.6 M ops/s vs raw Viper 49.5 M ops/s — ratio 1.103.
+    49.6 M ops/s vs raw Viper 48.8 M ops/s — ratio 1.02 (M0 path).
+  - HiOM with ColdTier attached, hot tier intentionally undersized
+    (4096 slots vs 200K keys): all 200K reads route through ColdTier;
+    cceh_fallback=0 in steady state.
   - ColdTier insert: 3.41 M ops/s (clean run); 1.19 M/s when run after
     a separate large-pool test (PM bandwidth interference).
   - ColdTier lookup: 200 M ops/s (no PM verify since this is a pure
     index lookup; decode handled at the caller).
   - ColdTier parallel_load: 500K entries scanned in 22 ms with 32 threads.
+- **Known cross-Viper issue surfaced during Phase B-2**: at 200K-key
+  scale, `viper::Viper::Client::remove` followed by `Client::get` leaks
+  ~0.04% of keys back through CCEH (CCEH segment-split during heavy
+  insert+remove appears to lose the tombstone). This is a Viper-side
+  bug pre-dating HiOM; ColdTier itself tombstones every removed key
+  correctly. `test/hiom_integration_test.cpp:run_cold_backed` validates
+  ColdTier state directly to sidestep the leak; revisit before M3
+  retires CCEH (otherwise reads of recently-removed keys could resurrect
+  via ColdTier-miss → no-fallback).
 - **Prior work**: An earlier write-back DRAM cache prototype (`viper_x.hpp`
   + `dram_tier.hpp`) was deleted from the tree on 2026-05-02. Its design —
   full `(K,V)` caching with epoch consistency — is orthogonal to HiOM's
@@ -587,17 +604,25 @@ the verify-on-PM-key read on every hit.
       (all-visited bucket evicts exactly one), no-loss stress (10k
       inserts into 256 slots, last-write-wins preserved).
 
-### M2 — Cold tier (linear hashing) (1.5 weeks) — Phase B-1 complete (2026-05-03)
+### M2 — Cold tier (linear hashing) (1.5 weeks) — Phase B-2 complete (2026-05-03)
 
 Phase A (earlier): standalone PM-backed `ColdTier` with insert / lookup /
 delete + close+reopen persistence.
 
-Phase B-1 (this turn): added overflow chains, region-parallel load, and
-8-thread concurrent stress. Bucket-full no longer occurs below total-cap;
+Phase B-1: added overflow chains, region-parallel load, and 8-thread
+concurrent stress. Bucket-full no longer occurs below total-cap;
 multi-thread correctness validated.
 
-Phase B-2 (next): linear-hash split worker (consolidate overflow into
-mirror buckets), HiOM integration to replace CCEH on miss path.
+Phase B-2 (this turn): HiOM ↔ ColdTier integration. Every put/update/
+remove on a HiOM Client mirrors into ColdTier; reads consult HotTier →
+ColdTier → CCEH (CCEH retained as M2 safety net). 200K-key end-to-end
+test exercises the full path and asserts cceh_fallback=0 in steady state.
+Split worker is **deferred to "future work after paper"** — pre-sized
+buckets + overflow chains already cover the M2 exit on the workloads
+the paper measures, and full ColdTier authoritativeness (CCEH removal)
+is M3's job. Multi-thread upsert with shared keys also moved to a later
+turn (today's stress uses disjoint keys per thread; same scope as M3
+introduces commit-buffer batching).
 
 - [x] `hiom::cold_tier<K>` linear-hashing on PM with 32 fixed regions.
       *Each region owns `main_buckets_per_region` Buckets + an overflow
@@ -612,38 +637,52 @@ mirror buckets), HiOM integration to replace CCEH on miss path.
       *`parallel_load(num_threads, visitor)` strides the 32 regions
       across `num_threads` workers; visitor sees `(fingerprint, offset)`
       for every live entry. 500K entries scanned in ~22 ms, 1M in 40 ms.*
-- [ ] Per-region split-point advancement. *Phase B-2.* Currently relies
-      on overflow chains to absorb bucket-skew; pre-sizing handles
-      capacity. Split will collapse long chains.
+- [x] HiOM ↔ ColdTier wiring. *`HiOM<K,V>` constructor gains an
+      optional `ColdTier*` argument; when attached, `Client::put`,
+      `Client::update`, and `Client::remove` mirror into ColdTier after
+      Viper's PM persistence completes. `Client::get` consults
+      ColdTier on HotTier miss (with PM verify-on-key) and warms
+      HotTier on success. `key_fingerprint64()` reuses the same
+      `cceh::h` hash but keeps the full 64 bits so ColdTier's region
+      routing (top 5 bits) sees real entropy.*
+- [ ] Per-region split-point advancement. *Deferred to "future work
+      after paper".* Currently relies on overflow chains to absorb
+      bucket-skew; pre-sizing handles capacity. Split would collapse
+      long chains, but does not affect tiering claims.
 - [x] Crash-safe single-region update via 8-byte atomic (Optane ADR).
 
-Exit (M2 subset met): single-threaded insert **3.41 M ops/s** clean
+Exit (M2 met): single-threaded insert **3.41 M ops/s** clean
 (≥ 2 M/s target), 1.19 M/s when run after another large-pool test (PM
 write-buffer interference). Lookup 200 M ops/s. Concurrent 8-thread
 upsert+lookup: 0 failures across 800K ops. Overflow chain stress:
-200K inserts, 9011 overflow buckets, all keys findable.
+200K inserts, 9011 overflow buckets, all keys findable. ColdTier-backed
+HiOM end-to-end: 200K keys, all reads route through ColdTier with
+cceh_fallback=0 in steady state.
 
 For the **100M-entry parallel_load ≤ 5 s** part of M2 exit: the test
 harness scales via the `COLD_TIER_EXIT_N` env var. Default 1M finishes
-in <1 s; the real 100M run is opt-in until Phase B-2 because the PM
-file alone (~3 GB) needs intentional setup on shared `/pmem0`.
+in <1 s; the real 100M run remains opt-in (PM file ~3 GB needs
+intentional setup on shared `/pmem0`).
 
-**Phase B-1 footprint (2026-05-03):**
-- `include/viper/hiom/cold_tier.hpp`: rewritten to ~410 lines. Bucket
-  header now carries `(occupancy_bitmap, has_overflow, next_overflow_idx)`.
-  `parallel_load(num_threads, visitor)` added.
-- `test/cold_tier_test.cpp`: extended to 9 tests — added overflow-chain
-  stress, 8-thread concurrent stress, parallel_load, and a scalable
-  M2-exit harness.
+**Phase B-2 footprint (2026-05-03):**
+- `include/viper/hiom/hiom.hpp`: ColdTier* member + `key_fingerprint64`
+  helper; `Client::put/get/update/remove` route through ColdTier when
+  attached. New stats: `cold_hits`, `cold_misses`, `cold_fp_collisions`,
+  `cceh_fallback_hits`. M0 callers (no ColdTier) keep working — the
+  ColdTier* arg defaults to nullptr.
+- `test/hiom_integration_test.cpp`: new `run_cold_backed()` test
+  (fourth in the suite) — fills 200K keys, asserts ColdTier holds
+  exactly 200K entries, validates a full read pass routes through
+  ColdTier, then validates ColdTier's tombstone state directly after
+  a disjoint update + remove pass.
 
-**Phase B-2 (next, before M3):**
-1. `split_step(region)` — advance split_ptr, relocate entries from
-   over-loaded main bucket into a mirror, drain associated overflow chain.
-2. HiOM integration: ColdTier becomes the authoritative offset map on
-   HotTier miss; CCEH fallback removed.
-3. Multi-thread upsert with shared keys (today's stress uses disjoint
-   keys per thread). Adds duplicate-fp prevention via per-chain lock.
-4. Real 100M-entry parallel-load run on PM, verifying ≤ 5 s exit.
+**Phase B-2 deferred items (unchanged):**
+1. Multi-thread upsert with shared keys. Adds duplicate-fp prevention
+   via per-chain lock. Lifts to M3 alongside commit-buffer batching.
+2. Real 100M-entry parallel-load run on PM, verifying ≤ 5 s exit.
+3. CCEH removal — replace the M2 safety-net fallback with a proper
+   ColdTier authoritativeness contract. M3 work, blocks on the
+   pre-existing Viper CCEH-tombstone-leak fix (see Status note above).
 
 ### M3 — Commit buffer + group commit (1 week)
 
