@@ -16,12 +16,18 @@
 
 using namespace viper::kv_bm;
 
-constexpr size_t ALL_OPS_NUM_REPETITIONS = 1;
-constexpr size_t ALL_OPS_NUM_PREFILLS = 100'000'000;
-constexpr size_t ALL_OPS_NUM_INSERTS = 50'000'000;
-constexpr size_t ALL_OPS_NUM_FINDS = 50'000'000;
-constexpr size_t ALL_OPS_NUM_UPDATES = 50'000'000;
-constexpr size_t ALL_OPS_NUM_DELETES = 50'000'000;
+ constexpr size_t ALL_OPS_NUM_REPETITIONS = 3;
+// constexpr size_t ALL_OPS_NUM_PREFILLS = 100'000'000;
+// constexpr size_t ALL_OPS_NUM_INSERTS = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_FINDS = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_UPDATES = 50'000'000;
+// constexpr size_t ALL_OPS_NUM_DELETES = 50'000'000;
+
+constexpr size_t ALL_OPS_NUM_PREFILLS = 1'000'000; 
+constexpr size_t ALL_OPS_NUM_INSERTS = 1'000'000;  
+constexpr size_t ALL_OPS_NUM_FINDS = 1'000'000;    
+constexpr size_t ALL_OPS_NUM_UPDATES = 1'000'000;  
+constexpr size_t ALL_OPS_NUM_DELETES = 1'000'000;
 
 #define GENERAL_ARGS \
               Repetitions(ALL_OPS_NUM_REPETITIONS) \
@@ -184,8 +190,7 @@ ALL_BMS(ViperFixture);
 
 
 int main(int argc, char** argv) {
-    std::string exec_name = argv[0];
-    const std::string arg = get_output_file("all_ops/all_ops");
-    return bm_main({exec_name, arg});
-//    return bm_main({exec_name});
+    std::vector<std::string> args{argv[0], get_output_file("all_ops/all_ops")};
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    return bm_main(std::move(args));
 }

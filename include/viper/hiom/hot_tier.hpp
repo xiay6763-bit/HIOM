@@ -1,0 +1,338 @@
+#pragma once
+
+// HiOM hot tier — compact 8-byte-per-slot DRAM hash table for offset-map caching.
+//
+// Layout (per §2.7 of design): the table is an array of *buckets*, each
+// holding kSlotsPerBucket (= 16) slots in 128 bytes (two contiguous 64-byte
+// cache lines, alignas(64)). A parallel metadata array stores per-bucket
+// visited bits + hand pointer for SIEVE eviction (M1).
+//
+// Each slot packs (32-bit fingerprint | 32-bit compact offset) into a single
+// 64-bit word so a slot upsert is a single atomic CAS.
+//
+// fingerprint == 0 is reserved for "empty slot". Callers MUST bias their
+// fingerprints to be non-zero (we assert this in debug).
+//
+// M0 + M1 scope: insert / lookup / remove with last-writer-wins semantics
+// on fingerprint collision; SIEVE eviction triggers when a probe window
+// is full of distinct fingerprints. No PINNED state yet (M4).
+// Concurrency is lock-free via 8-byte atomic CAS on slots and atomic
+// fetch_or/and on visited-bit word.
+//
+// SIEVE algorithm (Yang et al., NSDI '24 — verify before citing):
+//   - visited=1 on hit (lookup) and on update.
+//   - visited=0 on new insert.
+//   - eviction walks slots starting at `hand`: visited=1 → clear and skip;
+//     visited=0 → evict.
+
+#include <atomic>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <optional>
+#include <vector>
+
+namespace viper::hiom {
+
+class HotTier {
+  public:
+    static constexpr std::size_t kSlotsPerBucket = 16;
+    static constexpr std::uint32_t kEmptyFp = 0;
+    static constexpr std::uint32_t kInvalidOffset = 0xFFFFFFFFu;
+    static constexpr std::size_t kInvalidIdx = static_cast<std::size_t>(-1);
+
+    // num_buckets must be a power of two and at least 1.
+    // Total slot capacity = num_buckets × kSlotsPerBucket.
+    explicit HotTier(std::size_t num_buckets_pow2)
+        : num_buckets_(num_buckets_pow2),
+          mask_(num_buckets_pow2 - 1),
+          buckets_(allocate_buckets(num_buckets_pow2)),
+          meta_(num_buckets_pow2) {
+        assert((num_buckets_pow2 & (num_buckets_pow2 - 1)) == 0
+               && "num_buckets must be a power of two");
+        assert(num_buckets_pow2 >= 1);
+        assert(reinterpret_cast<std::uintptr_t>(buckets_.get()) % 64 == 0);
+    }
+
+    HotTier(const HotTier&) = delete;
+    HotTier& operator=(const HotTier&) = delete;
+
+    // Insert or update.
+    // - Match (existing fingerprint found): replaces offset, returns OLD offset.
+    //   Sets visited bit (the entry is "hot").
+    // - New insert (free slot found): returns kInvalidOffset.
+    //   Clears visited bit (per SIEVE: new entries start unvisited).
+    // - Bucket full of distinct fps: triggers SIEVE eviction; if eviction
+    //   yields a slot, claims it as new insert. If eviction fails (e.g.,
+    //   future M4 all-PINNED state), returns kInvalidOffset and entry is
+    //   NOT stored.
+    std::uint32_t upsert(std::uint32_t fingerprint, std::uint32_t offset) {
+        assert(fingerprint != kEmptyFp && "fingerprint 0 is reserved for empty");
+        const std::size_t bidx = bucket_index(fingerprint);
+        Bucket& b = buckets_[bidx];
+        BucketMeta& m = meta_[bidx];
+
+        for (int retry = 0; retry < kMaxUpsertRetries; ++retry) {
+            std::optional<std::size_t> first_empty;
+            bool restart = false;
+
+            for (std::size_t i = 0; i < kSlotsPerBucket; ++i) {
+                const std::uint64_t v
+                    = b.slots[i].packed.load(std::memory_order_acquire);
+                const std::uint32_t cur_fp = unpack_fp(v);
+
+                if (cur_fp == fingerprint) {
+                    // Update in place.
+                    std::uint64_t expected = v;
+                    const std::uint64_t desired = pack(fingerprint, offset);
+                    if (b.slots[i].packed.compare_exchange_strong(
+                            expected, desired,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        set_visited(m, i);  // update is a "hit"
+                        return unpack_off(v);
+                    }
+                    restart = true;
+                    break;
+                }
+                if (cur_fp == kEmptyFp && !first_empty.has_value()) {
+                    first_empty = i;
+                }
+            }
+
+            if (restart) continue;
+
+            // No matching fp. Try claim first_empty, or evict if bucket full.
+            std::size_t target_idx;
+            if (first_empty.has_value()) {
+                target_idx = *first_empty;
+            } else {
+                target_idx = sieve_evict(b, m);
+                if (target_idx == kInvalidIdx) {
+                    // M1: should not happen (no PINNED state). M4: may happen
+                    // if every slot is PINNED.
+                    return kInvalidOffset;
+                }
+            }
+
+            std::uint64_t expected = 0;
+            const std::uint64_t desired = pack(fingerprint, offset);
+            if (b.slots[target_idx].packed.compare_exchange_strong(
+                    expected, desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                size_.fetch_add(1, std::memory_order_relaxed);
+                clear_visited(m, target_idx);  // new entry: unvisited
+                return kInvalidOffset;
+            }
+            // Lost the slot to another writer; restart probe.
+        }
+        // Pathological retry exhaustion; treat as bucket-full failure.
+        return kInvalidOffset;
+    }
+
+    // Lookup. Returns offset on hit, std::nullopt on miss.
+    // Sets visited bit on hit. NOT const because of the side effect.
+    // Caller must verify offset → key match (4-byte fp has 1/2^32 collision rate).
+    std::optional<std::uint32_t> lookup(std::uint32_t fingerprint) {
+        assert(fingerprint != kEmptyFp);
+        const std::size_t bidx = bucket_index(fingerprint);
+        const Bucket& b = buckets_[bidx];
+        for (std::size_t i = 0; i < kSlotsPerBucket; ++i) {
+            const std::uint64_t v
+                = b.slots[i].packed.load(std::memory_order_acquire);
+            const std::uint32_t fp = unpack_fp(v);
+            if (fp == fingerprint) {
+                set_visited(meta_[bidx], i);
+                return unpack_off(v);
+            }
+            // No early-exit on empty (open-addressing-with-deletion safe).
+        }
+        return std::nullopt;
+    }
+
+    // Const lookup that does NOT set visited (for stats / debugging only).
+    std::optional<std::uint32_t> peek(std::uint32_t fingerprint) const {
+        assert(fingerprint != kEmptyFp);
+        const std::size_t bidx = bucket_index(fingerprint);
+        const Bucket& b = buckets_[bidx];
+        for (std::size_t i = 0; i < kSlotsPerBucket; ++i) {
+            const std::uint64_t v
+                = b.slots[i].packed.load(std::memory_order_acquire);
+            const std::uint32_t fp = unpack_fp(v);
+            if (fp == fingerprint) return unpack_off(v);
+        }
+        return std::nullopt;
+    }
+
+    // Remove entry by fingerprint. Returns true if removed.
+    bool remove(std::uint32_t fingerprint) {
+        assert(fingerprint != kEmptyFp);
+        const std::size_t bidx = bucket_index(fingerprint);
+        Bucket& b = buckets_[bidx];
+        for (std::size_t i = 0; i < kSlotsPerBucket; ++i) {
+            std::uint64_t expected
+                = b.slots[i].packed.load(std::memory_order_acquire);
+            if (unpack_fp(expected) == fingerprint) {
+                if (b.slots[i].packed.compare_exchange_strong(
+                        expected, 0,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    size_.fetch_sub(1, std::memory_order_relaxed);
+                    clear_visited(meta_[bidx], i);
+                    return true;
+                }
+                return remove(fingerprint);  // retry
+            }
+        }
+        return false;
+    }
+
+    std::size_t num_buckets() const { return num_buckets_; }
+    std::size_t capacity() const { return num_buckets_ * kSlotsPerBucket; }
+    std::size_t size() const { return size_.load(std::memory_order_relaxed); }
+    std::size_t eviction_count() const {
+        return eviction_count_.load(std::memory_order_relaxed);
+    }
+
+  private:
+    static constexpr int kMaxUpsertRetries = 16;
+
+    struct Slot {
+        std::atomic<std::uint64_t> packed{0};
+    };
+    static_assert(sizeof(Slot) == 8, "Slot must be 8 bytes");
+
+    struct alignas(64) Bucket {
+        Slot slots[kSlotsPerBucket];
+    };
+    static_assert(sizeof(Bucket) == 128, "Bucket must be 128 bytes");
+    static_assert(alignof(Bucket) == 64, "Bucket must be 64-byte aligned");
+
+    // Per-bucket SIEVE state. Kept in a parallel array so the slot bucket
+    // stays a clean 128B = 2-cache-line probe target.
+    //
+    // visited: bit i = 1 iff slot i has been hit/updated since last
+    //   eviction sweep cleared it.
+    // hand: SIEVE hand pointer in [0, 16); next sweep starts here.
+    struct alignas(8) BucketMeta {
+        std::atomic<std::uint16_t> visited{0};
+        std::atomic<std::uint8_t> hand{0};
+        // 5 bytes pad → 8 bytes total
+    };
+    static_assert(sizeof(BucketMeta) == 8, "BucketMeta must be 8 bytes");
+
+    struct BucketArrayDeleter {
+        std::size_t count;
+        void operator()(Bucket* p) const noexcept {
+            if (!p) return;
+            for (std::size_t i = 0; i < count; ++i) p[i].~Bucket();
+            ::operator delete(p, std::align_val_t{64});
+        }
+    };
+    using BucketArray = std::unique_ptr<Bucket[], BucketArrayDeleter>;
+
+    static BucketArray allocate_buckets(std::size_t n) {
+        Bucket* raw = static_cast<Bucket*>(
+            ::operator new(sizeof(Bucket) * n, std::align_val_t{64}));
+        for (std::size_t i = 0; i < n; ++i) new (raw + i) Bucket{};
+        return BucketArray(raw, BucketArrayDeleter{n});
+    }
+
+    // SIEVE eviction within a single bucket. Returns the slot index that
+    // is now free for the caller to claim, or kInvalidIdx if no slot can
+    // be evicted (M4 future case where every slot is PINNED).
+    //
+    // Algorithm: starting at hand, walk up to 2 × kSlotsPerBucket slots.
+    //   - if slot is empty: return it directly (skipped by some race)
+    //   - if visited[i] == 0: clear slot via CAS, advance hand, return i
+    //   - if visited[i] == 1: clear visited bit (second-chance) and continue
+    // Two passes are sufficient: pass 1 clears all set visited bits,
+    // pass 2 finds them all cleared and evicts the first.
+    std::size_t sieve_evict(Bucket& b, BucketMeta& m) {
+        std::uint8_t hand = m.hand.load(std::memory_order_relaxed);
+        for (std::size_t k = 0; k < 2 * kSlotsPerBucket; ++k) {
+            const std::size_t i = (hand + k) % kSlotsPerBucket;
+            const std::uint16_t vis = m.visited.load(std::memory_order_relaxed);
+            const bool visited_bit = ((vis >> i) & 1) != 0;
+            if (visited_bit) {
+                // Second chance: clear visited and continue.
+                m.visited.fetch_and(
+                    static_cast<std::uint16_t>(~(std::uint16_t(1) << i)),
+                    std::memory_order_relaxed);
+                continue;
+            }
+            // visited == 0: evict.
+            std::uint64_t expected
+                = b.slots[i].packed.load(std::memory_order_acquire);
+            if (expected == 0) {
+                // Slot already empty (concurrent remove or another evictor).
+                m.hand.store(static_cast<std::uint8_t>((i + 1) % kSlotsPerBucket),
+                             std::memory_order_relaxed);
+                return i;
+            }
+            if (b.slots[i].packed.compare_exchange_strong(
+                    expected, 0,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                size_.fetch_sub(1, std::memory_order_relaxed);
+                eviction_count_.fetch_add(1, std::memory_order_relaxed);
+                m.hand.store(static_cast<std::uint8_t>((i + 1) % kSlotsPerBucket),
+                             std::memory_order_relaxed);
+                return i;
+            }
+            // CAS failed: someone else changed the slot. Continue.
+        }
+        return kInvalidIdx;
+    }
+
+    // visited is a SIEVE hint; correctness is not gated on it (see §2.4 of
+    // design). Use relaxed order, and skip the RMW when the bit is already in
+    // the desired state — on hit-mostly workloads this turns the steady-state
+    // lookup into a pure load + branch.
+    static void set_visited(BucketMeta& m, std::size_t slot_idx) {
+        const std::uint16_t bit
+            = static_cast<std::uint16_t>(std::uint16_t(1) << slot_idx);
+        const std::uint16_t cur = m.visited.load(std::memory_order_relaxed);
+        if ((cur & bit) != 0) return;
+        m.visited.fetch_or(bit, std::memory_order_relaxed);
+    }
+    static void clear_visited(BucketMeta& m, std::size_t slot_idx) {
+        const std::uint16_t bit
+            = static_cast<std::uint16_t>(std::uint16_t(1) << slot_idx);
+        const std::uint16_t cur = m.visited.load(std::memory_order_relaxed);
+        if ((cur & bit) == 0) return;
+        m.visited.fetch_and(static_cast<std::uint16_t>(~bit),
+                            std::memory_order_relaxed);
+    }
+
+    static std::uint64_t pack(std::uint32_t fp, std::uint32_t off) {
+        return (static_cast<std::uint64_t>(fp) << 32)
+               | static_cast<std::uint64_t>(off);
+    }
+    static std::uint32_t unpack_fp(std::uint64_t v) {
+        return static_cast<std::uint32_t>(v >> 32);
+    }
+    static std::uint32_t unpack_off(std::uint64_t v) {
+        return static_cast<std::uint32_t>(v);
+    }
+
+    std::size_t bucket_index(std::uint32_t fingerprint) const {
+        std::uint64_t h = fingerprint;
+        h ^= h >> 16;
+        h *= 0x85ebca6b9c1cdcbull;
+        h ^= h >> 13;
+        return static_cast<std::size_t>(h) & mask_;
+    }
+
+    std::size_t num_buckets_;
+    std::size_t mask_;
+    BucketArray buckets_;
+    std::vector<BucketMeta> meta_;
+    std::atomic<std::size_t> size_{0};
+    std::atomic<std::size_t> eviction_count_{0};
+};
+
+}  // namespace viper::hiom

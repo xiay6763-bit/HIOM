@@ -17,3 +17,6 @@ ycsb*.png
 benchmark/ycsb-*/
 # 忽略 YCSB 的压缩包
 benchmark/*.tar.gz
+
+# 本地 Claude Code 项目指南，不入库
+CLAUDE.md

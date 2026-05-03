@@ -26,7 +26,7 @@ static constexpr char BASE_DIR[] = "/pmem0/ycsb_data";
 static constexpr char PREFILL_FILE[] = "/ycsb_prefill.dat";
 
 #define GENERAL_ARGS \
-            ->Repetitions(1) \
+            ->Repetitions(3) \
             ->Iterations(1) \
             ->Unit(BM_TIME_UNIT) \
             ->UseRealTime() \
@@ -68,6 +68,19 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
             std::cout << "Reading workload file: " << wl_file << std::endl;
             ycsb::read_workload_file(wl_file, data);
             std::cout << "Done reading workload file." << std::endl;
+            // Match the prefill cap: when iterating with smaller datasets via
+            // YCSB_PREFILL_LIMIT, also cap the workload so total runtime stays
+            // proportional. Use YCSB_OPS_LIMIT to override the workload cap.
+            size_t cap = 0;
+            if (const char* env = std::getenv("YCSB_OPS_LIMIT")) {
+                cap = std::strtoull(env, nullptr, 10);
+            } else if (const char* env2 = std::getenv("YCSB_PREFILL_LIMIT")) {
+                cap = std::strtoull(env2, nullptr, 10) / 2;  // workloads are ~half prefill in default config
+            }
+            if (cap > 0 && cap < data->size()) {
+                data->resize(cap);
+                std::cout << "Capped workload to " << cap << " records." << std::endl;
+            }
         }
         hdr_init(1, 1000000000, 4, &fixture.hdr_);
     }
@@ -139,6 +152,17 @@ int main(int argc, char** argv) {
     std::cout << "Prefilling data..." << std::endl;
     std::filesystem::path prefill_file = BASE_DIR + std::string{PREFILL_FILE};
     ycsb::read_workload_file(prefill_file, &prefill_data);
+
+    // Optional fast-iteration knob: cap prefill to N records via env var.
+    // For thesis evaluation set YCSB_PREFILL_LIMIT to a smaller number while
+    // iterating; unset (or 0) to use the full 10M-record prefill.
+    if (const char* env = std::getenv("YCSB_PREFILL_LIMIT")) {
+        const size_t limit = std::strtoull(env, nullptr, 10);
+        if (limit > 0 && limit < prefill_data.size()) {
+            prefill_data.resize(limit);
+            std::cout << "Capped prefill_data to " << limit << " records." << std::endl;
+        }
+    }
 
     std::string exec_name = argv[0];
     const std::string arg = get_output_file("ycsb/ycsb");

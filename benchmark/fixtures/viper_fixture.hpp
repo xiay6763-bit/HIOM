@@ -60,6 +60,14 @@ void ViperFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts, ViperConf
 //    pool_file_ = random_file(DB_PMEM_DIR);
 //    pool_file_ = DB_PMEM_DIR + std::string("/viper");
 
+    // Defensive cleanup: if a previous benchmark crashed or was terminated, the
+    // pool dir may still exist and Viper::create refuses non-empty dirs. Only
+    // touch our own pool path (never blanket-rm under /pmem0; that mount is
+    // shared with other users — see CLAUDE.md).
+    if (pool_file_.find("/dev/dax") == std::string::npos) {
+        std::filesystem::remove_all(pool_file_);
+    }
+
 //    viper_ = ViperT::open(pool_file_, v_config);
     viper_ = ViperT::create(pool_file_, BM_POOL_SIZE, v_config);
     this->prefill(num_prefill_inserts);
