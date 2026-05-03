@@ -351,6 +351,14 @@ class Viper {
         bool get(const K& key, V* value) const;
         size_t get_total_used_pmem() const;
         size_t get_total_allocated_pmem() const;
+
+        // HiOM helper: optimistic read of (key, value) at a known offset.
+        // Returns true on a clean read; false on locked/torn page (caller
+        // should retry or fall back). Mirrors get_value_from_offset's
+        // version-lock protocol (see line ~1560) but also exposes the key
+        // so HiOM can verify a 4-byte fingerprint match against the real
+        // PM-side key.
+        inline bool hiom_read_at_offset(KVOffset offset, K* key_out, V* value_out) const;
       protected:
         explicit ReadOnlyClient(ViperT& viper);
         inline const std::pair<typename KeyAccessor<K>::checker_type, typename ValueAccessor<V>::checker_type> get_const_entry_from_offset(KVOffset offset) const;
@@ -365,6 +373,12 @@ class Viper {
 
         bool get(const K& key, V* value);
         bool get(const K& key, V* value) const;
+
+        // HiOM helper: look up the current KVOffset for `key` via Viper's
+        // CCEH map, without reading the value. Returns a tombstone offset
+        // if the key isn't present. Used by HiOM to recover the offset
+        // after a put so it can mirror it into the hot tier.
+        KVOffset hiom_peek_offset(const K& key);
 
         template <typename UpdateFn>
         bool update(const K& key, UpdateFn update_fn);
@@ -1567,6 +1581,33 @@ inline bool Viper<K, V>::Client::get_value_from_offset(const KVOffset offset, V*
         return false;
     }
     *value = v_page.data[slot].second;
+    return lock_val == page_lock.load(LOAD_ORDER);
+}
+
+// HiOM helpers: implementations for the two public methods declared in
+// the class. peek_offset goes through the same CCEH path as get(); the
+// optimistic read for both key + value mirrors get_value_from_offset.
+
+template <typename K, typename V>
+inline typename Viper<K, V>::KVOffset
+Viper<K, V>::Client::hiom_peek_offset(const K& key) {
+    auto key_check_fn = [&](auto k, auto offset) {
+        if constexpr (using_fp) { return this->viper_.check_key_equality(k, offset); }
+        else { return cceh::CCEH<K>::dummy_key_check(k, offset); }
+    };
+    return this->viper_.map_.Get(key, key_check_fn);
+}
+
+template <typename K, typename V>
+inline bool Viper<K, V>::ReadOnlyClient::hiom_read_at_offset(
+        KVOffset offset, K* key_out, V* value_out) const {
+    const auto [block, page, slot] = offset.get_offsets();
+    const VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
+    const std::atomic<version_lock_t>& page_lock = v_page.version_lock;
+    version_lock_t lock_val = page_lock.load(LOAD_ORDER);
+    if (IS_LOCKED(lock_val)) return false;
+    *key_out = v_page.data[slot].first;
+    *value_out = v_page.data[slot].second;
     return lock_val == page_lock.load(LOAD_ORDER);
 }
 
