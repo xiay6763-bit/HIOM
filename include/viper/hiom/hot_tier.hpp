@@ -43,6 +43,17 @@ class HotTier {
     static constexpr std::uint32_t kInvalidOffset = 0xFFFFFFFFu;
     static constexpr std::size_t kInvalidIdx = static_cast<std::size_t>(-1);
 
+    // Reference to a specific slot, returned by upsert_pinned so the
+    // background flusher can later unpin precisely without re-probing.
+    // valid==false means the upsert did not place the entry into the
+    // hot tier (e.g., bucket full of PINNED slots) — caller should
+    // treat the entry as cold-only until the next read warms it.
+    struct SlotRef {
+        std::size_t bucket_idx{kInvalidIdx};
+        std::uint8_t slot_idx{0};
+        bool valid{false};
+    };
+
     // num_buckets must be a power of two and at least 1.
     // Total slot capacity = num_buckets × kSlotsPerBucket.
     explicit HotTier(std::size_t num_buckets_pow2)
@@ -133,7 +144,89 @@ class HotTier {
         return kInvalidOffset;
     }
 
-    // Lookup. Returns offset on hit, std::nullopt on miss.
+    // Variant of upsert that PINS the resulting slot. PINNED slots are
+    // skipped by SIEVE eviction until unpin() clears the bit. Returns
+    // a SlotRef so the caller (typically a background flusher) can
+    // later unpin without rehashing. If the bucket is full of PINNED
+    // distinct fingerprints, returns SlotRef{valid=false}: the entry
+    // is NOT stored, and the caller should rely on the cold tier /
+    // commit buffer alone. Stats: pin_failures_ counts these.
+    SlotRef upsert_pinned(std::uint32_t fingerprint, std::uint32_t offset) {
+        assert(fingerprint != kEmptyFp);
+        const std::size_t bidx = bucket_index(fingerprint);
+        Bucket& b = buckets_[bidx];
+        BucketMeta& m = meta_[bidx];
+
+        for (int retry = 0; retry < kMaxUpsertRetries; ++retry) {
+            std::optional<std::size_t> first_empty;
+            bool restart = false;
+
+            for (std::size_t i = 0; i < kSlotsPerBucket; ++i) {
+                const std::uint64_t v
+                    = b.slots[i].packed.load(std::memory_order_acquire);
+                const std::uint32_t cur_fp = unpack_fp(v);
+
+                if (cur_fp == fingerprint) {
+                    std::uint64_t expected = v;
+                    const std::uint64_t desired = pack(fingerprint, offset);
+                    if (b.slots[i].packed.compare_exchange_strong(
+                            expected, desired,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        set_visited(m, i);
+                        set_pinned(m, i);
+                        return SlotRef{bidx,
+                                       static_cast<std::uint8_t>(i), true};
+                    }
+                    restart = true;
+                    break;
+                }
+                if (cur_fp == kEmptyFp && !first_empty.has_value()) {
+                    first_empty = i;
+                }
+            }
+            if (restart) continue;
+
+            std::size_t target_idx;
+            if (first_empty.has_value()) {
+                target_idx = *first_empty;
+            } else {
+                target_idx = sieve_evict(b, m);
+                if (target_idx == kInvalidIdx) {
+                    pin_failures_.fetch_add(1, std::memory_order_relaxed);
+                    return SlotRef{};  // valid=false
+                }
+            }
+
+            std::uint64_t expected = 0;
+            const std::uint64_t desired = pack(fingerprint, offset);
+            if (b.slots[target_idx].packed.compare_exchange_strong(
+                    expected, desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                size_.fetch_add(1, std::memory_order_relaxed);
+                clear_visited(m, target_idx);
+                set_pinned(m, target_idx);
+                return SlotRef{bidx,
+                               static_cast<std::uint8_t>(target_idx), true};
+            }
+            // Lost the slot to another writer; restart probe.
+        }
+        pin_failures_.fetch_add(1, std::memory_order_relaxed);
+        return SlotRef{};
+    }
+
+    // Clear the PINNED bit for the slot referenced by ref. Caller is
+    // expected to have obtained ref from upsert_pinned and to call
+    // unpin only once the corresponding cold-tier write is durable.
+    // Idempotent (clearing an already-clear bit is a no-op).
+    void unpin(SlotRef ref) {
+        if (!ref.valid) return;
+        assert(ref.bucket_idx < num_buckets_);
+        assert(ref.slot_idx < kSlotsPerBucket);
+        clear_pinned(meta_[ref.bucket_idx], ref.slot_idx);
+    }
+
     // Sets visited bit on hit. NOT const because of the side effect.
     // Caller must verify offset → key match (4-byte fp has 1/2^32 collision rate).
     std::optional<std::uint32_t> lookup(std::uint32_t fingerprint) {
@@ -196,6 +289,9 @@ class HotTier {
     std::size_t eviction_count() const {
         return eviction_count_.load(std::memory_order_relaxed);
     }
+    std::size_t pin_failures() const {
+        return pin_failures_.load(std::memory_order_relaxed);
+    }
 
   private:
     static constexpr int kMaxUpsertRetries = 16;
@@ -217,10 +313,16 @@ class HotTier {
     // visited: bit i = 1 iff slot i has been hit/updated since last
     //   eviction sweep cleared it.
     // hand: SIEVE hand pointer in [0, 16); next sweep starts here.
+    // pinned: bit i = 1 iff slot i is PINNED — flusher hasn't yet
+    //   committed the entry to the cold tier, so SIEVE eviction must
+    //   skip it. Cleared by HotTier::unpin once the cold-tier write
+    //   is durable. (M3 Phase B.)
     struct alignas(8) BucketMeta {
         std::atomic<std::uint16_t> visited{0};
         std::atomic<std::uint8_t> hand{0};
-        // 5 bytes pad → 8 bytes total
+        std::uint8_t pad0{0};
+        std::atomic<std::uint16_t> pinned{0};
+        std::uint16_t pad1{0};
     };
     static_assert(sizeof(BucketMeta) == 8, "BucketMeta must be 8 bytes");
 
@@ -243,32 +345,36 @@ class HotTier {
 
     // SIEVE eviction within a single bucket. Returns the slot index that
     // is now free for the caller to claim, or kInvalidIdx if no slot can
-    // be evicted (M4 future case where every slot is PINNED).
+    // be evicted (every non-PINNED slot was visited and we ran out of
+    // budget, or every slot is PINNED).
+    //
+    // PINNED slots are unconditionally skipped: their cold-tier write
+    // hasn't completed yet, so dropping them now would create a window
+    // where the entry exists nowhere visible to readers.
     //
     // Algorithm: starting at hand, walk up to 2 × kSlotsPerBucket slots.
+    //   - if slot is PINNED: skip (don't touch visited bit)
     //   - if slot is empty: return it directly (skipped by some race)
     //   - if visited[i] == 0: clear slot via CAS, advance hand, return i
     //   - if visited[i] == 1: clear visited bit (second-chance) and continue
-    // Two passes are sufficient: pass 1 clears all set visited bits,
-    // pass 2 finds them all cleared and evicts the first.
+    // Two passes still suffice when no slots are PINNED.
     std::size_t sieve_evict(Bucket& b, BucketMeta& m) {
         std::uint8_t hand = m.hand.load(std::memory_order_relaxed);
         for (std::size_t k = 0; k < 2 * kSlotsPerBucket; ++k) {
             const std::size_t i = (hand + k) % kSlotsPerBucket;
+            const std::uint16_t pin = m.pinned.load(std::memory_order_relaxed);
+            if (((pin >> i) & 1) != 0) continue;  // PINNED slot
             const std::uint16_t vis = m.visited.load(std::memory_order_relaxed);
             const bool visited_bit = ((vis >> i) & 1) != 0;
             if (visited_bit) {
-                // Second chance: clear visited and continue.
                 m.visited.fetch_and(
                     static_cast<std::uint16_t>(~(std::uint16_t(1) << i)),
                     std::memory_order_relaxed);
                 continue;
             }
-            // visited == 0: evict.
             std::uint64_t expected
                 = b.slots[i].packed.load(std::memory_order_acquire);
             if (expected == 0) {
-                // Slot already empty (concurrent remove or another evictor).
                 m.hand.store(static_cast<std::uint8_t>((i + 1) % kSlotsPerBucket),
                              std::memory_order_relaxed);
                 return i;
@@ -283,7 +389,6 @@ class HotTier {
                              std::memory_order_relaxed);
                 return i;
             }
-            // CAS failed: someone else changed the slot. Continue.
         }
         return kInvalidIdx;
     }
@@ -306,6 +411,18 @@ class HotTier {
         if ((cur & bit) == 0) return;
         m.visited.fetch_and(static_cast<std::uint16_t>(~bit),
                             std::memory_order_relaxed);
+    }
+
+    static void set_pinned(BucketMeta& m, std::size_t slot_idx) {
+        const std::uint16_t bit
+            = static_cast<std::uint16_t>(std::uint16_t(1) << slot_idx);
+        m.pinned.fetch_or(bit, std::memory_order_relaxed);
+    }
+    static void clear_pinned(BucketMeta& m, std::size_t slot_idx) {
+        const std::uint16_t bit
+            = static_cast<std::uint16_t>(std::uint16_t(1) << slot_idx);
+        m.pinned.fetch_and(static_cast<std::uint16_t>(~bit),
+                           std::memory_order_relaxed);
     }
 
     static std::uint64_t pack(std::uint32_t fp, std::uint32_t off) {
@@ -333,6 +450,7 @@ class HotTier {
     std::vector<BucketMeta> meta_;
     std::atomic<std::size_t> size_{0};
     std::atomic<std::size_t> eviction_count_{0};
+    std::atomic<std::size_t> pin_failures_{0};
 };
 
 }  // namespace viper::hiom

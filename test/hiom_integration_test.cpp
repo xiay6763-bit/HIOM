@@ -269,6 +269,9 @@ int run_cold_backed() {
             return 1;
         }
     }
+    // Flusher is asynchronous now; wait for it to drain before
+    // inspecting ColdTier state.
+    hiom.flush_and_wait();
     const std::size_t cold_after_fill = cold->approx_size();
     std::cout << "  inserted " << kv.size()
               << " keys; ColdTier.approx_size=" << cold_after_fill << std::endl;
@@ -367,6 +370,9 @@ int run_cold_backed() {
         }
         removed[i] = true;
     }
+    // Wait for the flusher to apply all updates + removes to ColdTier
+    // before the final verification pass.
+    hiom.flush_and_wait();
 
     // Final pass: removed keys must miss; survivors must read the
     // (possibly-updated) expected value via the full HiOM client path
@@ -420,6 +426,83 @@ int run_cold_backed() {
     return 0;
 }
 
+// Phase B-2 follow-up (M3 Phase A+B+C): exercise reads while the
+// commit buffer still has un-flushed entries. Demonstrates that
+// HiOM stays correct even when ColdTier hasn't caught up: keys
+// resolved via the CCEH safety net are functionally indistinguishable
+// from cold-tier hits, the only difference being cceh_fallback_hits
+// rises during the commit window. Once the flusher drains, the same
+// reads route through ColdTier with cceh_fallback=0.
+int run_commit_window() {
+    std::cout << "=== HiOM commit-window read correctness (M3) ===" << std::endl;
+    cleanup_pool();
+    cleanup_cold_pool();
+
+    auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+    auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+    // Slow the flusher so reads will see in-flight commits.
+    viper::hiom::HiOM<std::uint64_t, std::uint64_t>::FlusherConfig fcfg;
+    fcfg.interval = std::chrono::milliseconds(500);
+    fcfg.high_watermark = 1ULL << 30;  // never wake on size
+    HiOMT hiom(*viper_db, /*hot_buckets_pow2=*/256, cold.get(), fcfg);
+    auto client = hiom.get_client();
+
+    constexpr std::size_t kN = 50'000;
+    std::mt19937_64 rng(0xb00b);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> kv;
+    kv.reserve(kN);
+    for (std::size_t i = 0; i < kN; ++i) {
+        kv.emplace_back(static_cast<std::uint64_t>(i + 1), rng());
+    }
+
+    // Write all keys quickly. Flusher won't wake (huge watermark, slow
+    // interval), so most entries should still be in the buffer when we
+    // start reading.
+    for (auto& [k, v] : kv) {
+        if (!client.put(k, v)) {
+            std::cerr << "  FAIL: put returned false for key " << k << std::endl;
+            return 1;
+        }
+    }
+    const std::size_t cold_before = cold->approx_size();
+    const std::size_t buf_before = hiom.commit_buffer()->size_hint();
+    std::cout << "  after fill: ColdTier=" << cold_before
+              << " buffer=" << buf_before
+              << " (most writes still in buffer)" << std::endl;
+    if (buf_before == 0) {
+        std::cerr << "  WARN: flusher already drained; can't exercise the"
+                  << " commit-window path with this timing." << std::endl;
+    }
+
+    const auto cf0 = hiom.stats().cceh_fallback_hits.load();
+    std::size_t hits = 0, misses = 0, mismatches = 0;
+    for (const auto& [k, expected] : kv) {
+        std::uint64_t got = 0;
+        if (!client.get(k, &got)) ++misses;
+        else if (got != expected) ++mismatches;
+        else ++hits;
+    }
+    const auto cf1 = hiom.stats().cceh_fallback_hits.load();
+    std::cout << "  reads during commit window: hits=" << hits
+              << " misses=" << misses << " mismatches=" << mismatches
+              << " cceh_fallback_delta=" << (cf1 - cf0) << std::endl;
+
+    if (misses != 0 || mismatches != 0) {
+        std::cerr << "  FAIL: in-flight commits observed lost or stale"
+                  << std::endl;
+        return 1;
+    }
+    // Now drain and confirm post-flush state is consistent.
+    hiom.flush_and_wait();
+    if (cold->approx_size() != kN) {
+        std::cerr << "  FAIL: post-flush ColdTier=" << cold->approx_size()
+                  << " expected " << kN << std::endl;
+        return 1;
+    }
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -428,6 +511,7 @@ int main() {
     rc |= run_update_remove();
     rc |= run_microbench();
     rc |= run_cold_backed();
+    rc |= run_commit_window();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

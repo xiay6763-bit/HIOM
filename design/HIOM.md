@@ -13,45 +13,47 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 ## Status (2026-05-03)
 
 - **Phase**: M0 ✅ complete; M1 functionally complete except EBR
-  (deferred to M4); **M2 Phase B-2 complete** — HiOM ↔ ColdTier
-  integration is in place: every put/update/remove mirrors into
-  ColdTier; reads consult HotTier → ColdTier → CCEH (CCEH still kept
-  as the M2 safety net). Split worker is descoped to "future work
-  after paper" — pre-sized buckets + overflow chains already cover the
-  M2 exit, and ColdTier authoritativeness (without CCEH backstop) is
-  M3's responsibility.
+  (deferred to M4); M2 Phase B-1 / B-2 ✅ complete; **M3 Phase A+B+C
+  complete** — per-thread commit buffer (on `concurrentqueue` with
+  ProducerToken), background flusher with timer + high-watermark
+  triggers, HotTier PINNED bit gating SIEVE eviction, write path
+  switched to PM → HotTier(PINNED) → buffer.push. CCEH safety net
+  retained for now; removing it is M3 Phase D.
 - **Code on disk**:
-  - `include/viper/hiom/hot_tier.hpp` (~330 lines): `viper::hiom::HotTier`
-    standalone hash table with packed (fp, offset) slots and SIEVE.
-  - `include/viper/hiom/offset_codec.hpp` (~110 lines): 4 B ↔ KVOffset
-    codec + 32-region block-base map (M0 uses 1 degenerate region).
-  - `include/viper/hiom/hiom.hpp` (~250 lines): `HiOM<K,V>` wrapper
-    around Viper, now with optional `ColdTier*` reference.
-  - `include/viper/hiom/cold_tier.hpp` (~560 lines): PM-backed
-    linear-hashing index with overflow chains and `parallel_load`.
-  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): standalone HotTier.
-  - `test/hiom_integration_test.cpp` (~310 lines, 4 tests): HiOM↔Viper
-    correctness + hit-mostly throughput vs raw Viper + ColdTier-backed
-    end-to-end (200K keys, asserts cceh_fallback=0 in steady state).
-  - `test/cold_tier_test.cpp` (~370 lines, 9 tests): correctness, update
-    CAS, remove+reactivate, close+reopen persistence, overflow chain
-    stress, 8-thread concurrent stress, parallel_load, scalable M2-exit
-    harness, single-thread microbench.
-  - `include/viper/viper.hpp` has TWO new additive public methods:
-    `Client::hiom_peek_offset` and `ReadOnlyClient::hiom_read_at_offset`.
-    No existing API changed.
+  - `include/viper/hiom/hot_tier.hpp` (~410 lines): standalone hash
+    table; M3 Phase B added PINNED bits in BucketMeta + `SlotRef`,
+    `upsert_pinned`, `unpin`, and PINNED-aware `sieve_evict`.
+  - `include/viper/hiom/offset_codec.hpp` (~110 lines): unchanged.
+  - `include/viper/hiom/cold_tier.hpp` (~560 lines): unchanged from M2.
+  - `include/viper/hiom/commit_buffer.hpp` (~110 lines, **new**): M3
+    Phase A. CommitEntry layout + `CommitBuffer` wrapping
+    `moodycamel::ConcurrentQueue` with per-producer / per-consumer
+    tokens and a clamped `try_drain`.
+  - `include/viper/hiom/hiom.hpp` (~440 lines): M3 Phase C. HiOM owns
+    a `CommitBuffer` + background flusher thread when ColdTier is
+    attached; Client write path uses lazy `ProducerToken` +
+    `push_commit`; `flush_and_wait()` + `FlusherConfig` surface;
+    `commits_flushed` stat.
+  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): unchanged — PINNED
+    defaults to 0, so M0/M1 behaviour is preserved.
+  - `test/hiom_integration_test.cpp` (~440 lines, **5 tests**): M0
+    correctness, M0 update/remove, M0 vs raw-Viper microbench,
+    Phase B-2 ColdTier-backed end-to-end (with `flush_and_wait`),
+    M3 commit-window read correctness (slow flusher → reads in flight
+    must be served correctly via CCEH safety net).
+  - `test/cold_tier_test.cpp` (~370 lines, 9 tests): unchanged.
+  - `include/viper/viper.hpp`: CCEH-tombstone-leak guard in
+    `Client::get` / `ReadOnlyClient::get` (from previous turn).
 - **Throughputs (single-threaded)**:
   - HotTier standalone lookup: 135 M ops/s.
-  - HiOM full-path lookup (HotTier hit + decode + PM verify-on-key):
-    49.6 M ops/s vs raw Viper 48.8 M ops/s — ratio 1.02 (M0 path).
-  - HiOM with ColdTier attached, hot tier intentionally undersized
-    (4096 slots vs 200K keys): all 200K reads route through ColdTier;
-    cceh_fallback=0 in steady state.
-  - ColdTier insert: 3.41 M ops/s (clean run); 1.19 M/s when run after
-    a separate large-pool test (PM bandwidth interference).
-  - ColdTier lookup: 200 M ops/s (no PM verify since this is a pure
-    index lookup; decode handled at the caller).
-  - ColdTier parallel_load: 500K entries scanned in 22 ms with 32 threads.
+  - HiOM full-path lookup (buffered write path doesn't change reads):
+    49.5 M ops/s vs raw Viper 47.5 M/s — ratio 1.04.
+  - HiOM with ColdTier + flusher, commit-window correctness test:
+    50K writes complete with buffer holding all of them; 50K reads
+    during the commit window all hit (45,904 via CCEH safety net,
+    rest via HotTier); post-flush ColdTier=50K.
+  - ColdTier insert: 3.32 M ops/s (clean run, no regression).
+  - ColdTier lookup: 201 M ops/s.
 - **Cross-Viper CCEH tombstone leak — FIXED (2026-05-03)**: at scale,
   `viper::Viper::Client::remove` followed by `Client::get` was leaking
   ~0.05–0.75% of removed keys back via a stale CCEH offset
@@ -698,13 +700,56 @@ intentional setup on shared `/pmem0`).
    CCEH tombstone leak that previously blocked this is now fixed in
    `viper.hpp` (see Status note). Removing CCEH itself remains M3.
 
-### M3 — Commit buffer + group commit (1 week)
+### M3 — Commit buffer + group commit (1 week) — Phase A+B+C complete (2026-05-03)
 
-- [ ] Per-thread `commit_buffer` (lock-free SPSC ring on `concurrentqueue`).
-- [ ] Background flusher: drain to cold tier in batched cache-line-aligned
-      writes (sort by destination bucket).
-- [ ] Three-condition flush trigger: buffer-size, pinned-count, timer.
-- [ ] Inline-flush fallback when pinned-count exceeds threshold.
+Phase A (commit buffer infrastructure), B (HotTier PINNED), and C
+(write-path switch) all landed in this turn. Phase D (retire CCEH
+safety net) is the next chunk.
+
+- [x] Per-thread `commit_buffer`. *Implemented as a shared
+      `moodycamel::ConcurrentQueue<CommitEntry>` with a per-Client
+      `ProducerToken` (lazy-allocated on first write) — gives near-SPSC
+      enqueue performance per producer, MPMC drain semantics for the
+      flusher. See `include/viper/hiom/commit_buffer.hpp`.*
+- [x] Background flusher: drain to cold tier in batched writes
+      (sort by 64-bit fp so ColdTier upserts hit adjacent buckets;
+      cache-line-aligned bulk-write API to ColdTier deferred — for
+      now we issue per-entry `cold_->upsert` in sorted order, which
+      already gives bucket cache locality). Single flusher thread per
+      HiOM instance; lifecycle owned by the HiOM constructor/destructor.
+- [x] HotTier PINNED to keep buffered writes alive. *Phase B.* Added
+      a 16-bit `pinned` field to `BucketMeta` (in the existing 5-byte
+      pad — struct still 8 B), `upsert_pinned`/`unpin`, and a
+      `sieve_evict` that skips PINNED slots without touching their
+      visited bit. `pin_failures_` counter tracks bucket-full cases
+      where the entry can't be hot-cached but can still go through
+      the buffer.
+- [x] Two-condition flush trigger: timer (`FlusherConfig.interval`,
+      default 5 ms) + buffer-size high-watermark (default 1024 entries
+      → wakes flusher early on bursty workloads).
+- [ ] Pinned-count threshold trigger and inline-flush fallback.
+      *Deferred to M4* — needs the full PINNED → IN_FLUSH → UNPINNED
+      state machine to back-pressure correctly.
+
+Exit (M3 Phase A+B+C met): `run_cold_backed` integration (200K keys,
+buffered through commit buffer, drained via `flush_and_wait` before
+verify) gets `cold=200000`, `cceh_fallback=0`, all reads correct.
+`run_commit_window` exercises a slow-flusher configuration and shows
+50K reads served correctly while the buffer holds 50K un-flushed
+entries (45,904 reads via CCEH safety net, post-flush state
+consistent). `cold_tier_test` and the M0 sub-tests unchanged and
+passing.
+
+**Phase D (next, before M4):**
+1. Retire CCEH on the read path. ColdTier becomes the authoritative
+   offset map; `cceh_fallback_hits` should stay at 0 by construction
+   (any HotTier+ColdTier double-miss returns false).
+2. Remove the `viper_.get` fallback from HiOM Client::get; the M3
+   commit-window test must be tightened to call `flush_and_wait`
+   inline if it wants reads to find recent writes (or accept that
+   uncommitted reads return false).
+3. Audit the recovery path: when CCEH is gone, re-startup must rebuild
+   ColdTier directly from VPage scan — overlaps with M5/M6.
 
 ### M4 — Pin invariants + state machine (1 week)
 

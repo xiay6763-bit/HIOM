@@ -35,12 +35,20 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "viper/cceh.hpp"
 #include "viper/viper.hpp"
 #include "viper/hiom/cold_tier.hpp"
+#include "viper/hiom/commit_buffer.hpp"
 #include "viper/hiom/hot_tier.hpp"
 #include "viper/hiom/offset_codec.hpp"
 
@@ -83,15 +91,47 @@ class HiOM {
         std::atomic<std::uint64_t> cold_misses{0};
         std::atomic<std::uint64_t> cold_fp_collisions{0};
         std::atomic<std::uint64_t> cceh_fallback_hits{0};
+        std::atomic<std::uint64_t> commits_flushed{0};
+    };
+
+    // Tunables for the background flusher. Defaults are chosen to
+    // balance latency (drain in <10 ms steady state) against per-batch
+    // overhead. Caller can override at construction.
+    struct FlusherConfig {
+        std::chrono::milliseconds interval{std::chrono::milliseconds(5)};
+        std::size_t high_watermark{1024};   // wake on size_hint() >= this
+        std::size_t batch_max{8192};        // drain at most this many per cycle
     };
 
     HiOM(ViperT& viper, std::size_t hot_buckets_pow2,
-         ColdTier* cold = nullptr)
+         ColdTier* cold = nullptr,
+         FlusherConfig fcfg = FlusherConfig{})
         : viper_(viper),
           hot_(hot_buckets_pow2),
           cold_(cold),
-          base_map_{}  // M0/M2: all zero, single region 0
-    {}
+          base_map_{},  // M0/M2: all zero, single region 0
+          fcfg_(fcfg)
+    {
+        if (cold_ != nullptr) {
+            commit_buf_ = std::make_unique<CommitBuffer>();
+            flusher_consumer_tok_ = std::make_unique<moodycamel::ConsumerToken>(
+                commit_buf_->make_consumer_token());
+            flusher_ = std::thread([this]() { flusher_loop(); });
+        }
+    }
+
+    ~HiOM() {
+        if (flusher_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(flush_mu_);
+                stop_ = true;
+            }
+            flush_cv_.notify_all();
+            flusher_.join();
+            // Drain anything left synchronously, just in case.
+            drain_once(/*max=*/std::numeric_limits<std::size_t>::max());
+        }
+    }
 
     HiOM(const HiOM&) = delete;
     HiOM& operator=(const HiOM&) = delete;
@@ -108,10 +148,13 @@ class HiOM {
             if (!viper_.put(key, value)) return false;
 
             // Step 2: peek the KVOffset Viper just installed and mirror
-            // into HotTier (and ColdTier if attached). Both happen *after*
-            // PM persistence so a crash never leaves either tier pointing
-            // at non-persisted data.
-            mirror_into_tiers(key);
+            // into HotTier (PINNED) and the commit buffer / ColdTier.
+            // All of this happens *after* PM persistence so a crash
+            // never leaves either tier pointing at non-persisted data;
+            // the volatile commit buffer is allowed to be lost on crash
+            // because Viper's CCEH (still the M2/M3 safety net) holds
+            // the same offset and recovery rebuilds from VPage scan.
+            mirror_write(key, CommitEntry::Op::kPut);
             return true;
         }
 
@@ -122,8 +165,6 @@ class HiOM {
                     hiom_.stats_.hot_hits.fetch_add(1, std::memory_order_relaxed);
                     return true;
                 }
-                // Verify failed: fp collision OR concurrent update raced
-                // with our optimistic read. Fall through to ColdTier.
                 hiom_.stats_.hot_fp_collisions.fetch_add(
                     1, std::memory_order_relaxed);
             } else {
@@ -138,13 +179,9 @@ class HiOM {
                     if (verify_and_read_offset(key, *cold_off, value)) {
                         hiom_.stats_.cold_hits.fetch_add(
                             1, std::memory_order_relaxed);
-                        // Warm hot tier so the next lookup of the same
-                        // key skips the ColdTier round-trip.
                         mirror_into_hot_with_offset(key, *cold_off);
                         return true;
                     }
-                    // PM-key mismatch: 64-bit fp collision in ColdTier.
-                    // Real-world rate is ~0; bookkeep and fall through.
                     hiom_.stats_.cold_fp_collisions.fetch_add(
                         1, std::memory_order_relaxed);
                 } else {
@@ -153,34 +190,43 @@ class HiOM {
                 }
             }
 
-            // Final fallback: Viper's CCEH. While ColdTier is attached
-            // this should fire only on the rare fp-collision path; we
-            // count it so tests can assert ~0.
+            // Final fallback: Viper's CCEH. With ColdTier attached this
+            // can fire transiently for entries that are still in the
+            // commit buffer (not yet flushed). We do NOT warm the hot
+            // tier here — that path goes through the buffer too and
+            // would race with the in-flight commit.
             if (!viper_.get(key, value)) return false;
             hiom_.stats_.cceh_fallback_hits.fetch_add(
                 1, std::memory_order_relaxed);
-            // Warm both tiers so the next lookup converges.
-            mirror_into_tiers(key);
-            hiom_.stats_.hot_warmups.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
 
         bool remove(const K& key) {
             const bool ok = viper_.remove(key);
-            if (ok) {
-                hiom_.hot_.remove(key_fingerprint(key));
-                if (hiom_.cold_ != nullptr) {
-                    hiom_.cold_->remove(key_fingerprint64(key));
-                }
+            if (!ok) return false;
+            hiom_.hot_.remove(key_fingerprint(key));
+            if (hiom_.cold_ != nullptr) {
+                // Push remove through the buffer so it serializes with
+                // earlier puts of the same key. Direct cold_.remove
+                // would race with a still-buffered kPut for this fp,
+                // and the flusher would then write the obsolete put
+                // *after* the remove.
+                push_commit({CommitEntry::Op::kRemove,
+                             {}, key_fingerprint64(key),
+                             KVOffset{},  // unused for kRemove
+                             HotTier::SlotRef{}});
             }
-            return ok;
+            return true;
         }
 
         template <typename UpdateFn>
         bool update(const K& key, UpdateFn fn) {
             if (!viper_.update(key, std::move(fn))) return false;
-            // Update wrote a new VPage slot; refresh both tiers.
-            mirror_into_tiers(key);
+            // Viper update is in-place; offset unchanged. Still push a
+            // kPut so HotTier's visited bit re-fires (touch keeps the
+            // entry "hot" for SIEVE) and the buffer's PINNED window
+            // re-arms — harmless duplicate cold-tier upsert.
+            mirror_write(key, CommitEntry::Op::kPut);
             return true;
         }
 
@@ -212,16 +258,36 @@ class HiOM {
         }
 
         // Look up the current KVOffset for `key` via Viper's CCEH and
-        // push it into both tiers. ColdTier carries the full 8 B offset
-        // verbatim; HotTier truncates via the codec (silently skips when
-        // the block is out of range for M0's degenerate 1-region map —
-        // ColdTier still has it, so correctness holds).
-        void mirror_into_tiers(const K& key) {
+        // route it into HotTier (PINNED if buffer attached) + commit
+        // buffer / ColdTier. The HotTier mirror is best-effort (silently
+        // skips when the block is out of range for M0's degenerate
+        // 1-region map; ColdTier still has it, so correctness holds).
+        void mirror_write(const K& key, CommitEntry::Op op) {
             KVOffset off = viper_.hiom_peek_offset(key);
             if (off.is_tombstone()) return;
-            mirror_into_hot_with_offset(key, off);
+
+            HotTier::SlotRef ref{};
+            const auto [block, page, slot] = off.get_offsets();
+            auto packed = encode(block,
+                                 static_cast<std::uint8_t>(page),
+                                 static_cast<std::uint16_t>(slot),
+                                 route_to_region_default(),
+                                 hiom_.base_map_);
+            if (packed) {
+                if (hiom_.cold_ != nullptr) {
+                    // Buffered path: pin so the slot survives until the
+                    // flusher writes the corresponding cold-tier entry.
+                    ref = hiom_.hot_.upsert_pinned(
+                        key_fingerprint(key), *packed);
+                } else {
+                    // No buffer; classic M0 mirror. Eviction is safe
+                    // because Viper's CCEH still holds the offset.
+                    hiom_.hot_.upsert(key_fingerprint(key), *packed);
+                }
+            }
+
             if (hiom_.cold_ != nullptr) {
-                hiom_.cold_->upsert(key_fingerprint64(key), off);
+                push_commit({op, {}, key_fingerprint64(key), off, ref});
             }
         }
 
@@ -239,23 +305,129 @@ class HiOM {
             hiom_.hot_.upsert(key_fingerprint(key), *packed);
         }
 
+        // Push a CommitEntry into the buffer using this Client's
+        // per-thread ProducerToken (allocated lazily on first write).
+        // Token allocation is the only contention point with the queue
+        // here; subsequent pushes are near-SPSC.
+        void push_commit(const CommitEntry& e) {
+            if (!prod_tok_) {
+                prod_tok_ = std::make_unique<moodycamel::ProducerToken>(
+                    hiom_.commit_buf_->make_producer_token());
+            }
+            hiom_.commit_buf_->push(*prod_tok_, e);
+            // Wake the flusher if we crossed the high watermark, so we
+            // don't always wait the full kFlushIntervalMs of latency.
+            if (hiom_.commit_buf_->size_hint() >= hiom_.fcfg_.high_watermark) {
+                hiom_.flush_cv_.notify_one();
+            }
+        }
+
         HiOM& hiom_;
         typename ViperT::Client viper_;
+        std::unique_ptr<moodycamel::ProducerToken> prod_tok_;
     };
 
     Client get_client() { return Client{*this, viper_.get_client()}; }
 
     HotTier& hot_tier() { return hot_; }
     ColdTier* cold_tier() { return cold_; }
+    CommitBuffer* commit_buffer() { return commit_buf_.get(); }
     const Stats& stats() const { return stats_; }
     BlockBaseMap& base_map() { return base_map_; }
 
+    // Block until the commit buffer is fully drained (all pending
+    // writes have been applied to ColdTier and corresponding HotTier
+    // pins released). Used by tests and graceful shutdown sequences;
+    // not on the steady-state path.
+    void flush_and_wait() {
+        if (!commit_buf_) return;
+        while (true) {
+            flush_cv_.notify_all();
+            // Caught up only when the queue is empty AND the flusher
+            // is not mid-batch. Both flags must be observed clear in
+            // sequence; a producer may push between them, so we recheck
+            // a few times before declaring stable.
+            if (commit_buf_->size_hint() == 0
+                && !flushing_in_progress_.load(std::memory_order_acquire)) {
+                bool stable = true;
+                for (int i = 0; i < 4; ++i) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    if (commit_buf_->size_hint() != 0
+                        || flushing_in_progress_.load(
+                               std::memory_order_acquire)) {
+                        stable = false;
+                        break;
+                    }
+                }
+                if (stable) return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+
   private:
+    // Single-cycle drain helper, shared between the flusher loop and
+    // the destructor's final cleanup pass. Returns the count drained.
+    std::size_t drain_once(std::size_t max) {
+        if (!commit_buf_ || cold_ == nullptr) return 0;
+        std::vector<CommitEntry> batch;
+        const std::size_t got = commit_buf_->try_drain(
+            *flusher_consumer_tok_, batch, max);
+        if (got == 0) return 0;
+        flushing_in_progress_.store(true, std::memory_order_release);
+        std::sort(batch.begin(), batch.end(),
+                  [](const CommitEntry& a, const CommitEntry& b) {
+                      return a.fp64 < b.fp64;
+                  });
+        for (const auto& e : batch) {
+            if (e.op == CommitEntry::Op::kPut) {
+                cold_->upsert(e.fp64, e.off);
+            } else {
+                cold_->remove(e.fp64);
+            }
+            if (e.hot_slot.valid) hot_.unpin(e.hot_slot);
+        }
+        stats_.commits_flushed.fetch_add(got, std::memory_order_relaxed);
+        flushing_in_progress_.store(false, std::memory_order_release);
+        return got;
+    }
+
+    // Background flusher: wakes on timer or high-watermark notify and
+    // drains the commit buffer in batches.
+    void flusher_loop() {
+        std::unique_lock<std::mutex> lk(flush_mu_);
+        while (!stop_) {
+            flush_cv_.wait_for(lk, fcfg_.interval, [this] {
+                return stop_
+                    || (commit_buf_ && commit_buf_->size_hint()
+                                       >= fcfg_.high_watermark);
+            });
+            lk.unlock();
+            // Drain in chunks until under the watermark again, so a
+            // sudden spike doesn't wait kFlushIntervalMs per chunk.
+            std::size_t drained;
+            do {
+                drained = drain_once(fcfg_.batch_max);
+            } while (drained > 0
+                     && commit_buf_->size_hint() >= fcfg_.high_watermark);
+            lk.lock();
+        }
+    }
+
     ViperT& viper_;
     HotTier hot_;
     ColdTier* cold_;
     BlockBaseMap base_map_;
     Stats stats_;
+    FlusherConfig fcfg_;
+
+    std::unique_ptr<CommitBuffer> commit_buf_;
+    std::unique_ptr<moodycamel::ConsumerToken> flusher_consumer_tok_;
+    std::thread flusher_;
+    std::mutex flush_mu_;
+    std::condition_variable flush_cv_;
+    bool stop_{false};
+    std::atomic<bool> flushing_in_progress_{false};
 };
 
 }  // namespace viper::hiom
