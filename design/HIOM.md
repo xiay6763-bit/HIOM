@@ -12,9 +12,10 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ## Status (2026-05-03)
 
-- **Phase**: M0 ✅ complete (standalone + Viper integration); M1 (SIEVE
-  eviction) functionally complete except EBR (deferred to M4 — see §M1
-  note below).
+- **Phase**: M0 ✅ complete; M1 functionally complete except EBR
+  (deferred to M4); **M2 Phase B-1 complete** — overflow chains,
+  region-parallel load, multi-thread stress all in place. Phase B-2
+  (split worker + HiOM integration replacing CCEH) is the next chunk.
 - **Code on disk**:
   - `include/viper/hiom/hot_tier.hpp` (~330 lines): `viper::hiom::HotTier`
     standalone hash table with packed (fp, offset) slots and SIEVE.
@@ -22,15 +23,27 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     codec + 32-region block-base map (M0 uses 1 degenerate region).
   - `include/viper/hiom/hiom.hpp` (~190 lines): `HiOM<K,V>` wrapper
     around Viper with HotTier in front of Viper's CCEH.
+  - `include/viper/hiom/cold_tier.hpp` (~410 lines): PM-backed
+    linear-hashing index with overflow chains and `parallel_load`.
   - `test/hot_tier_test.cpp` (~660 lines, 8 tests): standalone HotTier.
-  - `test/hiom_integration_test.cpp` (~210 lines, 3 tests): correctness,
-    update/remove, hit-mostly throughput vs raw Viper.
+  - `test/hiom_integration_test.cpp` (~210 lines, 3 tests): HiOM↔Viper
+    correctness + hit-mostly throughput vs raw Viper.
+  - `test/cold_tier_test.cpp` (~370 lines, 9 tests): correctness, update
+    CAS, remove+reactivate, close+reopen persistence, overflow chain
+    stress, 8-thread concurrent stress, parallel_load, scalable M2-exit
+    harness, single-thread microbench.
   - `include/viper/viper.hpp` has TWO new additive public methods:
     `Client::hiom_peek_offset` and `ReadOnlyClient::hiom_read_at_offset`.
     No existing API changed.
-- **Single-threaded lookup**: HotTier standalone 135 M ops/s; full HiOM
-  path (HotTier hit + decode + PM verify-on-key) 54.6 M ops/s vs raw
-  Viper 49.5 M ops/s — ratio 1.103, M0 exit met.
+- **Throughputs (single-threaded)**:
+  - HotTier standalone lookup: 135 M ops/s.
+  - HiOM full-path lookup (HotTier hit + decode + PM verify-on-key):
+    54.6 M ops/s vs raw Viper 49.5 M ops/s — ratio 1.103.
+  - ColdTier insert: 3.41 M ops/s (clean run); 1.19 M/s when run after
+    a separate large-pool test (PM bandwidth interference).
+  - ColdTier lookup: 200 M ops/s (no PM verify since this is a pure
+    index lookup; decode handled at the caller).
+  - ColdTier parallel_load: 500K entries scanned in 22 ms with 32 threads.
 - **Prior work**: An earlier write-back DRAM cache prototype (`viper_x.hpp`
   + `dram_tier.hpp`) was deleted from the tree on 2026-05-02. Its design —
   full `(K,V)` caching with epoch consistency — is orthogonal to HiOM's
@@ -574,16 +587,63 @@ the verify-on-PM-key read on every hit.
       (all-visited bucket evicts exactly one), no-loss stress (10k
       inserts into 256 slots, last-write-wins preserved).
 
-### M2 — Cold tier (linear hashing) (1.5 weeks)
+### M2 — Cold tier (linear hashing) (1.5 weeks) — Phase B-1 complete (2026-05-03)
 
-- [ ] `hiom::cold_tier<K>` linear-hashing on PM with 32 fixed regions.
-- [ ] In-place insert / lookup / delete.
-- [ ] Region-parallel load (entry point for fast recovery).
-- [ ] Per-region split-point advancement.
-- [ ] Crash-safe single-region update via 8-byte atomic (Optane ADR).
+Phase A (earlier): standalone PM-backed `ColdTier` with insert / lookup /
+delete + close+reopen persistence.
 
-Exit: cold tier insert ≥ 2M ops/sec; load 100M entries in ≤ 5 s with 32
-threads.
+Phase B-1 (this turn): added overflow chains, region-parallel load, and
+8-thread concurrent stress. Bucket-full no longer occurs below total-cap;
+multi-thread correctness validated.
+
+Phase B-2 (next): linear-hash split worker (consolidate overflow into
+mirror buckets), HiOM integration to replace CCEH on miss path.
+
+- [x] `hiom::cold_tier<K>` linear-hashing on PM with 32 fixed regions.
+      *Each region owns `main_buckets_per_region` Buckets + an overflow
+      pool of equal default size; routing splits the 64-bit fingerprint
+      into disjoint region-id (top 5 bits) and bucket-id bits.*
+- [x] In-place insert / lookup / delete. *Insert is single-pass over the
+      bucket chain — find match → CAS update; or remember first empty
+      slot and claim it after the chain ends. Delete is a single 8 B
+      atomic CAS to a tombstone offset; the fingerprint stays so a
+      subsequent re-insert reactivates via match-and-update.*
+- [x] Region-parallel load (entry point for fast recovery).
+      *`parallel_load(num_threads, visitor)` strides the 32 regions
+      across `num_threads` workers; visitor sees `(fingerprint, offset)`
+      for every live entry. 500K entries scanned in ~22 ms, 1M in 40 ms.*
+- [ ] Per-region split-point advancement. *Phase B-2.* Currently relies
+      on overflow chains to absorb bucket-skew; pre-sizing handles
+      capacity. Split will collapse long chains.
+- [x] Crash-safe single-region update via 8-byte atomic (Optane ADR).
+
+Exit (M2 subset met): single-threaded insert **3.41 M ops/s** clean
+(≥ 2 M/s target), 1.19 M/s when run after another large-pool test (PM
+write-buffer interference). Lookup 200 M ops/s. Concurrent 8-thread
+upsert+lookup: 0 failures across 800K ops. Overflow chain stress:
+200K inserts, 9011 overflow buckets, all keys findable.
+
+For the **100M-entry parallel_load ≤ 5 s** part of M2 exit: the test
+harness scales via the `COLD_TIER_EXIT_N` env var. Default 1M finishes
+in <1 s; the real 100M run is opt-in until Phase B-2 because the PM
+file alone (~3 GB) needs intentional setup on shared `/pmem0`.
+
+**Phase B-1 footprint (2026-05-03):**
+- `include/viper/hiom/cold_tier.hpp`: rewritten to ~410 lines. Bucket
+  header now carries `(occupancy_bitmap, has_overflow, next_overflow_idx)`.
+  `parallel_load(num_threads, visitor)` added.
+- `test/cold_tier_test.cpp`: extended to 9 tests — added overflow-chain
+  stress, 8-thread concurrent stress, parallel_load, and a scalable
+  M2-exit harness.
+
+**Phase B-2 (next, before M3):**
+1. `split_step(region)` — advance split_ptr, relocate entries from
+   over-loaded main bucket into a mirror, drain associated overflow chain.
+2. HiOM integration: ColdTier becomes the authoritative offset map on
+   HotTier miss; CCEH fallback removed.
+3. Multi-thread upsert with shared keys (today's stress uses disjoint
+   keys per thread). Adds duplicate-fp prevention via per-chain lock.
+4. Real 100M-entry parallel-load run on PM, verifying ≤ 5 s exit.
 
 ### M3 — Commit buffer + group commit (1 week)
 
