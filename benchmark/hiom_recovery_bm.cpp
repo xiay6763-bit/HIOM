@@ -48,13 +48,14 @@
 
 namespace {
 
-constexpr const char* kPoolDir = "/pmem0/viper_hiom_recbm";
+constexpr const char* kRootDir = "/pmem0/hiom/recovery_bench";
+constexpr const char* kPoolDir = "/pmem0/hiom/recovery_bench/pool";
 constexpr const char* kColdPoolFile
-    = "/pmem0/viper_hiom_recbm_cold/cold.bin";
-constexpr const char* kColdPoolDir = "/pmem0/viper_hiom_recbm_cold";
+    = "/pmem0/hiom/recovery_bench/cold/cold.bin";
+constexpr const char* kColdPoolDir = "/pmem0/hiom/recovery_bench/cold";
 constexpr const char* kCheckpointFile
-    = "/pmem0/viper_hiom_recbm_chkpt/chkpt.bin";
-constexpr const char* kCheckpointDir = "/pmem0/viper_hiom_recbm_chkpt";
+    = "/pmem0/hiom/recovery_bench/chkpt/chkpt.bin";
+constexpr const char* kCheckpointDir = "/pmem0/hiom/recovery_bench/chkpt";
 
 // Generous pool sizing so 100M entries (1.6 GiB raw + bookkeeping)
 // fit. 8 GiB covers up to ~400M (uint64_t, uint64_t) pairs.
@@ -110,14 +111,15 @@ void cleanup_dir(const char* dir, const char* expected_prefix) {
 
 void cleanup_all() {
     // Pool dir is created by Viper::create itself; just remove it.
-    if (std::string(kPoolDir).find("/pmem0/viper_hiom_recbm") != 0) {
+    if (std::string(kPoolDir).find("/pmem0/hiom/recovery_bench/") != 0) {
         std::cerr << "Refusing to clean unfamiliar pool: " << kPoolDir
                   << std::endl;
         std::exit(2);
     }
     std::filesystem::remove_all(kPoolDir);
-    cleanup_dir(kColdPoolDir, "/pmem0/viper_hiom_recbm_cold");
-    cleanup_dir(kCheckpointDir, "/pmem0/viper_hiom_recbm_chkpt");
+    std::filesystem::create_directories(kRootDir);
+    cleanup_dir(kColdPoolDir, "/pmem0/hiom/recovery_bench/cold");
+    cleanup_dir(kCheckpointDir, "/pmem0/hiom/recovery_bench/chkpt");
 }
 
 // Prefill N entries via raw Viper + direct ColdTier upsert. We

@@ -27,7 +27,8 @@
 
 namespace {
 
-constexpr const char* kPoolFile = "/pmem0/hiom_cold_tier_test";
+constexpr const char* kPoolDir = "/pmem0/hiom/cold_tier_test";
+constexpr const char* kPoolFile = "/pmem0/hiom/cold_tier_test/cold.bin";
 constexpr std::size_t kSmallMain = 1024;
 constexpr std::size_t kSmallOverflow = 4096;
 constexpr std::size_t kLargeMain = 8192;
@@ -38,12 +39,13 @@ using viper::hiom::ColdTier;
 using Offset = ColdTier::Offset;
 
 void cleanup() {
-    if (std::string(kPoolFile).find("/pmem0/hiom_cold_tier_test") != 0) {
+    if (std::string(kPoolFile).find("/pmem0/hiom/cold_tier_test/") != 0) {
         std::cerr << "Refusing unfamiliar pool path: " << kPoolFile
                   << std::endl;
         std::exit(2);
     }
     std::filesystem::remove(kPoolFile);
+    std::filesystem::create_directories(kPoolDir);
 }
 
 Offset make_offset(std::uint64_t i) {

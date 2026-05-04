@@ -33,11 +33,12 @@
 
 namespace {
 
-constexpr const char* kPoolDir = "/pmem0/viper_hiom_test";
-constexpr const char* kColdPoolFile = "/pmem0/viper_hiom_test_cold/cold.bin";
-constexpr const char* kColdPoolDir  = "/pmem0/viper_hiom_test_cold";
-constexpr const char* kCheckpointDir  = "/pmem0/viper_hiom_test_chkpt";
-constexpr const char* kCheckpointFile = "/pmem0/viper_hiom_test_chkpt/chkpt.bin";
+constexpr const char* kRootDir = "/pmem0/hiom/integration_test";
+constexpr const char* kPoolDir = "/pmem0/hiom/integration_test/pool";
+constexpr const char* kColdPoolFile = "/pmem0/hiom/integration_test/cold/cold.bin";
+constexpr const char* kColdPoolDir  = "/pmem0/hiom/integration_test/cold";
+constexpr const char* kCheckpointDir  = "/pmem0/hiom/integration_test/chkpt";
+constexpr const char* kCheckpointFile = "/pmem0/hiom/integration_test/chkpt/chkpt.bin";
 constexpr std::size_t kPoolSize = 1ULL << 30;     // 1 GiB
 constexpr std::size_t kNumKeys = 200'000;          // ~150 blocks of uint64_t pairs, well under 8K limit
 constexpr std::size_t kHotBuckets = 1ULL << 15;    // 32K buckets × 16 = 512K slots
@@ -48,19 +49,20 @@ using HiOMT = viper::hiom::HiOM<std::uint64_t, std::uint64_t>;
 
 void cleanup_pool() {
     // Defensive: same pattern as benchmark/fixtures/viper_fixture.hpp.
-    // Only touch our own directory under /pmem0; never blanket-rm.
-    if (std::string(kPoolDir).find("/pmem0/viper_hiom_test") != 0) {
+    // Only touch our own directory under /pmem0/hiom/; never blanket-rm.
+    if (std::string(kPoolDir).find("/pmem0/hiom/integration_test/") != 0) {
         std::cerr << "Refusing to clean unfamiliar pool path: " << kPoolDir
                   << std::endl;
         std::exit(2);
     }
     std::filesystem::remove_all(kPoolDir);
+    std::filesystem::create_directories(kRootDir);
 }
 
 void cleanup_cold_pool() {
     // Same defensive check for the ColdTier file. The directory holds
     // exactly cold.bin; nothing else from other users.
-    if (std::string(kColdPoolDir).find("/pmem0/viper_hiom_test_cold") != 0) {
+    if (std::string(kColdPoolDir).find("/pmem0/hiom/integration_test/") != 0) {
         std::cerr << "Refusing to clean unfamiliar cold path: " << kColdPoolDir
                   << std::endl;
         std::exit(2);
@@ -71,7 +73,7 @@ void cleanup_cold_pool() {
 
 void cleanup_checkpoint_dir() {
     // Same defensive pattern. Holds only chkpt.bin (4 KB).
-    if (std::string(kCheckpointDir).find("/pmem0/viper_hiom_test_chkpt") != 0) {
+    if (std::string(kCheckpointDir).find("/pmem0/hiom/integration_test/") != 0) {
         std::cerr << "Refusing to clean unfamiliar checkpoint path: "
                   << kCheckpointDir << std::endl;
         std::exit(2);
