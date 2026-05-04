@@ -422,6 +422,15 @@ class Viper {
     Client get_client();
     ReadOnlyClient get_read_only_client();
 
+    // HiOM hook (M5 checkpoint): the next-block-page write frontier as a
+    // packed offset_size_t (i.e. KVOffset{block, page, 0}). The
+    // checkpoint records this so M6 recovery can bound its VPage scan
+    // to [0, frontier) rather than walking the whole pool. Acquire-load
+    // pairs with the release-store inside get_new_block().
+    offset_size_t hiom_vpage_frontier() const {
+        return current_block_page_.load(std::memory_order_acquire);
+    }
+
   protected:
     static ViperBase init_pool(const std::string& pool_file, uint64_t pool_size,
                                bool is_new_pool, ViperConfig v_config);

@@ -17,6 +17,7 @@
 //      pin_failures==0 and hot_hits==N for that case.
 
 #include "viper/viper.hpp"
+#include "viper/hiom/checkpoint.hpp"
 #include "viper/hiom/cold_tier.hpp"
 #include "viper/hiom/hiom.hpp"
 
@@ -35,6 +36,8 @@ namespace {
 constexpr const char* kPoolDir = "/pmem0/viper_hiom_test";
 constexpr const char* kColdPoolFile = "/pmem0/viper_hiom_test_cold/cold.bin";
 constexpr const char* kColdPoolDir  = "/pmem0/viper_hiom_test_cold";
+constexpr const char* kCheckpointDir  = "/pmem0/viper_hiom_test_chkpt";
+constexpr const char* kCheckpointFile = "/pmem0/viper_hiom_test_chkpt/chkpt.bin";
 constexpr std::size_t kPoolSize = 1ULL << 30;     // 1 GiB
 constexpr std::size_t kNumKeys = 200'000;          // ~150 blocks of uint64_t pairs, well under 8K limit
 constexpr std::size_t kHotBuckets = 1ULL << 15;    // 32K buckets × 16 = 512K slots
@@ -64,6 +67,17 @@ void cleanup_cold_pool() {
     }
     std::filesystem::remove_all(kColdPoolDir);
     std::filesystem::create_directories(kColdPoolDir);
+}
+
+void cleanup_checkpoint_dir() {
+    // Same defensive pattern. Holds only chkpt.bin (4 KB).
+    if (std::string(kCheckpointDir).find("/pmem0/viper_hiom_test_chkpt") != 0) {
+        std::cerr << "Refusing to clean unfamiliar checkpoint path: "
+                  << kCheckpointDir << std::endl;
+        std::exit(2);
+    }
+    std::filesystem::remove_all(kCheckpointDir);
+    std::filesystem::create_directories(kCheckpointDir);
 }
 
 int run_correctness() {
@@ -539,6 +553,303 @@ int run_commit_window() {
     return 0;
 }
 
+// M5: A/B checkpoint protocol. Validates that the 4 KB Checkpoint PM
+// file survives close+reopen and recovers to the same record, that
+// torn writes on the active slot fall back to the inactive one, and
+// that HiOM constructor primes its cumulative flushed_count_ + seq_
+// from any restored record.
+//
+// Phases:
+//   (1) Steady-state: 10K writes with cadence=1024 → expect ≥9
+//       checkpoint writes; force_checkpoint to seal post-flush state;
+//       capture the live record.
+//   (2) Reopen Checkpoint alone (no DB) → read_valid() returns the
+//       same record (seq, flushed_count, vpage_frontier, cold_size).
+//   (3) Corrupt the active slot's magic by writing 8 bytes via fwrite
+//       (the file is plain bytes, no need to reach into Checkpoint
+//       internals) → read_valid() falls back to the inactive slot,
+//       whose record has seq < phase-1's.
+//   (4) Fresh PM files everywhere → write some, verify HiOM picks up
+//       flushed_count from the new checkpoint on next construction
+//       and that subsequent writes advance seq monotonically.
+int run_checkpoint_persistence() {
+    std::cout << "=== HiOM A/B checkpoint persistence (M5) ===" << std::endl;
+    cleanup_pool();
+    cleanup_cold_pool();
+    cleanup_checkpoint_dir();
+
+    constexpr std::size_t kN = 10'000;
+    constexpr std::uint64_t kCadence = 1024;
+    constexpr std::size_t kHotBucketsCkpt = 1ULL << 10;  // 16K slots, room for kN
+
+    viper::hiom::CheckpointRecord rec_phase1{};
+
+    // Phase 1: write data with Checkpoint attached, snapshot record.
+    {
+        auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+        auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+        auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+
+        HiOMT::CheckpointConfig ccfg;
+        ccfg.cadence_entries = kCadence;
+        HiOMT hiom(*viper_db, kHotBucketsCkpt, cold.get(),
+                   HiOMT::FlusherConfig{}, chkpt.get(), ccfg);
+        auto client = hiom.get_client();
+
+        std::mt19937_64 rng(0xc4ec0700);
+        for (std::size_t i = 0; i < kN; ++i) {
+            if (!client.put(static_cast<std::uint64_t>(i + 1), rng())) {
+                std::cerr << "  FAIL: put returned false at i=" << i << std::endl;
+                return 1;
+            }
+        }
+        hiom.flush_and_wait();
+        // force_checkpoint after flush_and_wait so the persisted record
+        // captures cold_size==kN and flushed_count==kN regardless of
+        // where the cadence boundaries landed.
+        hiom.force_checkpoint();
+
+        const auto cw = hiom.stats().checkpoints_written.load();
+        // cadence 1024, kN=10000 → at least 10000/1024 = 9 cadence
+        // boundaries, plus the explicit force_checkpoint, so >= 9.
+        const std::uint64_t expected_min = kN / kCadence;
+        std::cout << "  phase 1: writes=" << kN
+                  << " checkpoints_written=" << cw
+                  << " (expected >= " << expected_min << ")" << std::endl;
+        if (cw < expected_min) {
+            std::cerr << "  FAIL: too few checkpoint writes "
+                      << cw << " < " << expected_min << std::endl;
+            return 1;
+        }
+
+        auto rec_opt = chkpt->read_valid();
+        if (!rec_opt) {
+            std::cerr << "  FAIL: read_valid returned nullopt after writes"
+                      << std::endl;
+            return 1;
+        }
+        rec_phase1 = *rec_opt;
+        std::cout << "  phase 1 record: seq=" << rec_phase1.seq
+                  << " flushed=" << rec_phase1.flushed_count
+                  << " frontier=0x" << std::hex << rec_phase1.vpage_frontier
+                  << std::dec
+                  << " cold=" << rec_phase1.cold_size << std::endl;
+
+        if (rec_phase1.flushed_count != kN) {
+            std::cerr << "  FAIL: flushed_count=" << rec_phase1.flushed_count
+                      << " expected " << kN << std::endl;
+            return 1;
+        }
+        if (rec_phase1.cold_size != kN) {
+            std::cerr << "  FAIL: cold_size=" << rec_phase1.cold_size
+                      << " expected " << kN << std::endl;
+            return 1;
+        }
+        if (rec_phase1.vpage_frontier == 0) {
+            std::cerr << "  FAIL: vpage_frontier should be > 0 after writes"
+                      << std::endl;
+            return 1;
+        }
+        if (rec_phase1.seq == 0) {
+            std::cerr << "  FAIL: seq should be > 0 after force_checkpoint"
+                      << std::endl;
+            return 1;
+        }
+    }
+
+    // Phase 2: reopen the checkpoint file alone, verify read_valid()
+    // returns the same record bytes.
+    {
+        auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+        auto rec_opt = chkpt->read_valid();
+        if (!rec_opt) {
+            std::cerr << "  FAIL: phase 2 read_valid returned nullopt"
+                      << std::endl;
+            return 1;
+        }
+        const auto& r = *rec_opt;
+        if (r.seq != rec_phase1.seq
+            || r.flushed_count != rec_phase1.flushed_count
+            || r.vpage_frontier != rec_phase1.vpage_frontier
+            || r.cold_size != rec_phase1.cold_size) {
+            std::cerr << "  FAIL: phase 2 record mismatch:"
+                      << " seq=" << r.seq << "/" << rec_phase1.seq
+                      << " flushed=" << r.flushed_count << "/"
+                      << rec_phase1.flushed_count
+                      << " frontier=" << r.vpage_frontier << "/"
+                      << rec_phase1.vpage_frontier
+                      << " cold=" << r.cold_size << "/"
+                      << rec_phase1.cold_size << std::endl;
+            return 1;
+        }
+        std::cout << "  phase 2: reopen record matches (seq="
+                  << r.seq << ")" << std::endl;
+    }
+
+    // Phase 3: torn-write fallback. Snap the active slot index, close
+    // the checkpoint, corrupt the active slot's magic field via plain
+    // file I/O (avoids any DAX mmap coherence question), reopen, and
+    // verify read_valid() falls back to the older slot.
+    {
+        std::uint64_t active_slot = 0;
+        {
+            auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+            active_slot = chkpt->valid_pointer_raw();
+        }
+        if (active_slot != viper::hiom::Checkpoint::kSlotA
+            && active_slot != viper::hiom::Checkpoint::kSlotB) {
+            std::cerr << "  FAIL: phase 3 unexpected active slot "
+                      << active_slot << std::endl;
+            return 1;
+        }
+        const std::size_t slot_off
+            = (active_slot == viper::hiom::Checkpoint::kSlotA)
+              ? viper::hiom::Checkpoint::kSlotAOffset
+              : viper::hiom::Checkpoint::kSlotBOffset;
+
+        FILE* f = std::fopen(kCheckpointFile, "r+b");
+        if (!f) {
+            std::cerr << "  FAIL: phase 3 fopen failed" << std::endl;
+            return 1;
+        }
+        if (std::fseek(f, static_cast<long>(slot_off), SEEK_SET) != 0) {
+            std::cerr << "  FAIL: phase 3 fseek failed" << std::endl;
+            std::fclose(f);
+            return 1;
+        }
+        std::uint64_t bad = 0xdeadbeefdeadbeefull;
+        if (std::fwrite(&bad, sizeof(bad), 1, f) != 1) {
+            std::cerr << "  FAIL: phase 3 fwrite failed" << std::endl;
+            std::fclose(f);
+            return 1;
+        }
+        std::fflush(f);
+        std::fclose(f);
+
+        auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+        auto rec_opt = chkpt->read_valid();
+        if (!rec_opt) {
+            std::cerr << "  FAIL: torn-write fallback returned nullopt"
+                      << " (both slots unrecoverable?)" << std::endl;
+            return 1;
+        }
+        const auto& r = *rec_opt;
+        // Active slot at corruption time held rec_phase1; fallback
+        // came from the inactive slot which was written one cadence
+        // earlier — strictly older seq.
+        if (r.seq >= rec_phase1.seq) {
+            std::cerr << "  FAIL: torn-write fallback returned seq="
+                      << r.seq << ", not older than corrupted seq="
+                      << rec_phase1.seq << " — fallback didn't engage"
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "  phase 3: torn-write fallback returned older record"
+                  << " seq=" << r.seq << " (corrupted seq="
+                  << rec_phase1.seq << ")" << std::endl;
+    }
+
+    // Phase 4: fresh PM state, build a checkpoint, then construct a
+    // new HiOM with the checkpoint attached and verify it primes
+    // flushed_count_ from the persisted record. Then continue writing
+    // and verify seq advances strictly.
+    {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+
+        // Sub-phase 4a: write a small batch to get a non-zero record.
+        std::uint64_t pre_seq = 0;
+        std::uint64_t pre_flushed = 0;
+        constexpr std::size_t kInit = 5'000;
+        {
+            auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+            auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+
+            HiOMT::CheckpointConfig ccfg;
+            ccfg.cadence_entries = kCadence;
+            HiOMT hiom(*viper_db, kHotBucketsCkpt, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(), ccfg);
+            auto client = hiom.get_client();
+            std::mt19937_64 rng(0x42);
+            for (std::size_t i = 0; i < kInit; ++i) {
+                client.put(static_cast<std::uint64_t>(i + 1), rng());
+            }
+            hiom.flush_and_wait();
+            hiom.force_checkpoint();
+
+            auto rec_opt = chkpt->read_valid();
+            if (!rec_opt || rec_opt->flushed_count != kInit) {
+                std::cerr << "  FAIL: phase 4a unexpected record" << std::endl;
+                return 1;
+            }
+            pre_seq = rec_opt->seq;
+            pre_flushed = rec_opt->flushed_count;
+        }
+
+        // Sub-phase 4b: reopen everything, observe priming, write more.
+        // Note: Viper recovery (ColdTier::open / Viper::open with full
+        // VPage scan) is M6; for M5 we just verify Checkpoint priming
+        // by creating a fresh DB but reopening the checkpoint file.
+        cleanup_pool();
+        cleanup_cold_pool();
+        // Don't clean checkpoint dir — that's what we're reopening.
+        auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+        auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+        auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+
+        HiOMT::CheckpointConfig ccfg;
+        ccfg.cadence_entries = kCadence;
+        HiOMT hiom(*viper_db, kHotBucketsCkpt, cold.get(),
+                   HiOMT::FlusherConfig{}, chkpt.get(), ccfg);
+        if (hiom.flushed_count() != pre_flushed) {
+            std::cerr << "  FAIL: HiOM did not prime flushed_count: got="
+                      << hiom.flushed_count()
+                      << " expected " << pre_flushed << std::endl;
+            return 1;
+        }
+        std::cout << "  phase 4: HiOM primed flushed_count="
+                  << hiom.flushed_count() << " seq_floor="
+                  << pre_seq << " from restored checkpoint" << std::endl;
+
+        auto client = hiom.get_client();
+        constexpr std::size_t kExtra = 2'000;
+        for (std::size_t i = 0; i < kExtra; ++i) {
+            client.put(static_cast<std::uint64_t>(1'000'000 + i),
+                       0xababababababababull);
+        }
+        hiom.flush_and_wait();
+        hiom.force_checkpoint();
+
+        auto rec_post = chkpt->read_valid();
+        if (!rec_post) {
+            std::cerr << "  FAIL: phase 4 post read_valid returned nullopt"
+                      << std::endl;
+            return 1;
+        }
+        if (rec_post->seq <= pre_seq) {
+            std::cerr << "  FAIL: post seq=" << rec_post->seq
+                      << " not advanced past pre seq=" << pre_seq
+                      << std::endl;
+            return 1;
+        }
+        if (rec_post->flushed_count != pre_flushed + kExtra) {
+            std::cerr << "  FAIL: post flushed=" << rec_post->flushed_count
+                      << " expected " << (pre_flushed + kExtra)
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "  phase 4 post: seq=" << rec_post->seq
+                  << " flushed=" << rec_post->flushed_count
+                  << " (delta=" << (rec_post->flushed_count - pre_flushed)
+                  << ")" << std::endl;
+    }
+
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -548,6 +859,7 @@ int main() {
     rc |= run_microbench();
     rc |= run_cold_backed();
     rc |= run_commit_window();
+    rc |= run_checkpoint_persistence();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

@@ -47,6 +47,7 @@
 
 #include "viper/cceh.hpp"
 #include "viper/viper.hpp"
+#include "viper/hiom/checkpoint.hpp"
 #include "viper/hiom/cold_tier.hpp"
 #include "viper/hiom/commit_buffer.hpp"
 #include "viper/hiom/hot_tier.hpp"
@@ -91,6 +92,7 @@ class HiOM {
         std::atomic<std::uint64_t> cold_misses{0};
         std::atomic<std::uint64_t> cold_fp_collisions{0};
         std::atomic<std::uint64_t> commits_flushed{0};
+        std::atomic<std::uint64_t> checkpoints_written{0};
     };
 
     // Tunables for the background flusher. Defaults are chosen to
@@ -102,20 +104,48 @@ class HiOM {
         std::size_t batch_max{8192};        // drain at most this many per cycle
     };
 
+    // Tunables for the M5 A/B checkpoint protocol. cadence_entries is
+    // the cumulative-flushed-count distance between checkpoint writes:
+    // a checkpoint fires whenever an apply_batch crosses a multiple of
+    // it. Smaller -> tighter recovery bound, more PM write traffic;
+    // larger -> rarer writes, longer M6 scan window. The default of
+    // 4096 trades roughly one checkpoint per ~32 ms of steady-state
+    // commit traffic at the M4 default flusher pace.
+    struct CheckpointConfig {
+        std::uint64_t cadence_entries{4096};
+    };
+
     HiOM(ViperT& viper, std::size_t hot_buckets_pow2,
          ColdTier* cold = nullptr,
-         FlusherConfig fcfg = FlusherConfig{})
+         FlusherConfig fcfg = FlusherConfig{},
+         Checkpoint* checkpoint = nullptr,
+         CheckpointConfig ccfg = CheckpointConfig{})
         : viper_(viper),
           hot_(hot_buckets_pow2),
           cold_(cold),
           base_map_{},  // M0/M2: all zero, single region 0
-          fcfg_(fcfg)
+          fcfg_(fcfg),
+          checkpoint_(checkpoint),
+          ccfg_(ccfg)
     {
         if (cold_ != nullptr) {
             commit_buf_ = std::make_unique<CommitBuffer>();
             flusher_consumer_tok_ = std::make_unique<moodycamel::ConsumerToken>(
                 commit_buf_->make_consumer_token());
             flusher_ = std::thread([this]() { flusher_loop(); });
+        }
+        // Prime cumulative counters from any existing checkpoint so the
+        // monotonic invariant survives reopen. read_valid() returns
+        // nullopt on a fresh PM file (or one whose only writes were
+        // torn) — in that case we start at zero. seq_ is bumped from
+        // here on so the next write strictly orders after the last
+        // persisted one.
+        if (checkpoint_ != nullptr) {
+            if (auto rec = checkpoint_->read_valid()) {
+                flushed_count_.store(rec->flushed_count,
+                                     std::memory_order_relaxed);
+                seq_.store(rec->seq, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -378,6 +408,20 @@ class HiOM {
     const Stats& stats() const { return stats_; }
     BlockBaseMap& base_map() { return base_map_; }
 
+    // M5 introspection. flushed_count is the cumulative number of
+    // commit-buffer entries that have been applied to ColdTier (across
+    // restarts, primed from any restored checkpoint). checkpoint()
+    // returns the attached PM-resident checkpoint object (or nullptr).
+    std::uint64_t flushed_count() const {
+        return flushed_count_.load(std::memory_order_acquire);
+    }
+    Checkpoint* checkpoint() const { return checkpoint_; }
+    // Force a checkpoint write outside of cadence boundaries; used by
+    // tests and by graceful shutdown to seal the latest state.
+    void force_checkpoint() {
+        if (checkpoint_ != nullptr) try_write_checkpoint();
+    }
+
     // Block until the commit buffer is fully drained (all pending
     // writes have been applied to ColdTier and corresponding HotTier
     // pins released). Used by tests and graceful shutdown sequences;
@@ -478,6 +522,47 @@ class HiOM {
                     HotTier::SlotState::kUnpinned);
             }
         }
+
+        // M5 checkpoint hook: bump cumulative flushed count and, if the
+        // batch crossed a cadence boundary, try to persist a fresh
+        // checkpoint. fetch_add gives us atomic before/after; the
+        // boundary test fires at most once per batch even if the batch
+        // spans multiple boundaries (i.e. one checkpoint per drain,
+        // which is fine — each one snapshots the latest counters).
+        if (checkpoint_ != nullptr && !batch.empty()) {
+            const auto before = flushed_count_.fetch_add(
+                batch.size(), std::memory_order_acq_rel);
+            const auto after = before + batch.size();
+            const std::uint64_t cadence = ccfg_.cadence_entries;
+            if (cadence > 0
+                && (before / cadence) != (after / cadence)) {
+                try_write_checkpoint();
+            }
+        } else if (checkpoint_ == nullptr && !batch.empty()) {
+            // Even without a checkpoint attached, keep the cumulative
+            // count moving so HiOM::flushed_count() reads truthfully.
+            flushed_count_.fetch_add(batch.size(),
+                                     std::memory_order_acq_rel);
+        }
+    }
+
+    // M5: write a fresh checkpoint into the inactive A/B slot. Multiple
+    // threads (background flusher + inline-flusher) can both call
+    // apply_batch concurrently and race here; try_lock keeps it to one
+    // writer at a time and the loser silently skips this round (the
+    // next batch's cadence check picks it up). Inside the lock, ++seq_
+    // is the linearization point — guarantees strict monotonicity in
+    // the persisted record sequence.
+    void try_write_checkpoint() {
+        std::unique_lock<std::mutex> lk(checkpoint_mu_, std::try_to_lock);
+        if (!lk.owns_lock()) return;
+        CheckpointRecord rec{};
+        rec.seq = seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        rec.flushed_count = flushed_count_.load(std::memory_order_acquire);
+        rec.vpage_frontier = viper_.hiom_vpage_frontier();
+        rec.cold_size = (cold_ != nullptr) ? cold_->approx_size() : 0;
+        checkpoint_->write(rec);
+        stats_.checkpoints_written.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Single-cycle drain helper, shared between the flusher loop and
@@ -546,6 +631,20 @@ class HiOM {
     // flusher uses its own token and is independent).
     std::mutex inline_flush_mu_;
     std::unique_ptr<moodycamel::ConsumerToken> inline_consumer_tok_;
+
+    // M5 checkpoint state. checkpoint_ is non-owning (caller manages
+    // the PM file's lifetime so the same Checkpoint can survive HiOM
+    // close+reopen for the recovery test). flushed_count_ is the
+    // cumulative running total since DB creation, primed from the
+    // restored record on construction. seq_ is the writer's local
+    // monotonic seq, also primed. checkpoint_mu_ serializes write()
+    // calls so the A/B slot flip is single-writer (Checkpoint is
+    // single-writer by contract per the comment in checkpoint.hpp).
+    Checkpoint* checkpoint_;
+    CheckpointConfig ccfg_;
+    std::atomic<std::uint64_t> flushed_count_{0};
+    std::atomic<std::uint64_t> seq_{0};
+    std::mutex checkpoint_mu_;
 };
 
 }  // namespace viper::hiom

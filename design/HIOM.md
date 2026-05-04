@@ -10,52 +10,61 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
-## Status (2026-05-03)
+## Status (2026-05-04)
 
 - **Phase**: M0 ✅ complete; M1 functionally complete except EBR
   (deferred to M4 Phase D); M2 Phase B-1 / B-2 ✅ complete; M3 Phase
-  A+B+C+D ✅ complete; **M4 Phase 0+A+B complete** — 2-bit state
-  machine (UNPINNED / PINNED / IN_FLUSH) gating SIEVE eviction,
-  flusher does PINNED → IN_FLUSH → UNPINNED CAS dance, inline-flush
-  back-pressure when bucket-full + synchronous drain on the rare
-  pin-failure tail so reads always succeed. stable_sort fix landed
-  alongside (latent ordering bug for same-fp commit entries).
+  A+B+C+D ✅ complete; M4 Phase 0+A+B ✅ complete (state machine,
+  inline-flush back-pressure, stable_sort fix); **M5 A/B checkpoint
+  complete (2026-05-04)** — 4 KB PM file with two 64-B slots and an
+  8-B atomic `valid_pointer`; cadence-driven writes from
+  `apply_batch`; FNV-1a `summary_hash` for torn-write detection;
+  HiOM constructor primes `flushed_count_` + `seq_` from the
+  restored record so the cumulative counter survives reopen; new
+  `Viper::hiom_vpage_frontier()` accessor records the next-block-
+  page write frontier for M6's bounded recovery scan.
 - **Code on disk**:
-  - `include/viper/hiom/hot_tier.hpp` (~470 lines): standalone hash
-    table; M4 Phase A replaced 1-bit `pinned` with packed 32-bit
-    `state` field (16 × 2 bits via SlotState enum), public
-    `cas_slot_state` API for the flusher.
+  - `include/viper/hiom/hot_tier.hpp` (~470 lines): unchanged from M4.
   - `include/viper/hiom/offset_codec.hpp` (~110 lines): unchanged.
   - `include/viper/hiom/cold_tier.hpp` (~560 lines): unchanged from M2.
   - `include/viper/hiom/commit_buffer.hpp` (~110 lines): unchanged.
-  - `include/viper/hiom/hiom.hpp` (~510 lines): M4 Phase A added
-    `apply_batch` helper + state-machine CAS in flusher; Phase B
-    added `try_inline_flush()` (separate ConsumerToken + try-lock
-    serialization), Client `mirror_write` retries through inline-
-    flush, falls back to synchronous full drain on terminal pin-
-    failure so the entry reaches ColdTier before the put returns.
-  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): unchanged —
-    state field defaults to 0 (UNPINNED), so M0/M1 behaviour is
-    preserved exactly.
-  - `test/hiom_integration_test.cpp` (~480 lines, **5 tests**):
-    `run_commit_window` rewritten to deliberately undersize the hot
-    tier (256 buckets × 16 = 4096 slots vs 10K writes) so back-
-    pressure fires; asserts read-your-write succeeds for all 10K,
-    not that pin_failures=0 (it's the indicator of how often back-
-    pressure took the slow path, not a correctness gate).
+  - `include/viper/hiom/checkpoint.hpp` (~235 lines, **NEW M5**):
+    `Checkpoint::create / open / write / read_valid / read_both`,
+    `CheckpointRecord` (64 B, single cacheline) with `magic`, `seq`,
+    `flushed_count`, `vpage_frontier`, `cold_size`, `summary_hash`.
+  - `include/viper/hiom/hiom.hpp` (~610 lines): M5 added
+    `CheckpointConfig` (cadence_entries default 4096), constructor
+    optional `Checkpoint*` + ctor-time priming from
+    `read_valid()`, `try_write_checkpoint()` with try-lock so the
+    background flusher and inline-flusher don't double-write,
+    cadence check inside `apply_batch`, `force_checkpoint()` and
+    `flushed_count()` accessors, new `checkpoints_written` stat.
+  - `include/viper/viper.hpp`: M5 added `Viper::hiom_vpage_frontier()`
+    public accessor (acquire-load of `current_block_page_`); CCEH-
+    tombstone-leak guard from M3 still in place.
+  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): unchanged.
+  - `test/hiom_integration_test.cpp` (~810 lines, **6 tests**):
+    new `run_checkpoint_persistence` covers (1) cadence-driven
+    writes during 10K inserts (10 checkpoints @ cadence=1024), (2)
+    reopen-and-match, (3) torn-write fallback (corrupt active slot,
+    fall back to seq-1), (4) cross-restart priming + monotonic
+    advance.
   - `test/cold_tier_test.cpp` (~370 lines, 9 tests): unchanged.
-  - `include/viper/viper.hpp`: CCEH-tombstone-leak guard from earlier.
-- **Throughputs (single-threaded)**:
+- **Throughputs (single-threaded, post-M5)**:
   - HotTier standalone lookup: 135 M ops/s.
-  - HiOM full-path lookup: 49.4 M ops/s vs raw Viper 47.7 M ops/s —
-    ratio 1.04. State-machine CAS adds zero observable overhead on
-    the read path (it's all on the write/flush path).
+  - HiOM full-path lookup: 49.6 M ops/s vs raw Viper 47.3 M ops/s —
+    ratio 1.05. M5's apply_batch hook adds an atomic fetch_add and
+    a divisibility check per drain cycle, no observable overhead.
   - HiOM commit-window with back-pressure (HotTier 4096 slots, 10K
     writes, slow background flusher): pin_failures ≈ 31 (~0.3% of
     writes hit the synchronous-drain fallback); 10K reads after
     write phase split as ≈2K hot + ≈8K cold, 0 misses.
   - ColdTier insert: 1.9–3.3 M ops/s depending on PM bandwidth state.
   - ColdTier lookup: 200 M ops/s.
+- **Implementation share**: ~70% (6.0 weeks / 9 weeks of impl), up
+  from ~65% before M5. Remaining: M4 Phase C/D/E (multi-producer
+  happens-before, EBR, stress), M6 (bounded recovery scan + parallel
+  cold load), M7 (evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -810,17 +819,68 @@ each time). `cold_tier_test` unchanged.
 3. Phase E — multi-thread stress + simple crash inject; bridges
    into M7 evaluation.
 
-### M5 — A/B checkpoint protocol (3-4 days)
+### M5 — A/B checkpoint protocol (3-4 days) — ✅ complete (2026-05-04)
 
-- [ ] Two checkpoint slots in PM, each with `{seq, valid, summary_hash}`.
-- [ ] `valid_pointer` 8-byte atomic.
-- [ ] Flush completion → write inactive slot → flip pointer.
-- [ ] Recovery: load checkpoint, scan unflushed VPage range, replay buffer.
+- [x] Two checkpoint slots in PM, each with `{seq, valid, summary_hash}`.
+      *Implemented as `CheckpointRecord` (64 B, single cacheline) at
+      offsets 64 (slot A) and 192 (slot B) in a 4 KB PM file.*
+- [x] `valid_pointer` 8-byte atomic.
+      *At offset 0; sentinel `kValidNone = -1` distinguishes
+      "no checkpoint yet" from a real selection. Initial state is
+      pmem_persist'd at file create-time so a crash-before-first-write
+      leaves `read_valid()` returning `nullopt` instead of garbage.*
+- [x] Flush completion → write inactive slot → flip pointer.
+      *Hooked into `HiOM::apply_batch`: after each successful drain
+      the cumulative `flushed_count_` advances, and crossing a
+      multiple of `CheckpointConfig.cadence_entries` (default 4096)
+      triggers `try_write_checkpoint()`. Try-lock serialises the
+      background flusher and any inline-flusher so only one writer
+      mutates the inactive slot. Inside the lock: bump `seq_`
+      (linearization point), snapshot `flushed_count_`,
+      `viper_.hiom_vpage_frontier()`, `cold_->approx_size()`,
+      compute `summary_hash` (FNV-1a over the rest), pmem_persist
+      the slot, then atomic-store the new `valid_pointer` and
+      pmem_persist again. The 8-byte `valid_pointer` store is the
+      single durable commit point.*
+- [x] Constructor primes `flushed_count_` and `seq_` from any
+      restored record so the cumulative counter survives reopen.
+- [x] Torn-write fallback: `read_valid()` verifies `summary_hash`
+      on the indicated slot and falls back to the other slot on
+      mismatch.
+- [ ] Recovery: load checkpoint, scan unflushed VPage range, replay
+      buffer. *Deferred to M6 — that's the recovery milestone. M5
+      writes the protocol; M6 reads and acts on it.*
+
+Exit (M5 met): `run_checkpoint_persistence` in
+`hiom_integration_test.cpp` exercises four phases — (1) 10K writes
+with cadence=1024 produce 10 checkpoints (9 cadence boundaries +
+1 explicit `force_checkpoint`), final record has `seq=10`,
+`flushed_count=10000`, `cold_size=10000`, `vpage_frontier=0x7`;
+(2) close + reopen the Checkpoint file alone, `read_valid()`
+returns the same record; (3) corrupt the active slot's magic (seq
+10), reopen, fallback returns the older slot (seq 9); (4) fresh
+PM files, write 5K, reopen, new HiOM primes
+`flushed_count()=5000` from the restored record, then 2K more
+writes advance to seq=8 and `flushed_count=7000`.
+
+**M5 follow-ups (next):**
+1. Wire `force_checkpoint()` into `HiOM::~HiOM()` after the final
+   drain so a graceful shutdown always seals state. Currently the
+   destructor only drains; the caller must `force_checkpoint()` if
+   they want a sealed record.
+2. Tighten the cadence default once M6 measures recovery cost vs.
+   PM write overhead. 4096 is a guess.
+3. Cross-host reopen: today the priming path assumes the same
+   process; an actual recovery test (M6) needs to reopen ColdTier
+   and Viper from PM and verify they line up with the restored
+   `vpage_frontier` and `cold_size`.
 
 ### M6 — Recovery (3 days)
 
 - [ ] Parallel cold-tier load (32 threads, one per region).
-- [ ] VPage scan bounded by `valid_checkpoint.seq`.
+- [ ] VPage scan bounded by `valid_checkpoint.vpage_frontier`
+      (provided by M5's `Viper::hiom_vpage_frontier()` snapshot;
+      `seq` is just the record-ordering tiebreaker).
 - [ ] Hot-tier rebuild from cold tier (warm-up phase).
 
 Exit: 100 GB working set recovers in ≤ 5 s.
