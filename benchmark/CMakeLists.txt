@@ -214,6 +214,14 @@ target_link_libraries(recovery_bm viper ${PMEM_LIBS})
 target_link_libraries(recovery_bm benchmark hdr_histogram_static)
 set_target_properties(recovery_bm PROPERTIES LINKER_LANGUAGE CXX)
 
+# M6.5: HiOM recovery benchmark — standalone (no Google Benchmark
+# wiring), times Viper baseline open() vs HiOM open() with
+# skip_recovery + tail-scan on the same prefilled dataset.
+add_executable(hiom_recovery_bm hiom_recovery_bm.cpp)
+target_compile_options(hiom_recovery_bm PRIVATE -mclwb -pthread)
+target_link_libraries(hiom_recovery_bm viper pthread)
+set_target_properties(hiom_recovery_bm PROPERTIES LINKER_LANGUAGE CXX)
+
 add_executable(reclaim_bm reclaim_bm.cpp ${BASE_BENCHMARK_FILES})
 target_link_libraries(reclaim_bm viper ${PMEM_LIBS})
 target_link_libraries(reclaim_bm benchmark hdr_histogram_static)

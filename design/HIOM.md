@@ -20,8 +20,17 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   scan from `[checkpoint.vpage_frontier - 1, current_block)`,
   parallelised across `recovery_threads`, replays into ColdTier
   idempotently. Correctness only this round; the recovery-time win
-  ("40× faster" paper claim) is carved out to **M6.5** because it
-  requires retiring CCEH from Viper's *write* path.
+  ("40× faster" paper claim) is carved out to **M6.5**.
+  **M6.5 partial ✅ (2026-05-04)** — `ViperConfig::skip_recovery`
+  flag added (gates `recover_database()` in the constructor); new
+  standalone `hiom_recovery_bm` measures Viper baseline open vs
+  HiOM open(skip_recovery=true)+tail-scan on the same prefilled
+  pool. Initial measurements: 1M = 0.9× (HiOM open dominated by
+  ColdTier+Checkpoint+HotTier ctor fixed cost), 10M = 1.5×. The
+  full ≥10× target requires retiring CCEH from Viper's *write*
+  path (so post-recovery puts/updates/removes through
+  `Viper::Client` don't depend on `map_`); pending work tracked in
+  M6.5 §.
 - **Code on disk**:
   - `include/viper/hiom/hot_tier.hpp` (~470 lines): unchanged from M4.
   - `include/viper/hiom/offset_codec.hpp` (~110 lines): unchanged.
@@ -36,7 +45,18 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     spin up flusher (so no concurrent writes interleave with replay).
   - `include/viper/viper.hpp`: M6 added `Viper::hiom_visit_records<Visitor>()`
     public template (mirrors `recover_database`'s VPage iteration
-    line-for-line, exposed as a generic visitor).
+    line-for-line, exposed as a generic visitor). M6.5 added
+    `ViperConfig::skip_recovery` (default false; when true,
+    constructor skips the `recover_database()` call so HiOM's tail
+    scan is the sole index recovery path).
+  - `benchmark/hiom_recovery_bm.cpp` (~290 lines, **new in M6.5**):
+    standalone stopwatch benchmark (no Google Benchmark wiring).
+    HiOM-mediated prefill populates Viper VPages + Viper CCEH +
+    ColdTier + a sealed Checkpoint, then closes; baseline mode
+    times `Viper::open()` with full CCEH rebuild, HiOM mode times
+    `Viper::open(skip_recovery=true)` + ColdTier/Checkpoint/HiOM
+    ctor with `tail_scan=true`. Default sweep N ∈ {1M, 10M};
+    `--full` adds 100M.
   - `test/hiom_integration_test.cpp` (~1100 lines, **7 tests**):
     new `run_recovery_persistence` covers (A) clean shutdown +
     no-op recover, (B) crash with mid-stream checkpoint (5K drained
@@ -52,11 +72,23 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   - M6 recovery shape (10K writes, slow flusher): replayed ≈ 5446
     entries from a 4-block tail (block 3 boundary + blocks 4–6),
     cold goes 5000→10000, all 10K reads succeed post-recovery.
-- **Implementation share**: ~75% (6.7 weeks / 9 weeks of impl), up
-  from ~70% before M6. Remaining: M4 Phase C/D/E (multi-producer
-  happens-before, EBR, multi-thread + crash injection stress); M6.5
-  (retire CCEH from Viper write path → skip recover_database →
-  measure recovery time win); M7 (full evaluation).
+  - M6.5 recovery wall-clock (`hiom_recovery_bm`,
+    `recovery_threads=32`):
+    | N    | baseline_ms | hiom_ms | speedup |
+    |------|-------------|---------|---------|
+    | 1M   | 240.3       | 260.8   | 0.9×    |
+    | 10M  | 910.8       | 592.6   | 1.5×    |
+    Crossover is around N = a few million: HiOM open carries a
+    fixed cost (ColdTier mmap + Checkpoint read + HotTier ctor +
+    tail scan launch) that dominates at small N. The eventual
+    ≥10× speedup at 100M+ requires the CCEH write-path retirement
+    so HiOM mode can skip the rebuild *and* shrink the open path
+    further; today the baseline still wins at 1M.
+- **Implementation share**: ~77% (7.0 weeks / 9 weeks of impl), up
+  from ~75% before M6.5 partial. Remaining: M4 Phase C/D/E
+  (multi-producer happens-before, EBR, multi-thread + crash
+  injection stress); M6.5 *full* (retire CCEH from Viper write
+  path so the ≥10× target is reachable); M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -930,19 +962,32 @@ Required for the paper's "40× faster recovery" claim.
       lookup (cold or hot) instead of `map_.Get`.
 - [ ] Refactor `Viper::Client::update` to do the same.
 - [ ] Refactor `Viper::Client::remove` likewise.
-- [ ] Add `ViperConfig::skip_recovery` flag; gate `recover_database()`
-      call in the constructor on `!skip_recovery`.
-- [ ] HiOM::open variant that opens Viper with skip_recovery=true,
+- [x] Add `ViperConfig::skip_recovery` flag; gate `recover_database()`
+      call in the constructor on `!skip_recovery`. (2026-05-04)
+- [x] HiOM::open variant that opens Viper with skip_recovery=true,
       then runs the tail scan — total recovery is now O(tail), not
-      O(all VPages).
-- [ ] Re-verify all M0–M5 tests pass after the refactor (regression
-      surface).
-- [ ] Benchmark: time `Viper::open` baseline vs `HiOM::open`-with-
-      skip on 100M-entry pool. Target: ≥ 10× speedup; paper claim
-      is ~40×.
+      O(all VPages). Composed in `hiom_recovery_bm` (caller-side,
+      no new HiOM API needed; `Viper::open(cfg)` + existing HiOM
+      ctor with `RecoveryConfig::tail_scan=true`). (2026-05-04)
+- [x] Benchmark harness: `benchmark/hiom_recovery_bm.cpp`. Times
+      baseline open vs HiOM open on identical prefilled state;
+      sweep N ∈ {1M, 10M, 100M}. (2026-05-04)
+- [ ] Re-verify all M0–M5 tests pass after the put/update/remove
+      refactor (regression surface).
+- [ ] Run benchmark with `--full` (100M dataset) once write-path
+      retirement lands. Target: ≥ 10× speedup; paper claim is ~40×.
 
 Exit: `recovery_bm` shows HiOM recovery beating Viper baseline by
 ≥ 10× on the 100M dataset. All correctness tests still pass.
+
+**Status note**: The flag + benchmark scaffolding is in. The
+write-path retirement is the load-bearing piece left — without
+it, callers that mix `Viper::Client::put/update/remove` with
+HiOM after a `skip_recovery=true` open will operate on an empty
+`map_` and silently produce wrong results. The current benchmark
+sidesteps this by reading exclusively through HiOM's client
+(M3 Phase D already retired CCEH from the read path), but any
+production wiring needs the write-path work first.
 
 ### M7 — Evaluation (3-4 weeks)
 

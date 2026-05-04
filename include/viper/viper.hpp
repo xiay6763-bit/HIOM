@@ -65,6 +65,16 @@ struct ViperConfig {
     size_t dax_alignment = ONE_GB;
     size_t fs_alignment = ONE_GB;
     bool enable_reclamation = false;
+    // M6.5: when true, Viper::open() does not call recover_database()
+    // — the caller (HiOM) is authoritative for the index and will
+    // do its own bounded tail scan into ColdTier. Default false
+    // preserves all M0–M6 callsites. Skipping CCEH rebuild means
+    // post-recovery puts/updates/removes that go through
+    // Viper::Client (rather than HiOM::Client) will see an empty
+    // map_ and behave incorrectly; the recovery benchmark stays on
+    // the HiOM read path which is unaffected (M3 Phase D retired
+    // CCEH on read). Full write-path retirement is M6.6.
+    bool skip_recovery = false;
 };
 
 namespace internal {
@@ -549,7 +559,7 @@ Viper<K, V>::Viper(ViperBase v_base, const std::filesystem::path pool_dir, const
         add_v_page_blocks(mapping);
     }
 
-    if (!v_base_.is_new_db) {
+    if (!v_base_.is_new_db && !v_config.skip_recovery) {
         DEBUG_LOG("Recovering existing database.");
         recover_database();
     }
