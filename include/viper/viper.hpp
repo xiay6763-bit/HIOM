@@ -12,6 +12,7 @@
 #include <atomic>
 #include <assert.h>
 #include <filesystem>
+#include <functional>
 #include <immintrin.h>
 
 #include "cceh.hpp"
@@ -474,6 +475,26 @@ class Viper {
         }
     }
 
+    // HiOM hook (M6.5 full): resolver callback that maps a key to its
+    // current KVOffset via HiOM (ColdTier authoritative; mirrors M3
+    // Phase D's read-path retirement). Installed by HiOM's
+    // constructor after Viper::open() returns when ColdTier is
+    // wired up. When unset (default — all legacy callers), every
+    // write path is byte-identical to the M0 baseline. When set, the
+    // write paths use it as a *fallback* whenever map_.Get /
+    // map_.Insert reports tombstone — i.e. post-restart with
+    // skip_recovery=true, map_ is empty for pre-existing keys, and
+    // the resolver supplies the on-disk offset so the old VPage's
+    // `free_slots` slot can be invalidated. The resolver fires at
+    // most once per key per process lifetime (put/update/remove
+    // hydrate map_ on hit, so subsequent ops skip it). Concurrency
+    // safety: map_.Insert is CAS-atomic, so only one writer per key
+    // ever sees a tombstone return value and triggers the resolver.
+    using OldOffsetResolver = std::function<KVOffset(const K&)>;
+    void set_hiom_old_offset_resolver(OldOffsetResolver fn) {
+        hiom_old_offset_resolver_ = std::move(fn);
+    }
+
   protected:
     static ViperBase init_pool(const std::string& pool_file, uint64_t pool_size,
                                bool is_new_pool, ViperConfig v_config);
@@ -500,6 +521,11 @@ class Viper {
 
     cceh::CCEH<K> map_;
     static constexpr bool using_fp = requires_fingerprint(K);
+
+    // M6.5: see set_hiom_old_offset_resolver(). Default-constructed
+    // (empty std::function) means "no HiOM attached"; the
+    // operator bool() check in the write paths gates the fallback.
+    OldOffsetResolver hiom_old_offset_resolver_;
 
     std::vector<VPageBlock*> v_blocks_;
     std::atomic<size_t> num_v_blocks_;
@@ -1130,6 +1156,21 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
         old_offset = this->viper_.map_.Insert(key, kv_offset);
     }
 
+    // M6.5 full: if map_ said "new key" but HiOM (ColdTier) holds a
+    // pre-restart offset for this key, use it. This is the only way
+    // to invalidate the stale VPage slot when skip_recovery=true left
+    // map_ empty for keys written before the previous shutdown. The
+    // resolver fires at most once per key per process: once we
+    // consume it, the just-completed map_.Insert above has already
+    // hydrated map_, and any subsequent put/update/remove hits the
+    // CCEH fast path.
+    if (old_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+        const KVOffset resolved = this->viper_.hiom_old_offset_resolver_(key);
+        if (!resolved.is_tombstone()) {
+            old_offset = resolved;
+        }
+    }
+
     const bool is_new_item = old_offset.is_tombstone();
     if (!is_new_item && delete_old) {
         // Need to free slot at old location for this key
@@ -1351,7 +1392,22 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
     };
 
     while (true) {
-        const KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+        KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+        // M6.5 full: post-restart with skip_recovery=true, map_ is
+        // empty for pre-existing keys; consult HiOM and hydrate map_
+        // so the next update on this key hits the fast path.
+        if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+            const KVOffset resolved
+                = this->viper_.hiom_old_offset_resolver_(key);
+            if (!resolved.is_tombstone()) {
+                if constexpr (using_fp) {
+                    this->viper_.map_.Insert(key, resolved, key_check_fn);
+                } else {
+                    this->viper_.map_.Insert(key, resolved);
+                }
+                kv_offset = resolved;
+            }
+        }
         if (kv_offset.is_tombstone()) {
             return false;
         }
@@ -1379,7 +1435,15 @@ bool Viper<K, V>::Client::remove(const K& key) {
         return this->viper_.check_key_equality(key, offset);
     };
 
-    const KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+    KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+    // M6.5 full: skip_recovery=true means map_ may not know about
+    // pre-restart keys; consult HiOM. We do NOT hydrate map_ here
+    // because free_occupied_slot below will write a NONE tombstone
+    // into map_ via its own Insert call (line ~1463 of the
+    // delete_offset==true branch).
+    if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+        kv_offset = this->viper_.hiom_old_offset_resolver_(key);
+    }
     if (kv_offset.is_tombstone()) {
         return false;
     }

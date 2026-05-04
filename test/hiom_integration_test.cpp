@@ -1145,6 +1145,167 @@ int run_recovery_persistence() {
         }
     }
 
+    // ---- Phase D: skip_recovery=true + post-restart update/remove (M6.5 full) ----
+    // Verifies the OldOffsetResolver fires on Viper::Client::update
+    // and ::remove. Without the resolver, post-restart map_ is empty
+    // for pre-existing keys; update sees Get→tombstone and returns
+    // false (no mutation), remove sees the same and returns false (no
+    // invalidation). With the resolver, the fallback supplies the
+    // pre-restart KVOffset, the page is locked, and the mutation /
+    // invalidation goes through. We assert both via behaviour
+    // (read-back values for update, presence/absence for remove) and
+    // via slot accounting (count_live_vpage_records).
+    //
+    // We deliberately do NOT use cl.put() for post-restart updates:
+    // HiOM::Client::put short-circuits on existing-key returns from
+    // viper_.put and never re-fires mirror_write, which is a
+    // pre-existing API quirk orthogonal to M6.5. The contract is:
+    // put = insert, update = in-place mutate, remove = delete.
+    {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+        constexpr std::size_t kN = 2'000;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> kv;
+        kv.reserve(kN);
+        std::mt19937_64 rng(0xd1);
+        for (std::size_t i = 0; i < kN; ++i) {
+            kv.emplace_back(static_cast<std::uint64_t>(i + 1), rng());
+        }
+
+        // D.1: clean prefill + clean shutdown.
+        {
+            auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+            auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+            HiOMT::CheckpointConfig ccfg;
+            ccfg.cadence_entries = 1024;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(), ccfg);
+            auto cl = hiom.get_client();
+            for (auto& [k, v] : kv) cl.put(k, v);
+            hiom.flush_and_wait();
+            hiom.force_checkpoint();
+        }
+
+        auto count_live_vpage_records = [](ViperT& v) {
+            const viper::offset_size_t fr = v.hiom_vpage_frontier();
+            const auto block_hi
+                = static_cast<viper::block_size_t>(
+                    viper::KeyValueOffset{fr}.block_number) + 1;
+            std::size_t live = 0;
+            v.hiom_visit_records(0, block_hi,
+                                 [&](const auto&, const auto&, auto) { ++live; });
+            return live;
+        };
+
+        // D.2: reopen with skip_recovery=true; in-place update every
+        // key, then remove half. Read-back must show the new values
+        // for the survivors and absence for the removed half.
+        const std::uint64_t kNewBase = 0xfaceULL << 16;
+        {
+            viper::ViperConfig vcfg;
+            vcfg.skip_recovery = true;
+            auto viper_db = ViperT::open(kPoolDir, vcfg);
+            auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+            HiOMT::RecoveryConfig rcfg;
+            rcfg.tail_scan = true;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(),
+                       HiOMT::CheckpointConfig{}, rcfg);
+            auto cl = hiom.get_client();
+
+            // Update every key.
+            std::size_t update_failures = 0;
+            for (std::size_t i = 0; i < kN; ++i) {
+                const std::uint64_t k = static_cast<std::uint64_t>(i + 1);
+                const std::uint64_t newv = kNewBase + i;
+                if (!cl.update(k, [newv](std::uint64_t* slot) {
+                        *slot = newv;
+                    })) {
+                    ++update_failures;
+                }
+            }
+            std::cout << "  phase D updates: failed=" << update_failures
+                      << " (expected 0)" << std::endl;
+            if (update_failures != 0) {
+                std::cerr << "  FAIL: phase D update — resolver did not "
+                          << "supply pre-restart offsets for "
+                          << update_failures << " keys" << std::endl;
+                return 1;
+            }
+
+            std::size_t hits = 0, mismatches = 0;
+            for (std::size_t i = 0; i < kN; ++i) {
+                std::uint64_t got = 0;
+                if (cl.get(static_cast<std::uint64_t>(i + 1), &got)) {
+                    if (got == kNewBase + i) ++hits;
+                    else ++mismatches;
+                }
+            }
+            std::cout << "  phase D post-update reads: hits=" << hits
+                      << " mismatches=" << mismatches << std::endl;
+            if (hits != kN) {
+                std::cerr << "  FAIL: phase D update read-back" << std::endl;
+                return 1;
+            }
+
+            // Remove the odd-indexed half. Updates were in-place so
+            // live count is still kN; remove should drop it to kN/2.
+            std::size_t remove_failures = 0;
+            std::size_t expected_removed = 0;
+            for (std::size_t i = 0; i < kN; ++i) {
+                if ((i & 1) == 1) {
+                    if (!cl.remove(static_cast<std::uint64_t>(i + 1))) {
+                        ++remove_failures;
+                    }
+                    ++expected_removed;
+                }
+            }
+            std::cout << "  phase D removes: failed=" << remove_failures
+                      << " (expected 0 of " << expected_removed << ")"
+                      << std::endl;
+            if (remove_failures != 0) {
+                std::cerr << "  FAIL: phase D remove — resolver did not "
+                          << "supply pre-restart offsets for "
+                          << remove_failures << " keys" << std::endl;
+                return 1;
+            }
+
+            const std::size_t live_after = count_live_vpage_records(*viper_db);
+            const std::size_t expected_live = kN - expected_removed;
+            std::cout << "  phase D live VPage records (in-process): "
+                      << live_after << " (expected " << expected_live << ")"
+                      << std::endl;
+            if (live_after != expected_live) {
+                std::cerr << "  FAIL: phase D — slot accounting wrong. "
+                          << "live=" << live_after
+                          << " expected=" << expected_live
+                          << " (resolver did not invalidate pre-restart "
+                          << "VPage slots on remove)" << std::endl;
+                return 1;
+            }
+        }
+
+        // D.3: reopen via the default path, count live records to
+        // confirm the invalidations persisted to PM.
+        {
+            auto viper_db = ViperT::open(kPoolDir, viper::ViperConfig{});
+            const std::size_t live = count_live_vpage_records(*viper_db);
+            const std::size_t expected_live = kN / 2;
+            std::cout << "  phase D live VPage records (post-reopen): "
+                      << live << " (expected " << expected_live << ")"
+                      << std::endl;
+            if (live != expected_live) {
+                std::cerr << "  FAIL: phase D — invalidation not "
+                          << "persisted. live=" << live
+                          << " expected=" << expected_live << std::endl;
+                return 1;
+            }
+        }
+    }
+
     std::cout << "  PASS" << std::endl;
     return 0;
 }

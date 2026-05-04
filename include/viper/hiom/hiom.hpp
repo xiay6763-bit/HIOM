@@ -172,6 +172,39 @@ class HiOM {
         // Step 3: spin up the steady-state path — commit buffer +
         // flusher thread.
         if (cold_ != nullptr) {
+            // M6.5 full: install the old-offset resolver on Viper so
+            // its put/update/remove paths can find pre-restart
+            // offsets via ColdTier when map_ is empty (the
+            // skip_recovery=true case). The resolver fires at most
+            // once per key per process — once it returns the
+            // pre-restart KVOffset, the write path patches map_ so
+            // subsequent ops on the same key skip it entirely.
+            // Without ColdTier (M0 mode) we leave the resolver
+            // unset so legacy callers stay byte-identical.
+            viper_.set_hiom_old_offset_resolver(
+                [this](const K& key) -> KVOffset {
+                    const std::uint64_t fp64 = key_fingerprint64(key);
+                    auto cold_off = cold_->lookup(fp64);
+                    if (!cold_off) return KVOffset::Tombstone();
+                    const KVOffset off = *cold_off;
+                    // Verify: fp64 collision rate is ~1 in 2^64 but
+                    // ColdTier upserts are coalesced by fp so the
+                    // same fp can briefly point at a stale offset
+                    // during tombstone GC. Cheap key-verify keeps
+                    // semantics identical to map_.Get(key, key_check_fn).
+                    K stored_key{};
+                    V stored_val{};
+                    auto ro = viper_.get_read_only_client();
+                    if (!ro.hiom_read_at_offset(off, &stored_key,
+                                                &stored_val)) {
+                        return KVOffset::Tombstone();  // page locked / torn
+                    }
+                    if (!(stored_key == key)) {
+                        return KVOffset::Tombstone();  // fp collision
+                    }
+                    return off;
+                });
+
             commit_buf_ = std::make_unique<CommitBuffer>();
             flusher_consumer_tok_ = std::make_unique<moodycamel::ConsumerToken>(
                 commit_buf_->make_consumer_token());
