@@ -850,6 +850,305 @@ int run_checkpoint_persistence() {
     return 0;
 }
 
+// M6: bounded crash-recovery via VPage tail scan. Validates that HiOM
+// can rebuild ColdTier-side state after a simulated crash by scanning
+// only [checkpoint.vpage_frontier, current_block_page) — not the whole
+// PM pool. Three phases:
+//
+//   Phase A — clean shutdown: write 5K, flush, force_checkpoint,
+//     destroy HiOM. Reopen Viper / ColdTier / Checkpoint, construct
+//     HiOM with tail_scan=true. Expect recovery_replayed == 0
+//     (frontier == current). Read all 5K → all hit.
+//
+//   Phase B — crash mid-stream after a checkpoint: slow flusher so
+//     buffer accumulates. Write 5K, flush, force_checkpoint (cold=5K,
+//     frontier captured). Write 5K more (vpage advances; cold frozen
+//     because flusher slow). Destroy *without* flush_and_wait (crash
+//     sim). Reopen, recover. Expect recovery_replayed ≈ 5K (the
+//     tail). Read all 10K → all hit.
+//
+//   Phase C — crash before any checkpoint: write 5K with
+//     cadence_entries = 1<<30 (no auto-checkpoints) and never call
+//     force_checkpoint. Destroy without flush. Reopen — read_valid()
+//     returns nullopt → tail scan starts at block 0 → scans full
+//     pool. Expect recovery_replayed == 5K. Read all 5K → all hit.
+//
+// Note: Viper::open() still runs its own full CCEH rebuild on reopen
+// (bypassing that is M6.5/M7-perf scope). The point of this test is
+// the tail-scan correctness contract, not the recovery time win.
+int run_recovery_persistence() {
+    std::cout << "=== HiOM bounded tail-scan recovery (M6) ===" << std::endl;
+
+    constexpr std::size_t kHotBucketsRec = 1ULL << 10;  // 16K slots
+
+    // ---- Phase A: clean shutdown then no-op recover ----
+    {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+        constexpr std::size_t kN = 5'000;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> kv;
+        kv.reserve(kN);
+        std::mt19937_64 rng(0xa1);
+        for (std::size_t i = 0; i < kN; ++i) {
+            kv.emplace_back(static_cast<std::uint64_t>(i + 1), rng());
+        }
+
+        // Phase A.1: write + clean shutdown.
+        {
+            auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+            auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+            HiOMT::CheckpointConfig ccfg;
+            ccfg.cadence_entries = 1024;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(), ccfg);
+            auto client = hiom.get_client();
+            for (auto& [k, v] : kv) client.put(k, v);
+            hiom.flush_and_wait();
+            hiom.force_checkpoint();
+        }  // dtor: drains cleanly, frontier == current
+
+        // Phase A.2: reopen + recover with tail_scan=true.
+        {
+            auto viper_db = ViperT::open(kPoolDir, viper::ViperConfig{});
+            auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+            const std::size_t cold_pre = cold->approx_size();
+            HiOMT::RecoveryConfig rcfg;
+            rcfg.tail_scan = true;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(),
+                       HiOMT::CheckpointConfig{}, rcfg);
+            const auto replayed = hiom.stats().recovery_replayed.load();
+            const std::size_t cold_post = cold->approx_size();
+            std::cout << "  phase A: writes=" << kN
+                      << " replayed=" << replayed
+                      << " cold(pre→post)=" << cold_pre
+                      << "→" << cold_post << std::endl;
+            // After clean shutdown, the entire boundary block is
+            // already drained to cold; tail-scan re-upserts those
+            // entries idempotently (same fp64 → overwrite without
+            // bumping num_entries). cold size must be unchanged.
+            if (cold_pre != kN || cold_post != kN) {
+                std::cerr << "  FAIL: phase A cold size shifted "
+                          << cold_pre << " → " << cold_post
+                          << " (expected " << kN << " both)"
+                          << std::endl;
+                return 1;
+            }
+            auto client = hiom.get_client();
+            std::size_t hits = 0, misses = 0, mismatches = 0;
+            for (const auto& [k, expected] : kv) {
+                std::uint64_t got = 0;
+                if (!client.get(k, &got)) ++misses;
+                else if (got != expected) ++mismatches;
+                else ++hits;
+            }
+            std::cout << "  phase A reads: hits=" << hits
+                      << " misses=" << misses
+                      << " mismatches=" << mismatches << std::endl;
+            if (hits != kN) {
+                std::cerr << "  FAIL: phase A read pass" << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    // ---- Phase B: crash mid-stream with a checkpoint ----
+    {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+        constexpr std::size_t kHalf = 5'000;
+        constexpr std::size_t kTotal = 2 * kHalf;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> kv;
+        kv.reserve(kTotal);
+        std::mt19937_64 rng(0xb2);
+        for (std::size_t i = 0; i < kTotal; ++i) {
+            kv.emplace_back(static_cast<std::uint64_t>(i + 1), rng());
+        }
+        std::size_t cold_at_crash = 0;
+        std::size_t buf_at_crash = 0;
+
+        // Phase B.1: write 5K, flush+checkpoint, write 5K more, "crash".
+        {
+            auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+            auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+
+            // Slow flusher so buffer accumulates after the checkpoint.
+            HiOMT::FlusherConfig fcfg;
+            fcfg.interval = std::chrono::milliseconds(500);
+            fcfg.high_watermark = 1ULL << 30;
+            HiOMT::CheckpointConfig ccfg;
+            ccfg.cadence_entries = 1ULL << 30;  // no auto checkpoints
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(), fcfg,
+                       chkpt.get(), ccfg);
+            auto client = hiom.get_client();
+
+            for (std::size_t i = 0; i < kHalf; ++i)
+                client.put(kv[i].first, kv[i].second);
+            hiom.flush_and_wait();
+            hiom.force_checkpoint();
+            for (std::size_t i = kHalf; i < kTotal; ++i)
+                client.put(kv[i].first, kv[i].second);
+            cold_at_crash = cold->approx_size();
+            buf_at_crash = hiom.commit_buffer()
+                ? hiom.commit_buffer()->size_hint() : 0;
+            std::cout << "  phase B at-crash: cold=" << cold_at_crash
+                      << " buf=" << buf_at_crash << std::endl;
+            // M4 inline-flush back-pressure may have drained some of
+            // the tail eagerly; cold should still be < kTotal so the
+            // tail scan has work to do.
+            if (cold_at_crash >= kTotal) {
+                std::cerr << "  WARN: ColdTier already full pre-crash; "
+                          << "test won't exercise tail-scan."
+                          << std::endl;
+            }
+            // Crash sim: stop flusher + drop buffer so the dtor's
+            // final drain is a no-op. Any commit-buffer entries here
+            // are lost from ColdTier — exactly the post-kill state.
+            hiom.simulate_crash_for_test();
+        }  // dtor runs but commit_buf_ is null → no drain
+
+        // Phase B.2: reopen + tail-scan recovery.
+        {
+            auto viper_db = ViperT::open(kPoolDir, viper::ViperConfig{});
+            auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+            HiOMT::RecoveryConfig rcfg;
+            rcfg.tail_scan = true;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(),
+                       HiOMT::CheckpointConfig{}, rcfg);
+            const auto replayed = hiom.stats().recovery_replayed.load();
+            const std::size_t cold_after_recovery = cold->approx_size();
+            std::cout << "  phase B post-recovery: replayed=" << replayed
+                      << " cold=" << cold_after_recovery
+                      << " (expected cold==" << kTotal << ")" << std::endl;
+            if (cold_after_recovery != kTotal) {
+                std::cerr << "  FAIL: phase B cold size after recovery "
+                          << cold_after_recovery << " != " << kTotal
+                          << std::endl;
+                return 1;
+            }
+            // Tail-scan replays from the frontier (which captured the
+            // post-flush state at force_checkpoint), so it covers
+            // every block since then. Some replayed entries may
+            // already have been in cold via inline-flush; idempotent
+            // upserts are harmless. Replayed >= the 5K post-checkpoint
+            // tail (give or take, depending on per-block packing).
+            if (replayed < kHalf - 1) {
+                std::cerr << "  FAIL: phase B replayed " << replayed
+                          << " < expected ≥ " << (kHalf - 1) << std::endl;
+                return 1;
+            }
+            auto client = hiom.get_client();
+            std::size_t hits = 0, misses = 0, mismatches = 0;
+            for (const auto& [k, expected] : kv) {
+                std::uint64_t got = 0;
+                if (!client.get(k, &got)) ++misses;
+                else if (got != expected) ++mismatches;
+                else ++hits;
+            }
+            std::cout << "  phase B reads: hits=" << hits
+                      << " misses=" << misses
+                      << " mismatches=" << mismatches << std::endl;
+            if (hits != kTotal) {
+                std::cerr << "  FAIL: phase B read pass" << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    // ---- Phase C: crash before any checkpoint ----
+    {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+        constexpr std::size_t kN = 5'000;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> kv;
+        kv.reserve(kN);
+        std::mt19937_64 rng(0xc3);
+        for (std::size_t i = 0; i < kN; ++i) {
+            kv.emplace_back(static_cast<std::uint64_t>(i + 1), rng());
+        }
+
+        // Phase C.1: write 5K with no checkpoint at all, then "crash".
+        {
+            auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+            auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+
+            HiOMT::FlusherConfig fcfg;
+            fcfg.interval = std::chrono::milliseconds(500);
+            fcfg.high_watermark = 1ULL << 30;
+            HiOMT::CheckpointConfig ccfg;
+            ccfg.cadence_entries = 1ULL << 30;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(), fcfg,
+                       chkpt.get(), ccfg);
+            auto client = hiom.get_client();
+            for (auto& [k, v] : kv) client.put(k, v);
+            // No flush, no force_checkpoint. Crash sim: drop buffer
+            // so dtor doesn't drain.
+            hiom.simulate_crash_for_test();
+        }
+
+        // Phase C.2: reopen — read_valid() returns nullopt; tail scan
+        // starts at block 0 and scans the whole pool.
+        {
+            auto viper_db = ViperT::open(kPoolDir, viper::ViperConfig{});
+            auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+            // Sanity: checkpoint is fresh.
+            if (chkpt->read_valid().has_value()) {
+                std::cerr << "  FAIL: phase C precondition — checkpoint "
+                          << "should be empty" << std::endl;
+                return 1;
+            }
+            HiOMT::RecoveryConfig rcfg;
+            rcfg.tail_scan = true;
+            HiOMT hiom(*viper_db, kHotBucketsRec, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(),
+                       HiOMT::CheckpointConfig{}, rcfg);
+            const auto replayed = hiom.stats().recovery_replayed.load();
+            const std::size_t cold_after = cold->approx_size();
+            std::cout << "  phase C post-recovery: replayed=" << replayed
+                      << " cold=" << cold_after
+                      << " (expected " << kN << ")" << std::endl;
+            if (replayed != kN) {
+                std::cerr << "  FAIL: phase C replayed " << replayed
+                          << " != " << kN << std::endl;
+                return 1;
+            }
+            if (cold_after != kN) {
+                std::cerr << "  FAIL: phase C cold " << cold_after
+                          << " != " << kN << std::endl;
+                return 1;
+            }
+            auto client = hiom.get_client();
+            std::size_t hits = 0, misses = 0, mismatches = 0;
+            for (const auto& [k, expected] : kv) {
+                std::uint64_t got = 0;
+                if (!client.get(k, &got)) ++misses;
+                else if (got != expected) ++mismatches;
+                else ++hits;
+            }
+            std::cout << "  phase C reads: hits=" << hits
+                      << " misses=" << misses
+                      << " mismatches=" << mismatches << std::endl;
+            if (hits != kN) {
+                std::cerr << "  FAIL: phase C read pass" << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -860,6 +1159,7 @@ int main() {
     rc |= run_cold_backed();
     rc |= run_commit_window();
     rc |= run_checkpoint_persistence();
+    rc |= run_recovery_persistence();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

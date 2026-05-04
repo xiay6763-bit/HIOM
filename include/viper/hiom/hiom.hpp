@@ -93,6 +93,7 @@ class HiOM {
         std::atomic<std::uint64_t> cold_fp_collisions{0};
         std::atomic<std::uint64_t> commits_flushed{0};
         std::atomic<std::uint64_t> checkpoints_written{0};
+        std::atomic<std::uint64_t> recovery_replayed{0};
     };
 
     // Tunables for the background flusher. Defaults are chosen to
@@ -115,11 +116,26 @@ class HiOM {
         std::uint64_t cadence_entries{4096};
     };
 
+    // M6 tail-scan recovery. tail_scan = true causes the constructor
+    // to run a bounded VPage scan from the restored
+    // checkpoint.vpage_frontier (or block 0 if no checkpoint) up to
+    // viper.hiom_vpage_frontier() and upsert every live record into
+    // ColdTier. Idempotent — entries already in cold are overwritten
+    // with the same offset, no harm. The scan happens *before* the
+    // commit-buffer / flusher are spun up so no concurrent writes
+    // interleave with replay. Set tail_scan=false (default) on the
+    // create-fresh path; nothing to recover.
+    struct RecoveryConfig {
+        bool tail_scan{false};
+        std::size_t recovery_threads{32};
+    };
+
     HiOM(ViperT& viper, std::size_t hot_buckets_pow2,
          ColdTier* cold = nullptr,
          FlusherConfig fcfg = FlusherConfig{},
          Checkpoint* checkpoint = nullptr,
-         CheckpointConfig ccfg = CheckpointConfig{})
+         CheckpointConfig ccfg = CheckpointConfig{},
+         RecoveryConfig rcfg = RecoveryConfig{})
         : viper_(viper),
           hot_(hot_buckets_pow2),
           cold_(cold),
@@ -128,24 +144,38 @@ class HiOM {
           checkpoint_(checkpoint),
           ccfg_(ccfg)
     {
-        if (cold_ != nullptr) {
-            commit_buf_ = std::make_unique<CommitBuffer>();
-            flusher_consumer_tok_ = std::make_unique<moodycamel::ConsumerToken>(
-                commit_buf_->make_consumer_token());
-            flusher_ = std::thread([this]() { flusher_loop(); });
-        }
-        // Prime cumulative counters from any existing checkpoint so the
-        // monotonic invariant survives reopen. read_valid() returns
-        // nullopt on a fresh PM file (or one whose only writes were
-        // torn) — in that case we start at zero. seq_ is bumped from
-        // here on so the next write strictly orders after the last
-        // persisted one.
+        // Step 1: prime cumulative counters from any existing
+        // checkpoint so the monotonic invariant survives reopen.
+        // read_valid() returns nullopt on a fresh PM file (or one
+        // whose only writes were torn) — in that case we start at
+        // zero. seq_ is bumped from here on so the next write
+        // strictly orders after the last persisted one.
         if (checkpoint_ != nullptr) {
             if (auto rec = checkpoint_->read_valid()) {
                 flushed_count_.store(rec->flushed_count,
                                      std::memory_order_relaxed);
                 seq_.store(rec->seq, std::memory_order_relaxed);
             }
+        }
+
+        // Step 2 (M6): bounded VPage tail scan to bring ColdTier in
+        // sync with whatever is on PM past the last checkpoint
+        // frontier. Done before the flusher / commit-buffer come up
+        // so no concurrent writes interleave with replay.
+        if (rcfg.tail_scan && cold_ != nullptr) {
+            const std::uint64_t replayed
+                = recover_tail_into_cold(rcfg.recovery_threads);
+            stats_.recovery_replayed.fetch_add(
+                replayed, std::memory_order_relaxed);
+        }
+
+        // Step 3: spin up the steady-state path — commit buffer +
+        // flusher thread.
+        if (cold_ != nullptr) {
+            commit_buf_ = std::make_unique<CommitBuffer>();
+            flusher_consumer_tok_ = std::make_unique<moodycamel::ConsumerToken>(
+                commit_buf_->make_consumer_token());
+            flusher_ = std::thread([this]() { flusher_loop(); });
         }
     }
 
@@ -422,6 +452,26 @@ class HiOM {
         if (checkpoint_ != nullptr) try_write_checkpoint();
     }
 
+    // M6 test hook: simulate a crash by stopping the flusher and
+    // dropping the commit buffer *without* draining. After this call
+    // the destructor is a no-op for the buffer (drain_once short-
+    // circuits on null commit_buf_), so any in-flight commit entries
+    // are lost — exactly the volatile-state-loss semantics a real
+    // process kill would produce. ColdTier and Checkpoint are
+    // untouched (PM-resident, durable per-op). Test-only — production
+    // shutdown should call flush_and_wait + force_checkpoint instead.
+    void simulate_crash_for_test() {
+        if (flusher_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(flush_mu_);
+                stop_ = true;
+            }
+            flush_cv_.notify_all();
+            flusher_.join();
+        }
+        commit_buf_.reset();
+    }
+
     // Block until the commit buffer is fully drained (all pending
     // writes have been applied to ColdTier and corresponding HotTier
     // pins released). Used by tests and graceful shutdown sequences;
@@ -563,6 +613,78 @@ class HiOM {
         rec.cold_size = (cold_ != nullptr) ? cold_->approx_size() : 0;
         checkpoint_->write(rec);
         stats_.checkpoints_written.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // M6: bounded VPage tail scan. Walks Viper VPages in
+    // [frontier_block, current_block) — derived from
+    // checkpoint.vpage_frontier (or 0 if no valid checkpoint) and
+    // viper.hiom_vpage_frontier() — and upserts every live record into
+    // ColdTier. Idempotent: ColdTier::upsert is last-write-wins on the
+    // (fp64, offset) pair, and Viper's update path is in-place so each
+    // key has at most one live offset on PM. Parallelised by chunking
+    // the block range across `threads` workers in the same shape as
+    // Viper::recover_database.
+    //
+    // Returns the count of records replayed, for stats and test
+    // introspection. Caller increments stats_.recovery_replayed.
+    std::size_t recover_tail_into_cold(std::size_t threads) {
+        if (cold_ == nullptr) return 0;
+        viper::block_size_t frontier_block = 0;
+        if (checkpoint_ != nullptr) {
+            if (auto rec = checkpoint_->read_valid()) {
+                frontier_block
+                    = KVOffset{rec->vpage_frontier}.block_number;
+            }
+        }
+        // current_block_page_.block_number semantics: the *next* block
+        // a client will claim (get_new_block bumps it from
+        // {client_block, ...} to {client_block + 1, ...}). So when
+        // checkpoint fires while a client is writing into block N,
+        // frontier_block is captured as N+1 — the boundary block N
+        // itself is NOT covered by [frontier_block, current_block).
+        // That block typically straddles drained-and-undrained
+        // entries (first-half drained pre-checkpoint, second-half
+        // committed-but-not-drained post-checkpoint). Start one block
+        // earlier so the boundary is included; ColdTier::upsert is
+        // idempotent on (fp64, same offset), so re-upserting already-
+        // in-cold entries is harmless and doesn't double-count
+        // num_entries.
+        const viper::block_size_t start_block
+            = (frontier_block > 0) ? frontier_block - 1 : 0;
+        const viper::block_size_t current_block
+            = KVOffset{viper_.hiom_vpage_frontier()}.block_number;
+        if (current_block <= start_block) return 0;
+
+        const std::size_t num_blocks
+            = static_cast<std::size_t>(current_block - start_block);
+        const std::size_t num_threads
+            = std::min<std::size_t>(num_blocks,
+                                    std::max<std::size_t>(1, threads));
+        const std::size_t per_thread
+            = (num_blocks + num_threads - 1) / num_threads;
+
+        std::atomic<std::size_t> total{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (std::size_t t = 0; t < num_threads; ++t) {
+            const viper::block_size_t lo = static_cast<viper::block_size_t>(
+                start_block + t * per_thread);
+            const viper::block_size_t hi = static_cast<viper::block_size_t>(
+                std::min<std::size_t>(lo + per_thread, current_block));
+            if (lo >= hi) continue;
+            workers.emplace_back([this, lo, hi, &total]() {
+                std::size_t local = 0;
+                viper_.hiom_visit_records(lo, hi,
+                    [this, &local](const K& key, const V& /*value*/,
+                                   KVOffset off) {
+                        cold_->upsert(key_fingerprint64(key), off);
+                        ++local;
+                    });
+                total.fetch_add(local, std::memory_order_relaxed);
+            });
+        }
+        for (auto& w : workers) w.join();
+        return total.load(std::memory_order_relaxed);
     }
 
     // Single-cycle drain helper, shared between the flusher loop and

@@ -12,59 +12,51 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ## Status (2026-05-04)
 
-- **Phase**: M0 ✅ complete; M1 functionally complete except EBR
-  (deferred to M4 Phase D); M2 Phase B-1 / B-2 ✅ complete; M3 Phase
-  A+B+C+D ✅ complete; M4 Phase 0+A+B ✅ complete (state machine,
-  inline-flush back-pressure, stable_sort fix); **M5 A/B checkpoint
-  complete (2026-05-04)** — 4 KB PM file with two 64-B slots and an
-  8-B atomic `valid_pointer`; cadence-driven writes from
-  `apply_batch`; FNV-1a `summary_hash` for torn-write detection;
-  HiOM constructor primes `flushed_count_` + `seq_` from the
-  restored record so the cumulative counter survives reopen; new
-  `Viper::hiom_vpage_frontier()` accessor records the next-block-
-  page write frontier for M6's bounded recovery scan.
+- **Phase**: M0 ✅; M1 functionally complete except EBR (deferred to
+  M4 Phase D); M2 Phase B-1/B-2 ✅; M3 Phase A+B+C+D ✅; M4 Phase
+  0+A+B ✅ (state machine, inline-flush back-pressure, stable_sort
+  fix); M5 ✅ (A/B checkpoint protocol with FNV-1a torn-write
+  detection); **M6 pragmatic ✅ (2026-05-04)** — bounded VPage tail
+  scan from `[checkpoint.vpage_frontier - 1, current_block)`,
+  parallelised across `recovery_threads`, replays into ColdTier
+  idempotently. Correctness only this round; the recovery-time win
+  ("40× faster" paper claim) is carved out to **M6.5** because it
+  requires retiring CCEH from Viper's *write* path.
 - **Code on disk**:
   - `include/viper/hiom/hot_tier.hpp` (~470 lines): unchanged from M4.
   - `include/viper/hiom/offset_codec.hpp` (~110 lines): unchanged.
   - `include/viper/hiom/cold_tier.hpp` (~560 lines): unchanged from M2.
   - `include/viper/hiom/commit_buffer.hpp` (~110 lines): unchanged.
-  - `include/viper/hiom/checkpoint.hpp` (~235 lines, **NEW M5**):
-    `Checkpoint::create / open / write / read_valid / read_both`,
-    `CheckpointRecord` (64 B, single cacheline) with `magic`, `seq`,
-    `flushed_count`, `vpage_frontier`, `cold_size`, `summary_hash`.
-  - `include/viper/hiom/hiom.hpp` (~610 lines): M5 added
-    `CheckpointConfig` (cadence_entries default 4096), constructor
-    optional `Checkpoint*` + ctor-time priming from
-    `read_valid()`, `try_write_checkpoint()` with try-lock so the
-    background flusher and inline-flusher don't double-write,
-    cadence check inside `apply_batch`, `force_checkpoint()` and
-    `flushed_count()` accessors, new `checkpoints_written` stat.
-  - `include/viper/viper.hpp`: M5 added `Viper::hiom_vpage_frontier()`
-    public accessor (acquire-load of `current_block_page_`); CCEH-
-    tombstone-leak guard from M3 still in place.
-  - `test/hot_tier_test.cpp` (~660 lines, 8 tests): unchanged.
-  - `test/hiom_integration_test.cpp` (~810 lines, **6 tests**):
-    new `run_checkpoint_persistence` covers (1) cadence-driven
-    writes during 10K inserts (10 checkpoints @ cadence=1024), (2)
-    reopen-and-match, (3) torn-write fallback (corrupt active slot,
-    fall back to seq-1), (4) cross-restart priming + monotonic
-    advance.
-  - `test/cold_tier_test.cpp` (~370 lines, 9 tests): unchanged.
-- **Throughputs (single-threaded, post-M5)**:
+  - `include/viper/hiom/checkpoint.hpp` (~235 lines): unchanged from M5.
+  - `include/viper/hiom/hiom.hpp` (~700 lines): M6 added
+    `RecoveryConfig`, `recover_tail_into_cold()` (parallel scan
+    using N worker threads, idempotent ColdTier upserts),
+    `simulate_crash_for_test()` test hook, `recovery_replayed`
+    stat. Constructor reordered: prime counters → tail scan →
+    spin up flusher (so no concurrent writes interleave with replay).
+  - `include/viper/viper.hpp`: M6 added `Viper::hiom_visit_records<Visitor>()`
+    public template (mirrors `recover_database`'s VPage iteration
+    line-for-line, exposed as a generic visitor).
+  - `test/hiom_integration_test.cpp` (~1100 lines, **7 tests**):
+    new `run_recovery_persistence` covers (A) clean shutdown +
+    no-op recover, (B) crash with mid-stream checkpoint (5K drained
+    + 5K lost-from-buffer, tail scan recovers), (C) crash before
+    any checkpoint (read_valid → nullopt → full-pool scan).
+- **Throughputs (single-threaded, post-M6)**:
   - HotTier standalone lookup: 135 M ops/s.
-  - HiOM full-path lookup: 49.6 M ops/s vs raw Viper 47.3 M ops/s —
-    ratio 1.05. M5's apply_batch hook adds an atomic fetch_add and
-    a divisibility check per drain cycle, no observable overhead.
-  - HiOM commit-window with back-pressure (HotTier 4096 slots, 10K
-    writes, slow background flusher): pin_failures ≈ 31 (~0.3% of
-    writes hit the synchronous-drain fallback); 10K reads after
-    write phase split as ≈2K hot + ≈8K cold, 0 misses.
-  - ColdTier insert: 1.9–3.3 M ops/s depending on PM bandwidth state.
-  - ColdTier lookup: 200 M ops/s.
-- **Implementation share**: ~70% (6.0 weeks / 9 weeks of impl), up
-  from ~65% before M5. Remaining: M4 Phase C/D/E (multi-producer
-  happens-before, EBR, stress), M6 (bounded recovery scan + parallel
-  cold load), M7 (evaluation).
+  - HiOM full-path lookup: 49.3 M ops/s vs raw Viper 47.4 M/s —
+    ratio 1.04. Recovery code is on the open() path only; zero
+    steady-state overhead.
+  - HiOM commit-window with back-pressure: 31 pin_failures, 10K
+    reads correct (M4 unchanged).
+  - M6 recovery shape (10K writes, slow flusher): replayed ≈ 5446
+    entries from a 4-block tail (block 3 boundary + blocks 4–6),
+    cold goes 5000→10000, all 10K reads succeed post-recovery.
+- **Implementation share**: ~75% (6.7 weeks / 9 weeks of impl), up
+  from ~70% before M6. Remaining: M4 Phase C/D/E (multi-producer
+  happens-before, EBR, multi-thread + crash injection stress); M6.5
+  (retire CCEH from Viper write path → skip recover_database →
+  measure recovery time win); M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -875,15 +867,82 @@ writes advance to seq=8 and `flushed_count=7000`.
    and Viper from PM and verify they line up with the restored
    `vpage_frontier` and `cold_size`.
 
-### M6 — Recovery (3 days)
+### M6 — Recovery (3 days) — pragmatic ✅ complete (2026-05-04)
 
-- [ ] Parallel cold-tier load (32 threads, one per region).
-- [ ] VPage scan bounded by `valid_checkpoint.vpage_frontier`
-      (provided by M5's `Viper::hiom_vpage_frontier()` snapshot;
-      `seq` is just the record-ordering tiebreaker).
-- [ ] Hot-tier rebuild from cold tier (warm-up phase).
+Pragmatic scope: bounded VPage tail scan correctness. The
+recovery-time win against Viper's `recover_database()` baseline is
+deferred to **M6.5** because it requires retiring CCEH from
+Viper's *write* path, not just the read path (M3 Phase D retired
+read; write-path retirement risks regressions across M0–M5 tests).
 
-Exit: 100 GB working set recovers in ≤ 5 s.
+- [x] **Bounded VPage tail scan**. `HiOM::recover_tail_into_cold()`
+      walks `[max(0, frontier_block - 1), current_block_page.block_number)`
+      and `cold_->upsert(fp64, off)` every live record. Idempotent
+      because ColdTier's upsert overwrites in place when fp64
+      already exists (no num_entries bump). The `-1` adjustment is
+      because `current_block_page_.block_number` is "next block to
+      claim", so the block being actively written at checkpoint
+      time straddles `frontier_block - 1` — must be re-scanned.
+- [x] **Parallel scan**, one thread per `recovery_threads / num_blocks`
+      sub-range, mirroring `Viper::recover_database`'s thread split.
+      Default 32 threads; configurable via `RecoveryConfig`.
+- [x] **`Viper::hiom_visit_records<Visitor>()`** public template that
+      reuses recover_database's `IS_BIT_SET(version_lock, USED_BIT)`
+      + `free_slots[slot]` iteration as a generic visitor.
+- [x] **Constructor ordering**: prime counters from checkpoint →
+      run tail scan (if `tail_scan=true`) → spin up flusher. No
+      concurrent writes interleave with replay.
+- [x] **`simulate_crash_for_test()` test hook**: stops the flusher
+      and drops the commit buffer without draining, matching the
+      DRAM-loss semantics a real process kill produces.
+- [ ] **Hot-tier rebuild from cold tier (warm-up phase)**. Optional;
+      not required for correctness. Deferred to M6.5 as a
+      perf optimization.
+- [ ] **CCEH-skip on open** (the actual recovery-time win).
+      Deferred to M6.5.
+
+Exit (M6 pragmatic met): `run_recovery_persistence` 3 phases all
+PASS. Phase A (clean shutdown): replayed ≈ boundary block contents,
+cold size unchanged at 5K, all 5K reads hit. Phase B (crash mid-
+stream after a checkpoint): replayed ≈ 5446 (boundary block + 5K
+post-checkpoint tail), cold goes 5K → 10K, all 10K reads hit.
+Phase C (crash before any checkpoint): `read_valid()` returns
+nullopt, scan starts from block 0, replayed = 5K, cold = 5K,
+all 5K reads hit.
+
+**M6 follow-ups (next):**
+1. Hot-tier warm-up phase. Walk the most-recently-touched N entries
+   from ColdTier and pre-load HotTier so the first reads after
+   recovery don't pay PM-via-cold latency. Pure perf, optional.
+2. `recovery_bm` integration. Today's `benchmark/recovery_bm.cpp`
+   times raw Viper recovery; add a HiOM-recovery variant that
+   measures end-to-end open() time including tail scan.
+
+### M6.5 — Recovery time win (CCEH write-path retirement, ~3-5 days)
+
+Retiring CCEH from Viper's `put` / `update` / `remove` so
+`recover_database()` can be skipped entirely (the only thing it
+rebuilds is `map_`, which is unused if HiOM is authoritative).
+Required for the paper's "40× faster recovery" claim.
+
+- [ ] Refactor `Viper::Client::put` (existing-key path) to
+      invalidate the previous offset's bitset slot via a HiOM
+      lookup (cold or hot) instead of `map_.Get`.
+- [ ] Refactor `Viper::Client::update` to do the same.
+- [ ] Refactor `Viper::Client::remove` likewise.
+- [ ] Add `ViperConfig::skip_recovery` flag; gate `recover_database()`
+      call in the constructor on `!skip_recovery`.
+- [ ] HiOM::open variant that opens Viper with skip_recovery=true,
+      then runs the tail scan — total recovery is now O(tail), not
+      O(all VPages).
+- [ ] Re-verify all M0–M5 tests pass after the refactor (regression
+      surface).
+- [ ] Benchmark: time `Viper::open` baseline vs `HiOM::open`-with-
+      skip on 100M-entry pool. Target: ≥ 10× speedup; paper claim
+      is ~40×.
+
+Exit: `recovery_bm` shows HiOM recovery beating Viper baseline by
+≥ 10× on the 100M dataset. All correctness tests still pass.
 
 ### M7 — Evaluation (3-4 weeks)
 

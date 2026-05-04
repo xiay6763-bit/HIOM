@@ -431,6 +431,39 @@ class Viper {
         return current_block_page_.load(std::memory_order_acquire);
     }
 
+    // HiOM hook (M6 recovery): visit every live record in VPages
+    // [block_lo, block_hi). Mirrors recover_database()'s iteration
+    // (USED_BIT on the page's version_lock, free_slots bitset for
+    // per-slot occupancy) but exposes it as a generic visitor so HiOM
+    // can drive its own bounded tail scan without depending on CCEH
+    // rebuild. Visitor signature: `void(const K&, const V&, KVOffset)`.
+    // Caller is responsible for parallelism — the function itself is
+    // single-threaded over its range. Range may exceed v_blocks_.size()
+    // if a concurrent get_new_block races; we clamp to the current
+    // vector size for safety.
+    template <typename Visitor>
+    void hiom_visit_records(block_size_t block_lo, block_size_t block_hi,
+                            Visitor&& visit) {
+        const block_size_t cap
+            = static_cast<block_size_t>(v_blocks_.size());
+        if (block_hi > cap) block_hi = cap;
+        for (block_size_t bn = block_lo; bn < block_hi; ++bn) {
+            VPageBlock* block = v_blocks_[bn];
+            if (block == nullptr) continue;
+            for (page_size_t pn = 0; pn < num_pages_per_block; ++pn) {
+                const VPage& page = block->v_pages[pn];
+                if (!IS_BIT_SET(page.version_lock, USED_BIT)) continue;
+                for (data_offset_size_t sn = 0;
+                     sn < VPage::num_slots_per_page; ++sn) {
+                    if (page.free_slots[sn]) continue;
+                    visit(page.data[sn].first,
+                          page.data[sn].second,
+                          KVOffset{bn, pn, sn});
+                }
+            }
+        }
+    }
+
   protected:
     static ViperBase init_pool(const std::string& pool_file, uint64_t pool_size,
                                bool is_new_pool, ViperConfig v_config);
