@@ -237,17 +237,25 @@ class HiOM {
             // Step 1: viper does the PM-side write (data + bitset persisted)
             // and updates its own CCEH. Persistence ordering is unchanged
             // from the original Viper put path (viper.hpp ~1037-1054).
-            if (!viper_.put(key, value)) return false;
+            // Note: viper_.put returns is_new_item (true=insert, false=
+            // update of existing key). Both are "success"; only an
+            // internal panic would skip the return, so we always run
+            // mirror_write below regardless of insert vs. update —
+            // otherwise updates of an existing key would silently miss
+            // the commit buffer + ColdTier path, leaving the CCEH offset
+            // and the HiOM offset divergent (M4 Phase C bug).
+            const bool is_new_item = viper_.put(key, value);
 
-            // Step 2: peek the KVOffset Viper just installed and mirror
-            // into HotTier (PINNED) and the commit buffer / ColdTier.
-            // All of this happens *after* PM persistence so a crash
-            // never leaves either tier pointing at non-persisted data;
-            // the volatile commit buffer is allowed to be lost on crash
-            // because Viper's CCEH (still the M2/M3 safety net) holds
-            // the same offset and recovery rebuilds from VPage scan.
-            mirror_write(key, CommitEntry::Op::kPut);
-            return true;
+            // Step 2: mirror into HotTier (PINNED) and the commit buffer /
+            // ColdTier. M4 Phase C: take the offset directly from the
+            // Viper Client's last_put_offset() — viper_.put just wrote
+            // (key, value) into that exact slot, so it's guaranteed to
+            // hold our key. Peeking CCEH (the old approach) could return
+            // a stale duplicate entry and lead ColdTier to point at a
+            // different key's slot.
+            const KVOffset just_written = viper_.last_put_offset();
+            mirror_write_with_offset(key, CommitEntry::Op::kPut, just_written);
+            return is_new_item;
         }
 
         bool get(const K& key, V* value) {
@@ -311,10 +319,13 @@ class HiOM {
                 // would race with a still-buffered kPut for this fp,
                 // and the flusher would then write the obsolete put
                 // *after* the remove.
+                const std::uint64_t seq = hiom_.commit_seq_.fetch_add(
+                    1, std::memory_order_seq_cst) + 1;
                 push_commit({CommitEntry::Op::kRemove,
                              {}, key_fingerprint64(key),
                              KVOffset{},  // unused for kRemove
-                             HotTier::SlotRef{}});
+                             HotTier::SlotRef{},
+                             seq});
             }
             return true;
         }
@@ -365,6 +376,18 @@ class HiOM {
         void mirror_write(const K& key, CommitEntry::Op op) {
             KVOffset off = viper_.hiom_peek_offset(key);
             if (off.is_tombstone()) return;
+            mirror_write_with_offset(key, op, off);
+        }
+
+        // M4 Phase C: same as mirror_write, but caller supplies the
+        // KVOffset directly (e.g., from viper_.last_put_offset() on
+        // the put hot path). Avoids a CCEH peek that under heavy
+        // multi-producer same-key concurrency can return a stale
+        // duplicate offset whose VPage slot has been re-allocated to
+        // a different key — exactly the bug Phase C is meant to fix.
+        void mirror_write_with_offset(const K& key, CommitEntry::Op op,
+                                      KVOffset off) {
+            if (off.is_tombstone()) return;
 
             HotTier::SlotRef ref{};
             const auto [block, page, slot] = off.get_offsets();
@@ -404,7 +427,9 @@ class HiOM {
             }
 
             if (hiom_.cold_ != nullptr) {
-                push_commit({op, {}, key_fingerprint64(key), off, ref});
+                const std::uint64_t seq = hiom_.commit_seq_.fetch_add(
+                    1, std::memory_order_seq_cst) + 1;
+                push_commit({op, {}, key_fingerprint64(key), off, ref, seq});
                 // M4 Phase B: if upsert_pinned failed (ref.valid==false),
                 // the entry isn't in HotTier. Block until the commit
                 // buffer is drained so it reaches ColdTier before this
@@ -542,69 +567,163 @@ class HiOM {
     // their slots to UNPINNED, freeing room for the retry.
     //
     // Returns the number of entries drained, or 0 if another thread
-    // is already inline-flushing (caller should yield and retry).
-    // The lock serializes inline-flush calls only; the background
-    // flusher uses an independent ConsumerToken so this can run
-    // alongside it without contention beyond the queue itself.
-    std::size_t try_inline_flush(std::size_t target) {
+    // is already inline-flushing OR the background flusher is mid-
+    // apply (caller should yield and retry). M4 Phase C: try_lock
+    // on apply_mu_ to coordinate with drain_once; same lock means
+    // strict cross-batch ordering of (fp64, seq) is preserved
+    // because every apply pass drains the queue to empty.
+    std::size_t try_inline_flush(std::size_t /*target ignored after Phase C*/) {
         if (!commit_buf_ || cold_ == nullptr) return 0;
-        std::unique_lock<std::mutex> lk(inline_flush_mu_, std::try_to_lock);
+        std::unique_lock<std::mutex> lk(apply_mu_, std::try_to_lock);
         if (!lk.owns_lock()) return 0;
-        if (!inline_consumer_tok_) {
-            inline_consumer_tok_ = std::make_unique<moodycamel::ConsumerToken>(
-                commit_buf_->make_consumer_token());
-        }
-        std::vector<CommitEntry> batch;
-        const std::size_t got = commit_buf_->try_drain(
-            *inline_consumer_tok_, batch, target);
-        if (got == 0) return 0;
-        std::stable_sort(batch.begin(), batch.end(),
-                         [](const CommitEntry& a, const CommitEntry& b) {
-                             return a.fp64 < b.fp64;
-                         });
-        apply_batch(batch);
-        stats_.commits_flushed.fetch_add(got, std::memory_order_relaxed);
+        const std::size_t got = drain_to_empty_and_apply_locked();
         return got;
     }
 
   private:
+    // M4 Phase C: drain the queue until try_drain returns 0 (i.e.
+    // queue empty from this consumer's view), then sort by
+    // (fp64 asc, seq asc), coalesce same-fp runs in apply_batch,
+    // and apply. Caller must hold apply_mu_. Returns total drained.
+    std::size_t drain_to_empty_and_apply_locked() {
+        // Set flushing_in_progress_ BEFORE we start dequeuing. Otherwise
+        // flush_and_wait can observe (size_hint==0, flushing==false) in
+        // the gap between try_drain's last successful dequeue and the
+        // store(true) below — even though apply_batch hasn't run yet —
+        // and incorrectly declare the queue "stable", returning before
+        // ColdTier sees the drained entries.
+        flushing_in_progress_.store(true, std::memory_order_release);
+        std::vector<CommitEntry> batch;
+        std::size_t total = 0;
+        constexpr std::size_t kPerCall = 1024;
+        while (true) {
+            const std::size_t prev = batch.size();
+            const std::size_t got = commit_buf_->try_drain(
+                *flusher_consumer_tok_, batch, kPerCall);
+            if (got == 0) break;
+            total += got;
+            (void)prev;
+        }
+        if (total == 0) {
+            flushing_in_progress_.store(false, std::memory_order_release);
+            return 0;
+        }
+        std::stable_sort(batch.begin(), batch.end(),
+                         [](const CommitEntry& a, const CommitEntry& b) {
+                             if (a.fp64 != b.fp64) return a.fp64 < b.fp64;
+                             return a.seq < b.seq;
+                         });
+        apply_batch(batch);
+        stats_.commits_flushed.fetch_add(total, std::memory_order_relaxed);
+        flushing_in_progress_.store(false, std::memory_order_release);
+        return total;
+    }
+
     // Apply a sorted batch of CommitEntry to the cold tier and the
     // HotTier state machine. Extracted from drain_once so the inline-
     // flush path (M4 Phase B) can reuse it. Caller must already hold
     // a (logical or physical) drain ownership — the function makes no
     // assumption about which thread is calling, but Concurrency-wise
     // the CAS dance on each slot is safe regardless.
+    // Apply a sorted batch of CommitEntry to the cold tier and the
+    // HotTier state machine. M4 Phase C: batch is sorted by
+    // (fp64 asc, seq asc). For each run of equal fp64, we apply
+    // ONLY one cold-tier op per fp (idempotent + bandwidth saving),
+    // but we still walk every entry's hot_slot to drive the
+    // PINNED → IN_FLUSH → UNPINNED transitions. This resolves the
+    // multi-producer "two threads write same key" race where without
+    // a (fp64, seq) sort, ColdTier could end up with the older offset.
+    //
+    // Winner selection (Step 5c): walk descending from highest seq.
+    // The first kRemove or alive kPut wins. A kPut entry is "alive"
+    // for our purposes only if (a) the slot's free_slots bit is
+    // unset (slot is occupied) AND (b) the slot's stored key hashes
+    // to the same fp64 as the entry. Just (a) is insufficient
+    // because under heavy update concurrency a freed slot can be
+    // *reused* by a different key — alive=true, but the data is
+    // not for us. Hashing the slot's key catches that. If the
+    // entire run is stale kPuts (or reused-by-other-key kPuts),
+    // we leave ColdTier untouched: any earlier-batch upsert for the
+    // same fp stays in place, and the future batch carrying the
+    // latest seq will overwrite with the correct offset. (Falling
+    // back to kRemove here would wipe a still-valid earlier entry.)
     void apply_batch(std::vector<CommitEntry>& batch) {
-        for (const auto& e : batch) {
-            // M4 Phase A: take ownership of the hot slot via
-            // PINNED → IN_FLUSH. Failure here is benign: the slot
-            // may have been overwritten by a same-fp update (which
-            // pushed its own kPut; we'll process that one too) or
-            // already-cleared by an earlier flush cycle. Either way
-            // the cold-tier write below is still authoritative —
-            // entry's fp64+offset don't depend on slot state.
-            const bool we_own = hot_.cas_slot_state(
-                e.hot_slot,
-                HotTier::SlotState::kPinned,
-                HotTier::SlotState::kInFlush);
+        if (batch.empty()) return;
 
-            if (e.op == CommitEntry::Op::kPut) {
-                cold_->upsert(e.fp64, e.off);
-            } else {
-                cold_->remove(e.fp64);
+        std::size_t i = 0;
+        while (i < batch.size()) {
+            std::size_t j = i + 1;
+            while (j < batch.size() && batch[j].fp64 == batch[i].fp64) {
+                ++j;
+            }
+            // batch[i..j) is one fp64 run, sorted by seq asc.
+            // Walk descending and pick the first kRemove (final by
+            // intent) or alive-and-fp-matching kPut.
+            const CommitEntry* winner = nullptr;
+            for (std::size_t k = j; k > i; --k) {
+                const CommitEntry& e = batch[k - 1];
+                if (e.op == CommitEntry::Op::kRemove) {
+                    winner = &e;
+                    break;
+                }
+                // kPut: the slot must be occupied AND still hold a
+                // key that hashes to e.fp64. hiom_get_slot_key
+                // returns false if free_slots is set; the read of
+                // the key itself is safe because Viper persists the
+                // key bytes *before* clearing the free_slots bit.
+                // The fp64 check is what filters out the case where
+                // a freed slot has been re-allocated to a different
+                // key under heavy update concurrency — without it,
+                // ColdTier would point at a slot whose data is for
+                // another key.
+                K stored_key;
+                if (!viper_.hiom_get_slot_key(e.off, &stored_key)) {
+                    continue;  // freed
+                }
+                if (key_fingerprint64(stored_key) != e.fp64) {
+                    continue;  // slot reused by a different key
+                }
+                winner = &e;
+                break;
             }
 
-            if (we_own) {
-                // Release. CAS failure here is a real race (another
-                // writer transitioned IN_FLUSH → PINNED via
-                // force_pinned mid-flight) — in that case leave the
-                // state alone so the next flush cycle sees PINNED.
-                hot_.cas_slot_state(
-                    e.hot_slot,
-                    HotTier::SlotState::kInFlush,
-                    HotTier::SlotState::kUnpinned);
+            // Cold-tier write FIRST so the slot stays pinned across
+            // the whole run until the durable cold record is in
+            // place (M4 Phase B contract). One write per fp instead
+            // of one per entry. winner==nullptr means the run was
+            // entirely stale kPuts; leave ColdTier untouched.
+            if (winner != nullptr) {
+                if (winner->op == CommitEntry::Op::kPut) {
+                    cold_->upsert(winner->fp64, winner->off);
+                } else {
+                    cold_->remove(winner->fp64);
+                }
             }
+
+            // Now drive the state machine for every entry's slot
+            // ref. CAS failures are benign:
+            //  - earlier-seq entries' slot refs may point at slots
+            //    whose state was already advanced by the latest
+            //    upsert_pinned for the same fp (last writer wins on
+            //    the underlying slot);
+            //  - or the slot may already have transitioned through
+            //    IN_FLUSH→UNPINNED by a prior apply pass.
+            for (std::size_t k = i; k < j; ++k) {
+                const bool we_own = hot_.cas_slot_state(
+                    batch[k].hot_slot,
+                    HotTier::SlotState::kPinned,
+                    HotTier::SlotState::kInFlush);
+                if (we_own) {
+                    hot_.cas_slot_state(
+                        batch[k].hot_slot,
+                        HotTier::SlotState::kInFlush,
+                        HotTier::SlotState::kUnpinned);
+                }
+            }
+
+            i = j;
         }
+
 
         // M5 checkpoint hook: bump cumulative flushed count and, if the
         // batch crossed a cadence boundary, try to persist a fresh
@@ -722,25 +841,13 @@ class HiOM {
 
     // Single-cycle drain helper, shared between the flusher loop and
     // the destructor's final cleanup pass. Returns the count drained.
-    std::size_t drain_once(std::size_t max) {
+    // M4 Phase C: takes apply_mu_ (blocking) so background and inline
+    // flushers serialize; whoever holds it drains the queue to
+    // empty, then sorts (fp64, seq) and coalesces same-fp runs.
+    std::size_t drain_once(std::size_t /*max ignored after Phase C*/) {
         if (!commit_buf_ || cold_ == nullptr) return 0;
-        std::vector<CommitEntry> batch;
-        const std::size_t got = commit_buf_->try_drain(
-            *flusher_consumer_tok_, batch, max);
-        if (got == 0) return 0;
-        flushing_in_progress_.store(true, std::memory_order_release);
-        // stable_sort: same fp64 ops keep their enqueue order so a
-        // put-v1 / put-v2 sequence on a single key applies as v1
-        // first, v2 second, leaving ColdTier with v2 (the latest).
-        // std::sort would be free to swap them.
-        std::stable_sort(batch.begin(), batch.end(),
-                  [](const CommitEntry& a, const CommitEntry& b) {
-                      return a.fp64 < b.fp64;
-                  });
-        apply_batch(batch);
-        stats_.commits_flushed.fetch_add(got, std::memory_order_relaxed);
-        flushing_in_progress_.store(false, std::memory_order_release);
-        return got;
+        std::lock_guard<std::mutex> lk(apply_mu_);
+        return drain_to_empty_and_apply_locked();
     }
 
     // Background flusher: wakes on timer or high-watermark notify and
@@ -780,12 +887,19 @@ class HiOM {
     bool stop_{false};
     std::atomic<bool> flushing_in_progress_{false};
 
-    // M4 Phase B: inline-flush state. Lazy ConsumerToken so the
-    // first try_inline_flush call pays the allocation; lock guards
-    // against multiple simultaneous inline-flushers (the background
-    // flusher uses its own token and is independent).
-    std::mutex inline_flush_mu_;
-    std::unique_ptr<moodycamel::ConsumerToken> inline_consumer_tok_;
+    // M4 Phase C: drain+apply serialization. A single mutex covers
+    // both the background flusher's drain_once and the writer-side
+    // try_inline_flush, so concurrent same-fp upserts can't race in
+    // the cold tier. Whoever holds it drains the queue to empty (so
+    // each apply pass sees every entry that was already pushed and
+    // can sort/coalesce by (fp64, seq) for strict happens-before
+    // correctness across producer threads).
+    std::mutex apply_mu_;
+
+    // M4 Phase C: monotonic stamp source for CommitEntry.seq. Bumped
+    // by HiOM::Client at push time. Distinct from `seq_` (M5
+    // checkpoint generation, bumped per-checkpoint).
+    std::atomic<std::uint64_t> commit_seq_{0};
 
     // M5 checkpoint state. checkpoint_ is non-owning (caller manages
     // the PM file's lifetime so the same Checkpoint can survive HiOM

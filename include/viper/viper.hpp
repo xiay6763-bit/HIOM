@@ -382,6 +382,15 @@ class Viper {
       public:
         bool put(const K& key, const V& value);
 
+        // M4 Phase C: returns the KVOffset of the slot that put()
+        // just allocated (vs. CCEH-peek, which can return a stale
+        // duplicate entry under heavy update concurrency). Defined
+        // only after a successful put() on this client; the returned
+        // value is the offset whose slot the caller's (key, value)
+        // were written into. HiOM uses this on the write path so
+        // mirror_write doesn't have to peek CCEH for the offset.
+        inline KVOffset last_put_offset() const { return last_put_offset_; }
+
         bool get(const K& key, V* value);
         bool get(const K& key, V* value) const;
 
@@ -428,6 +437,12 @@ class Viper {
         uint16_t op_count_;
         size_t num_reclaimable_ops_;
         int size_delta_;
+
+        // M4 Phase C: last KVOffset that this Client's put() wrote
+        // a (key, value) into. Used by HiOM Client::put to push the
+        // exact-just-allocated offset into the commit buffer instead
+        // of peeking CCEH (which can race with concurrent updates).
+        KVOffset last_put_offset_{};
     };
 
     Client get_client();
@@ -493,6 +508,40 @@ class Viper {
     using OldOffsetResolver = std::function<KVOffset(const K&)>;
     void set_hiom_old_offset_resolver(OldOffsetResolver fn) {
         hiom_old_offset_resolver_ = std::move(fn);
+    }
+
+    // M4 Phase C: cheap "is this offset still pointing at a live
+    // record" predicate. Used by HiOM's apply_batch coalesce path
+    // to skip cold-tier writes for offsets whose VPage slot has
+    // already been freed by a later CAS (the live entry is in
+    // some other CommitEntry, in this batch or a future one).
+    // Reads only the free_slots bitset; no version-lock check, no
+    // data read. Caller must hold no Viper locks.
+    bool hiom_is_offset_alive(KVOffset off) const {
+        const auto [block, page, slot] = off.get_offsets();
+        if (block >= v_blocks_.size()) return false;
+        const VPage& vp = v_blocks_[block]->v_pages[page];
+        // free_slots: bit set ⇒ slot is free. Bit cleared ⇒ slot is
+        // occupied (data alive).
+        return !vp.free_slots[slot];
+    }
+
+    // M4 Phase C, stronger variant: returns the slot's stored key
+    // when the slot is alive (free_slots bit cleared), so callers
+    // can hash-check it against the expected fp64. Needed because a
+    // freed slot can be re-allocated to a *different* key under
+    // heavy update concurrency — alive=true but the data is for
+    // someone else. Skips version-lock dance: the key bytes are
+    // persisted *before* free_slots[idx] is reset (see
+    // Viper::Client::put), so any reader that observes
+    // free_slots[idx]=0 sees a stable, durable key.
+    bool hiom_get_slot_key(KVOffset off, K* key_out) const {
+        const auto [block, page, slot] = off.get_offsets();
+        if (block >= v_blocks_.size()) return false;
+        const VPage& vp = v_blocks_[block]->v_pages[page];
+        if (vp.free_slots[slot]) return false;
+        *key_out = vp.data[slot].first;
+        return true;
     }
 
   protected:
@@ -1147,6 +1196,11 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
 
     // Store data in DRAM map.
     const KVOffset kv_offset{v_block_number_, v_page_number_, free_slot_idx};
+    // M4 Phase C: HiOM uses last_put_offset_ on the write path
+    // instead of peeking CCEH, which can return a stale duplicate
+    // entry under heavy update concurrency. Set it as soon as we
+    // know the new offset; the rest of put() doesn't depend on it.
+    last_put_offset_ = kv_offset;
     KVOffset old_offset;
 
     if constexpr (using_fp) {
@@ -1739,6 +1793,14 @@ inline bool Viper<K, V>::ReadOnlyClient::hiom_read_at_offset(
         KVOffset offset, K* key_out, V* value_out) const {
     const auto [block, page, slot] = offset.get_offsets();
     const VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
+    // M4 Phase C: free_slots[slot] = true means the slot is logically
+    // empty (the bit is reset on insert; set on free_occupied_slot).
+    // With reclaim off (the default), the slot's data remains on PM
+    // even after the bit is set, so a naive read would return stale
+    // (key, value). Bail before touching the data so callers
+    // (verify_and_read in HotTier path, alive checks in apply_batch)
+    // treat freed slots as if they don't exist.
+    if (v_page.free_slots[slot]) return false;
     const std::atomic<version_lock_t>& page_lock = v_page.version_lock;
     version_lock_t lock_val = page_lock.load(LOAD_ORDER);
     if (IS_LOCKED(lock_val)) return false;

@@ -51,6 +51,12 @@ struct CommitEntry {
     std::uint64_t fp64{0};
     viper::KeyValueOffset off{};
     HotTier::SlotRef hot_slot{};  // unpin target after flush; valid==false skipped
+    // M4 Phase C: monotonic stamp from HiOM::commit_seq_, taken at
+    // push time. Apply path sorts by (fp64, seq) and coalesces same-fp
+    // runs, applying only the highest-seq entry. seq=0 is the
+    // default-constructed sentinel, never assigned by Client paths
+    // (commit_seq_.fetch_add(1) + 1 starts at 1).
+    std::uint64_t seq{0};
 };
 static_assert(sizeof(CommitEntry) <= 64,
               "CommitEntry should fit comfortably in a cache line");

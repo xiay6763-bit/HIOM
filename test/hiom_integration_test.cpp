@@ -22,12 +22,14 @@
 #include "viper/hiom/hiom.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <random>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1312,6 +1314,142 @@ int run_recovery_persistence() {
     return 0;
 }
 
+// M4 Phase C: multi-producer correctness. Spawns N writer threads that
+// pound on a small key space (heavy same-key contention). Without
+// (fp64, seq) sort + coalesce + drain-to-empty under apply_mu_, the
+// commit-buffer order doesn't match the CCEH CAS order, and ColdTier
+// can end up with an offset whose VPage slot was freed by a later
+// CAS — `cl.get(K)` then misses live keys. The test asserts:
+//
+//   1. Every key in [0, KEY_RANGE) is readable via HiOM client get
+//      after all writers finish + flush_and_wait. Zero misses.
+//
+//   2. The KVOffset that ColdTier holds for each key matches the
+//      KVOffset that Viper's CCEH holds (the linearization-point
+//      truth). Mismatch = stale offset in ColdTier = the bug Phase C
+//      fixes.
+int run_multi_producer_correctness() {
+    std::cout << "=== HiOM multi-producer same-key correctness (M4 Phase C) ===" << std::endl;
+
+    cleanup_pool();
+    cleanup_cold_pool();
+    cleanup_checkpoint_dir();
+
+    constexpr std::size_t kHotBucketsMP = 1ULL << 12;  // 4K buckets x 16 = 64K slots
+    constexpr int kNumThreads = 8;
+    constexpr int kKeyRange = 256;          // heavy same-key contention
+    constexpr int kItersPerThread = 50'000;
+
+    auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+    auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+    auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+    HiOMT hiom(*viper_db, kHotBucketsMP, cold.get(),
+               HiOMT::FlusherConfig{}, chkpt.get());
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<std::uint64_t> total_writes{0};
+
+    auto worker = [&](int thread_id) {
+        auto cl = hiom.get_client();
+        std::mt19937_64 rng(static_cast<std::uint64_t>(thread_id) * 0x9E3779B97F4A7C15ULL);
+        ready.fetch_add(1);
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < kItersPerThread; ++i) {
+            const std::uint64_t k = static_cast<std::uint64_t>(
+                (rng() % kKeyRange) + 1);
+            // Per-(thread, iteration) value: high bits are thread_id,
+            // low bits are i, so collisions across threads have
+            // distinguishable values. We don't predict the CCEH
+            // winner; we just need cl.get to return SOME thread's
+            // value AND the offset to match CCEH's view.
+            const std::uint64_t v = (static_cast<std::uint64_t>(thread_id) << 48)
+                                  | static_cast<std::uint64_t>(i);
+            cl.put(k, v);
+        }
+        total_writes.fetch_add(kItersPerThread, std::memory_order_relaxed);
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(kNumThreads);
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    while (ready.load() < kNumThreads) std::this_thread::yield();
+    const auto t0 = std::chrono::steady_clock::now();
+    go.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+    const auto t1 = std::chrono::steady_clock::now();
+    hiom.flush_and_wait();
+    const auto t2 = std::chrono::steady_clock::now();
+
+    const double write_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double flush_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    std::cout << "  threads=" << kNumThreads
+              << " key_range=" << kKeyRange
+              << " writes/thread=" << kItersPerThread
+              << "  total_writes=" << total_writes.load()
+              << "  (" << write_ms << " ms write, "
+              << flush_ms << " ms flush)" << std::endl;
+
+    // Assertion 1: every key reads back. A live key that misses
+    // means ColdTier is pointing at an invalidated VPage slot.
+    auto cl = hiom.get_client();
+    auto vcl = viper_db->get_client();
+    std::size_t missed = 0;
+    std::size_t mismatched_offsets = 0;
+    std::size_t agree = 0;
+    for (int i = 0; i < kKeyRange; ++i) {
+        const std::uint64_t k = static_cast<std::uint64_t>(i + 1);
+
+        // CCEH-side truth.
+        const auto viper_off = vcl.hiom_peek_offset(k);
+        if (viper_off.is_tombstone()) {
+            // Key was never written (not in our key range under workload).
+            // For this test workload all keys are written.
+            std::cerr << "  unexpected tombstone for k=" << k << std::endl;
+            ++missed;
+            continue;
+        }
+        // ColdTier-side view.
+        const auto fp = viper::hiom::key_fingerprint64(k);
+        const auto cold_off = hiom.cold_tier()->lookup(fp);
+        if (!cold_off.has_value()) {
+            ++missed;
+            continue;
+        }
+        if (*cold_off == viper_off) {
+            ++agree;
+        } else {
+            ++mismatched_offsets;
+        }
+
+        // Reading via HiOM client must return SOME value, no miss.
+        std::uint64_t got = 0;
+        if (!cl.get(k, &got)) {
+            ++missed;
+        }
+    }
+    std::cout << "  per-key offset agreement: agree=" << agree
+              << " mismatched=" << mismatched_offsets
+              << " missed=" << missed
+              << " (expected agree=" << kKeyRange
+              << ", others=0)" << std::endl;
+    if (agree != static_cast<std::size_t>(kKeyRange)
+        || mismatched_offsets != 0 || missed != 0) {
+        std::cerr << "  FAIL: ColdTier diverged from CCEH for "
+                  << mismatched_offsets << " keys; "
+                  << missed << " keys read back as missing. "
+                  << "Multi-producer happens-before broken." << std::endl;
+        return 1;
+    }
+
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1323,6 +1461,7 @@ int main() {
     rc |= run_commit_window();
     rc |= run_checkpoint_persistence();
     rc |= run_recovery_persistence();
+    rc |= run_multi_producer_correctness();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;
