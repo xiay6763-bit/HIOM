@@ -84,7 +84,12 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 - **Code on disk**:
   - `include/viper/hiom/hot_tier.hpp` (~470 lines): unchanged from M4.
   - `include/viper/hiom/offset_codec.hpp` (~110 lines): unchanged.
-  - `include/viper/hiom/cold_tier.hpp` (~560 lines): unchanged from M2.
+  - `include/viper/hiom/cold_tier.hpp` (~810 lines after
+    2026-05-05 bulk_upsert): adds `BulkEntry`, public
+    `bulk_upsert(std::vector<BulkEntry>&)`, and the private
+    `apply_bucket_group` helper (per-bucket-group two-fence
+    persist). Existing `upsert` / `lookup` / `remove` /
+    `parallel_load` API unchanged.
   - `include/viper/hiom/commit_buffer.hpp` (~110 lines): unchanged.
   - `include/viper/hiom/checkpoint.hpp` (~235 lines): unchanged from M5.
   - `include/viper/hiom/hiom.hpp` (~830 lines after M4 Phase E):
@@ -114,12 +119,22 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     `::remove` line ~1438) gain a tombstone fallback that consults
     the resolver — null by default (legacy mode unchanged), set by
     HiOM's constructor when ColdTier is wired up.
-  - `include/viper/hiom/hiom.hpp` (~745 lines after M6.5 full): M6.5
-    full installs the resolver closure in HiOM's ctor (Step 3,
-    just before flusher spin-up) when `cold_ != nullptr`. The
-    closure does `cold_->lookup(fp64)` + `hiom_read_at_offset` +
-    key-verify, returning `KVOffset::Tombstone()` on miss / fp
-    collision / locked page. ~25 LoC.
+    **2026-05-05**: split `internal::pmem_persist` into
+    `pmem_flush_range` (clwb loop, no fence) + `pmem_drain` (single
+    sfence). The original `pmem_persist` keeps its semantics; the
+    split lets ColdTier::bulk_upsert batch many flushes and emit a
+    single drain across the bucket-group.
+  - `include/viper/hiom/hiom.hpp` (~770 lines after 2026-05-05
+    bulk_upsert refactor): `apply_batch` collects kPut winners
+    into a `std::vector<ColdTier::BulkEntry>` and dispatches via
+    one `cold_->bulk_upsert(puts)` call instead of per-entry
+    upsert; kRemove winners stay on the per-entry path. Checkpoint
+    cadence hook now fires per crossed boundary instead of per
+    apply_batch. M6.5 full installs the resolver closure in
+    HiOM's ctor (Step 3, just before flusher spin-up) when
+    `cold_ != nullptr`. The closure does `cold_->lookup(fp64)` +
+    `hiom_read_at_offset` + key-verify, returning
+    `KVOffset::Tombstone()` on miss / fp collision / locked page.
   - `benchmark/hiom_recovery_bm.cpp` (~290 lines, **new in M6.5**):
     standalone stopwatch benchmark (no Google Benchmark wiring).
     HiOM-mediated prefill populates Viper VPages + Viper CCEH +
@@ -249,10 +264,68 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   was always the next-priority M3 follow-up ("cache-line-aligned
   bulk writes to ColdTier"); the fixture made it visible. See
   *M3 follow-ups* below for the planned attack surface.
-- **Implementation share**: ~87% (7.8 weeks / 9 weeks of impl), up
-  from ~85% before the bench-fixture wire-up. Remaining: write-path
-  perf optimization (M3 follow-up surfaced by bench-fixture); 100M
-  `--full` measurement; M7 (full evaluation).
+- **M3 follow-up #1 landed: cache-line-aligned bulk writes to
+  ColdTier (2026-05-05)**. Two pieces:
+  - `viper::internal::pmem_persist` split into `pmem_flush_range`
+    (clwb loop, no fence) + `pmem_drain` (single sfence). Lets a
+    caller batch many flushes and amortise the sfence — the actual
+    cost driver for small PM updates.
+  - `ColdTier::bulk_upsert(std::vector<BulkEntry>&)`: sort entries
+    by (region, bucket); for each contiguous (region, bucket) run,
+    walk the chain once classifying each entry as
+    match-update or new-insert (claim empty slot or extend chain),
+    stage all stores, then issue exactly **two** drains per
+    bucket-group (one for entry data, one for header occupancy
+    bits) instead of two per entry. Crash-consistency invariant
+    unchanged: header bit becomes visible only after entry data
+    is durable. Caller (HiOM::apply_batch) holds `apply_mu_`, so
+    no concurrent writer hits the same chain.
+  - `HiOM::apply_batch` refactored to two stages: (1) collect
+    kPut winners across all (fp64, seq) runs into a single
+    `BulkEntry` vector, dispatch via one `cold_->bulk_upsert`
+    call; kRemove winners stay on the per-entry path (rare,
+    target existing chain entries). (2) HotTier state machine
+    (PINNED → IN_FLUSH → UNPINNED) drives unchanged. Because a
+    single bulk apply now spans many cadence boundaries, the M5
+    checkpoint hook fires *per crossed boundary* instead of once
+    per `apply_batch` (test caught it: 10K writes / cadence 1024
+    expected ≥9 checkpoints; with naïve per-batch trigger it was
+    8).
+  - Direct `ColdTier::bulk_upsert` correctness + update test
+    added in `cold_tier_test.cpp` (`run_bulk_upsert`): 200K
+    random fps in 256-batch chunks, full-set lookup parity, then
+    same-key second pass with new offsets, all 200K observe the
+    update. PASS.
+  - Throughput delta on `all_ops_bm` (1M, KeyType16 × ValueType200,
+    `_mean` of 3 repetitions; baseline column is the same
+    smoke run from the row above):
+    | op     | thread | Viper       | HiOM (post-bulk) | HiOM/Viper | HiOM (pre-bulk) |
+    |--------|--------|-------------|------------------|------------|------------------|
+    | insert | 1      | 485 K/s     | 191 K/s          | 0.39×      | 200 K/s (0.38×) |
+    | insert | 8      | 2.94 M/s/thr | 142 K/s/thr     | 0.05×      | ~1 M/s aggregate (~30× slower) |
+    | get    | 1      | 1.29 M/s    | 1.29 M/s         | 1.00×      | 1.08× |
+    | get    | 8      | 10.05 M/s/thr | 9.86 M/s/thr   | 0.98×      | — |
+    | update | 1      | 2.01 M/s    | 485 K/s          | 0.24×      | 0.22× |
+    | update | 8      | 10.42 M/s/thr | 500 K/s/thr   | 0.048×     | — |
+    | delete | 1      | 766 K/s     | 496 K/s          | 0.65×      | 0.65× |
+    | delete | 8      | 5.27 M/s/thr | 3.64 M/s/thr   | 0.69×      | — |
+    Single-thread numbers are essentially flat — bulk_upsert only
+    pays off when the flusher catches a large batch, and a
+    single-threaded inserter pushes one entry at a time so each
+    apply round still does a ~1-entry batch. At thread=8
+    aggregate, HiOM insert went from ~1 M/s → ~1.13 M/s (small
+    but in the right direction); aggregate update from ~1 M/s →
+    ~4 M/s — the better win lands on update because every update
+    forces a (Put, Remove) sequence of commit-buffer entries that
+    coalesce into the same fp64 run, giving the bulk path more to
+    chew on. The remaining ~21× insert gap at thread=8 is no
+    longer in the cold-tier write path; it points at the
+    `commit_seq_` global atomic and moodycamel mpmc enqueue
+    contention (M3 follow-up #2).
+- **Implementation share**: ~88% (8.0 weeks / 9 weeks of impl), up
+  from ~87% before bulk_upsert landed. Remaining: per-thread
+  commit-buffer lanes (M3 follow-up #2, multi-thread write-path
+  contention), 100M `--full` measurement, M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -919,9 +992,10 @@ deferred to M4 with the full state machine.
       `ProducerToken` (lazy-allocated on first write) — gives near-SPSC
       enqueue performance per producer, MPMC drain semantics for the
       flusher. See `include/viper/hiom/commit_buffer.hpp`.*
-- [x] Background flusher: drain to cold tier in batched writes
-      (sort by 64-bit fp; per-entry `cold_->upsert` for now,
-      cache-line-coalesced bulk writes a future optimization).
+- [x] Background flusher: drain to cold tier in batched writes.
+      Sorted by `(fp64, seq)` and applied via `apply_batch` (M4
+      Phase C). Cache-line-coalesced bulk path (M3 follow-up #1)
+      landed 2026-05-05: see the bulk_upsert bullet in Status.
       Single flusher thread per HiOM instance.
 - [x] HotTier PINNED to keep buffered writes alive. *Phase B.*
       16-bit `pinned` field per BucketMeta in existing pad bytes;
@@ -947,23 +1021,23 @@ ColdTier holds the full set. M0 sub-tests still pass; `cold_tier_test`
 unchanged.
 
 **M3 follow-ups (next, prioritised by bench-fixture findings):**
-1. **Cache-line-aligned bulk writes to ColdTier** (high priority).
-   The 2026-05-05 bench-fixture wire-up showed HiOMFixture's insert
-   throughput is 2.6× slower than ViperFixture single-thread and
-   ~30× slower at thread=8. Single-thread overhead points at the
-   commit-buffer push + flusher path; multi-thread suggests
-   contention or PM-bandwidth saturation. The flusher's
-   `apply_batch` currently does one `cold_->upsert(fp64, off)`
-   per entry, each with its own `pmem_persist` (clwb + sfence).
-   Sorted-and-coalesced batches per ColdTier bucket / cache line
-   would amortize the fence and unblock the multi-thread write
-   path. Aligns with the design constraint #5
-   ("Cold tier writes are batched. Single-key flush is a bug").
-2. **Per-thread commit-buffer lanes** (medium priority). Even with
-   moodycamel ProducerTokens the global `commit_seq_` atomic and
-   the shared mpsc enqueue can contend at high writer count. A
-   lane-per-thread design with a global merge step at apply time
-   would localise the hot path.
+1. **Cache-line-aligned bulk writes to ColdTier** — ✅ done
+   (2026-05-05). Implemented as `pmem_persist` split +
+   `ColdTier::bulk_upsert` with one drain per bucket-group, plus
+   `HiOM::apply_batch` two-stage refactor that collects all kPut
+   winners and dispatches a single `bulk_upsert` call. Multi-
+   boundary checkpoint loop landed alongside (one
+   `try_write_checkpoint` per crossed cadence boundary in a single
+   apply round). Direct test added in `cold_tier_test.cpp::run_bulk_upsert`.
+   Throughput delta is small on `all_ops_bm` because the flusher
+   batches stay tiny under low producer fan-in; the win is held
+   in reserve for higher-thread workloads where bulk batches grow.
+   See the bench-fixture parity bullet in Status for the table.
+2. **Per-thread commit-buffer lanes** (now top priority — bulk_upsert
+   alone didn't close the multi-thread insert gap, so the
+   `commit_seq_` global atomic + moodycamel mpmc enqueue
+   contention is the dominant bottleneck at thread=8). Lane-per-
+   thread design with a global merge step at apply time.
 3. **Inline-flush + `pin_failures` back-pressure landed in M4
    Phase B** — done.
 4. **Multi-thread shared-key stress** — M2 deferred; M4 Phase E's

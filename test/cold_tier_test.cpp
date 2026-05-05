@@ -327,6 +327,74 @@ int run_m2_exit() {
     return 0;
 }
 
+int run_bulk_upsert() {
+    std::cout << "=== ColdTier bulk_upsert (M3 follow-up: amortised fence) ===" << std::endl;
+    cleanup();
+    auto ct = ColdTier::create(kPoolFile, kLargeMain, kLargeOverflow);
+    constexpr std::size_t kN = 200'000;
+    std::mt19937_64 rng(0xb01c11);
+    std::vector<std::uint64_t> fps;
+    fps.reserve(kN);
+    for (std::size_t i = 0; i < kN; ++i) fps.push_back(make_fp(rng()));
+
+    // Drive bulk_upsert in groups of 256 — same order of magnitude as
+    // a typical commit-buffer drain batch.
+    constexpr std::size_t kBatch = 256;
+    auto t0 = std::chrono::steady_clock::now();
+    std::size_t written = 0;
+    std::vector<ColdTier::BulkEntry> buf;
+    buf.reserve(kBatch);
+    for (std::size_t i = 0; i < kN; i += kBatch) {
+        const std::size_t end = std::min(i + kBatch, kN);
+        buf.clear();
+        for (std::size_t k = i; k < end; ++k) {
+            buf.push_back({fps[k], make_offset(k)});
+        }
+        written += ct->bulk_upsert(buf);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double mops = (double)written / (ms / 1000.0) / 1e6;
+    std::cout << "  bulk_upsert: " << kN << " in " << ms << " ms ("
+              << mops << " M ops/s, written=" << written << ")" << std::endl;
+
+    // Lookups: every entry must be findable with the same offset.
+    std::size_t hits = 0, misses = 0, mismatches = 0;
+    for (std::size_t i = 0; i < kN; ++i) {
+        auto v = ct->lookup(fps[i]);
+        if (!v) ++misses;
+        else if (v->offset != make_offset(i).offset) ++mismatches;
+        else ++hits;
+    }
+    if (hits != written || misses + hits != kN || mismatches != 0) {
+        std::cerr << "  FAIL: hits=" << hits << " misses=" << misses
+                  << " mismatches=" << mismatches << std::endl;
+        return 1;
+    }
+
+    // Same-key updates — second pass with new offsets must overwrite.
+    for (std::size_t i = 0; i < kN; i += kBatch) {
+        const std::size_t end = std::min(i + kBatch, kN);
+        buf.clear();
+        for (std::size_t k = i; k < end; ++k) {
+            buf.push_back({fps[k], make_offset(k + kN)});
+        }
+        ct->bulk_upsert(buf);
+    }
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < kN; ++i) {
+        auto v = ct->lookup(fps[i]);
+        if (!v || v->offset != make_offset(i + kN).offset) ++bad;
+    }
+    if (bad) {
+        std::cerr << "  FAIL: " << bad
+                  << " keys did not see updated offset" << std::endl;
+        return 1;
+    }
+    std::cout << "  PASS (bulk_upsert correctness + update)" << std::endl;
+    return 0;
+}
+
 int run_microbench() {
     std::cout << "=== ColdTier single-threaded microbench ===" << std::endl;
     cleanup();
@@ -384,6 +452,7 @@ int main() {
     rc |= run_concurrent_stress();
     rc |= run_parallel_load();
     rc |= run_m2_exit();
+    rc |= run_bulk_upsert();
     rc |= run_microbench();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;

@@ -810,6 +810,25 @@ class HiOM {
     void apply_batch(std::vector<CommitEntry>& batch) {
         if (batch.empty()) return;
 
+        // Two-stage apply (M3 follow-up: cache-line-aligned bulk
+        // writes to ColdTier).
+        //
+        // Stage 1: walk the (fp64,seq)-sorted batch run-by-run,
+        //   pick a winner per run, classify it as kPut or kRemove,
+        //   and either accumulate kPut winners into `puts` (later
+        //   dispatched via cold_->bulk_upsert) or apply kRemove
+        //   immediately (rare; kRemove targets an existing fp,
+        //   so the bucket walk is per-key by nature).
+        //
+        // Stage 2: drive the HotTier state machine
+        //   (PINNED → IN_FLUSH → UNPINNED) for every entry. This
+        //   step happens AFTER the cold-tier writes are durable,
+        //   preserving M4 Phase B's invariant that the slot stays
+        //   pinned across the whole run until ColdTier owns the
+        //   record.
+        std::vector<typename ColdTier::BulkEntry> puts;
+        puts.reserve(batch.size());
+
         std::size_t i = 0;
         while (i < batch.size()) {
             std::size_t j = i + 1;
@@ -847,58 +866,73 @@ class HiOM {
                 break;
             }
 
-            // Cold-tier write FIRST so the slot stays pinned across
-            // the whole run until the durable cold record is in
-            // place (M4 Phase B contract). One write per fp instead
-            // of one per entry. winner==nullptr means the run was
-            // entirely stale kPuts; leave ColdTier untouched.
             if (winner != nullptr) {
                 if (winner->op == CommitEntry::Op::kPut) {
-                    cold_->upsert(winner->fp64, winner->off);
+                    puts.push_back({winner->fp64, winner->off});
                 } else {
+                    // kRemove: dispatch immediately. Single-key path
+                    // is fine — removes are rare relative to puts and
+                    // each one targets an existing chain entry, not
+                    // a clean slot, so a "bulk_remove" wouldn't
+                    // amortise much (no shared-bucket-header flip).
                     cold_->remove(winner->fp64);
                 }
             }
-
-            // Now drive the state machine for every entry's slot
-            // ref. CAS failures are benign:
-            //  - earlier-seq entries' slot refs may point at slots
-            //    whose state was already advanced by the latest
-            //    upsert_pinned for the same fp (last writer wins on
-            //    the underlying slot);
-            //  - or the slot may already have transitioned through
-            //    IN_FLUSH→UNPINNED by a prior apply pass.
-            for (std::size_t k = i; k < j; ++k) {
-                const bool we_own = hot_.cas_slot_state(
-                    batch[k].hot_slot,
-                    HotTier::SlotState::kPinned,
-                    HotTier::SlotState::kInFlush);
-                if (we_own) {
-                    hot_.cas_slot_state(
-                        batch[k].hot_slot,
-                        HotTier::SlotState::kInFlush,
-                        HotTier::SlotState::kUnpinned);
-                }
-            }
-
             i = j;
         }
 
+        // Stage 1 dispatch: amortise the PM fence across all kPut
+        // winners by sorting them once into bucket-runs and
+        // emitting two drains per run (instead of two per entry).
+        if (!puts.empty()) {
+            cold_->bulk_upsert(puts);
+        }
 
-        // M5 checkpoint hook: bump cumulative flushed count and, if the
-        // batch crossed a cadence boundary, try to persist a fresh
-        // checkpoint. fetch_add gives us atomic before/after; the
-        // boundary test fires at most once per batch even if the batch
-        // spans multiple boundaries (i.e. one checkpoint per drain,
-        // which is fine — each one snapshots the latest counters).
+        // Stage 2: HotTier state-machine drives. The CAS dance is
+        // unchanged from M4 Phase C — we walk every entry's slot
+        // ref. CAS failures are benign:
+        //  - earlier-seq entries' slot refs may point at slots
+        //    whose state was already advanced by the latest
+        //    upsert_pinned for the same fp (last writer wins on
+        //    the underlying slot);
+        //  - or the slot may already have transitioned through
+        //    IN_FLUSH→UNPINNED by a prior apply pass.
+        for (std::size_t k = 0; k < batch.size(); ++k) {
+            const bool we_own = hot_.cas_slot_state(
+                batch[k].hot_slot,
+                HotTier::SlotState::kPinned,
+                HotTier::SlotState::kInFlush);
+            if (we_own) {
+                hot_.cas_slot_state(
+                    batch[k].hot_slot,
+                    HotTier::SlotState::kInFlush,
+                    HotTier::SlotState::kUnpinned);
+            }
+        }
+
+
+        // M5 checkpoint hook: bump cumulative flushed count and, for
+        // each cadence boundary the batch crossed, try to persist a
+        // fresh checkpoint. Pre–M3-bulk-upsert, batches were small
+        // enough that one boundary per batch was the common case and
+        // a single try_write_checkpoint() per apply_batch was
+        // sufficient. After bulk_upsert lands, the flusher coalesces
+        // many entries per batch and one apply_batch can span 2+
+        // cadence_entries boundaries — emit a checkpoint per crossed
+        // boundary to keep the user-visible cadence honest. (Each
+        // try_write_checkpoint is try_lock–guarded and idempotent on
+        // failure, so a small loop is safe.)
         if (checkpoint_ != nullptr && !batch.empty()) {
             const auto before = flushed_count_.fetch_add(
                 batch.size(), std::memory_order_acq_rel);
             const auto after = before + batch.size();
             const std::uint64_t cadence = ccfg_.cadence_entries;
-            if (cadence > 0
-                && (before / cadence) != (after / cadence)) {
-                try_write_checkpoint();
+            if (cadence > 0) {
+                const auto boundaries_before = before / cadence;
+                const auto boundaries_after = after / cadence;
+                for (auto b = boundaries_before; b < boundaries_after; ++b) {
+                    try_write_checkpoint();
+                }
             }
         } else if (checkpoint_ == nullptr && !batch.empty()) {
             // Even without a checkpoint attached, keep the cumulative

@@ -118,6 +118,28 @@ inline void pmem_persist(const void* addr, const size_t len) {
     _mm_sfence();
 }
 
+// Two-step persist primitives. `pmem_flush_range` issues `_mm_clwb` on
+// every cache line in [addr, addr+len) without an sfence; `pmem_drain`
+// issues a single `_mm_sfence`. Together they are equivalent to one
+// `pmem_persist`, but the split lets a caller batch many flush_range
+// calls (e.g. several scattered records in one bucket) and amortise
+// the sfence over them — the actual cost driver of small PM updates.
+//
+// HiOM's ColdTier uses this for `bulk_upsert` (M3 follow-up): a sorted
+// run of entries hitting the same bucket gets per-record clwbs but
+// only ONE sfence, instead of a sfence per entry.
+inline void pmem_flush_range(const void* addr, const size_t len) {
+    char* addr_ptr = (char*) addr;
+    char* end_ptr = addr_ptr + len;
+    for (; addr_ptr < end_ptr; addr_ptr += CACHE_LINE_SIZE) {
+        _mm_clwb(addr_ptr);
+    }
+}
+
+inline void pmem_drain() {
+    _mm_sfence();
+}
+
 inline void pmem_memcpy_persist(void* dest, const void* src, const size_t len) {
     memcpy(dest, src, len);
     pmem_persist(dest, len);

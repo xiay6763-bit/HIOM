@@ -330,6 +330,75 @@ class ColdTier {
         }
     }
 
+    // -- M3 follow-up: bulk_upsert with amortised PM fence cost --------
+    //
+    // Same semantics as repeated calls to `upsert`, but groups entries
+    // hitting the same bucket and emits ONE sfence per bucket-group
+    // (instead of two per entry). Contract: caller must hold an
+    // external mutex (e.g., HiOM::apply_mu_) so no concurrent writer
+    // hits the same chain. Concurrent readers and concurrent legacy
+    // `upsert` from threads that are NOT writers (e.g., the M6 tail-
+    // scan workers, which are gated by HiOM constructor sequencing) are
+    // safe.
+    //
+    // Internally:
+    //   1. Sort `entries` by (region, bucket).
+    //   2. For each contiguous (region, bucket) group:
+    //      a. Walk the chain once, classifying each entry as
+    //         match-update (existing fp) or new-insert (claim empty
+    //         slot or extend chain).
+    //      b. Stage all writes in DRAM (atomic stores to PM-backed
+    //         memory take effect immediately, but only become durable
+    //         after clwb+sfence; we omit per-entry sfences).
+    //      c. clwb every dirtied cache line.
+    //      d. ONE sfence to commit the entry-data half.
+    //      e. OR all new occupancy bits into the header.
+    //      f. clwb the header lines + ONE sfence to commit the
+    //         occupancy half.
+    //   3. The two-fence-per-bucket pattern preserves the
+    //      crash-consistency invariant: header bit visible only after
+    //      entry data is durable. (Same invariant as `upsert`.)
+    //
+    // Returns the number of entries written (== entries.size() unless
+    // an overflow pool ran out; partial failures abort the rest of the
+    // group).
+    struct BulkEntry {
+        std::uint64_t fp;
+        Offset off;
+    };
+
+    std::size_t bulk_upsert(std::vector<BulkEntry>& entries) {
+        if (entries.empty()) return 0;
+        // Sort by (region, bucket) so same-bucket entries cluster.
+        // Stable not required; no equal-key duplicates are passed in
+        // (HiOM::apply_batch coalesces by fp64 before calling).
+        std::sort(entries.begin(), entries.end(),
+                  [this](const BulkEntry& a, const BulkEntry& b) {
+                      const auto ra = region_id_of(a.fp);
+                      const auto rb = region_id_of(b.fp);
+                      if (ra != rb) return ra < rb;
+                      return bucket_id_of(a.fp) < bucket_id_of(b.fp);
+                  });
+
+        std::size_t total_written = 0;
+        std::size_t i = 0;
+        while (i < entries.size()) {
+            const std::size_t rid = region_id_of(entries[i].fp);
+            const std::size_t bid = bucket_id_of(entries[i].fp);
+            // Find the run of entries hitting this (rid, bid).
+            std::size_t j = i + 1;
+            while (j < entries.size()
+                   && region_id_of(entries[j].fp) == rid
+                   && bucket_id_of(entries[j].fp) == bid) {
+                ++j;
+            }
+            total_written += apply_bucket_group(rid, bid, &entries[i], j - i);
+            i = j;
+        }
+        return total_written;
+    }
+    // ------------------------------------------------------------------
+
     std::optional<Offset> lookup(std::uint64_t fingerprint) const {
         assert(fingerprint != kEmptyFp);
         const std::size_t rid = region_id_of(fingerprint);
@@ -522,6 +591,206 @@ class ColdTier {
             return true;
         }
         return false;
+    }
+
+    // Apply a contiguous run of `n` BulkEntry that all hash to
+    // (rid, bid). Caller (bulk_upsert) holds a logical writer lock —
+    // for our usage (HiOM::apply_batch under apply_mu_) no concurrent
+    // bulk_upsert / upsert from another writer hits the same chain.
+    // Returns the number of entries successfully written; partial
+    // failure on overflow-pool exhaustion stops the rest of the group.
+    //
+    // Two-phase persistence per bucket touched, mirroring upsert's
+    // crash-consistency contract (entry data durable BEFORE occupancy
+    // bit becomes visible):
+    //
+    //   Phase 1: stage all entry stores (fp + offset) to dirty cache
+    //            lines, accumulate `pending_bits` per Bucket*. Flush
+    //            every dirtied entry line with pmem_flush_range, then
+    //            ONE pmem_drain commits the whole entry-data half.
+    //   Phase 2: header.fetch_or(pending_bits) for each dirtied
+    //            bucket, flush the header line, then ONE pmem_drain
+    //            commits the occupancy half.
+    //
+    // Per-fp updates (existing fingerprint match) take a faster
+    // single-phase path — just one entry-line flush + the shared
+    // drain. They never need a header bit flip (occupancy is already 1).
+    std::size_t apply_bucket_group(std::size_t rid, std::size_t bid,
+                                   const BulkEntry* entries, std::size_t n) {
+        if (n == 0) return 0;
+        Bucket& head = main_buckets_of(rid)[bid];
+
+        // We collect "dirty buckets" in the order we touch them so we
+        // can flush them once at the end. A small inline-vector would
+        // be ideal; for typical group sizes (1..few) the std::vector
+        // allocation is amortised by the bulk_upsert savings.
+        struct DirtyBucket {
+            Bucket* b;
+            std::uint64_t add_bits;  // bits to OR into header.occupancy
+        };
+        std::vector<DirtyBucket> dirty;
+        dirty.reserve(4);
+
+        auto find_or_create_dirty = [&](Bucket* b) -> DirtyBucket& {
+            for (auto& d : dirty) if (d.b == b) return d;
+            dirty.push_back({b, 0ull});
+            return dirty.back();
+        };
+
+        std::size_t written = 0;
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::uint64_t fp = entries[k].fp;
+            const Offset off = entries[k].off;
+            assert(fp != kEmptyFp);
+            assert(off.offset != kTombstoneOffset);
+
+            // Walk the chain: look for fp match, remember first empty
+            // slot we see along the way.
+            Bucket* cur = &head;
+            Bucket* tail = &head;
+            Bucket* found_empty_b = nullptr;
+            std::size_t found_empty_i = 0;
+            bool matched = false;
+            while (cur != nullptr) {
+                for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
+                    const std::uint64_t cfp
+                        = cur->entries[i].fingerprint.load(
+                              std::memory_order_acquire);
+                    if (cfp == fp) {
+                        // Update path: just rewrite the offset slot.
+                        cur->entries[i].offset.store(
+                            off.offset, std::memory_order_release);
+                        viper::internal::pmem_flush_range(
+                            &cur->entries[i].offset,
+                            sizeof(std::uint64_t));
+                        // Track the dirty bucket so the final drain
+                        // covers this line; no header bit needed.
+                        find_or_create_dirty(cur);
+                        matched = true;
+                        ++written;
+                        break;
+                    }
+                    if (cfp == kEmptyFp && found_empty_b == nullptr) {
+                        found_empty_b = cur;
+                        found_empty_i = i;
+                    }
+                }
+                if (matched) break;
+                tail = cur;
+                const std::uint64_t hdr
+                    = cur->header.load(std::memory_order_acquire);
+                const std::uint64_t next_idx = hdr >> 8;
+                if (next_idx == kNoOverflow) break;
+                cur = overflow_bucket_of(rid, next_idx);
+            }
+            if (matched) continue;
+
+            // Insert path. Try first remembered empty slot.
+            if (found_empty_b != nullptr) {
+                std::uint64_t expected = kEmptyFp;
+                if (found_empty_b->entries[found_empty_i].fingerprint
+                        .compare_exchange_strong(
+                            expected, fp,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                    found_empty_b->entries[found_empty_i].offset.store(
+                        off.offset, std::memory_order_release);
+                    viper::internal::pmem_flush_range(
+                        &found_empty_b->entries[found_empty_i],
+                        sizeof(Entry));
+                    auto& d = find_or_create_dirty(found_empty_b);
+                    d.add_bits |= (std::uint64_t{1} << found_empty_i);
+                    region_at(rid).num_entries.fetch_add(
+                        1, std::memory_order_relaxed);
+                    ++written;
+                    continue;
+                }
+                // Lost the slot (concurrent inserter). Fall through to
+                // overflow allocation — preserves "every entry lands"
+                // contract and matches single-key upsert's recursion.
+            }
+
+            // Need to extend the chain with a fresh overflow bucket.
+            const std::uint64_t alloc_idx
+                = region_at(rid).next_overflow_alloc.fetch_add(
+                      1, std::memory_order_acq_rel) + 1;
+            if (alloc_idx > overflow_slots_per_region_) {
+                region_at(rid).next_overflow_alloc.fetch_sub(
+                    1, std::memory_order_acq_rel);
+                // Pool exhausted — abort the rest of the group.
+                break;
+            }
+            Bucket* nb = overflow_bucket_of(rid, alloc_idx);
+            nb->entries[0].fingerprint.store(fp, std::memory_order_release);
+            nb->entries[0].offset.store(off.offset,
+                                        std::memory_order_release);
+            viper::internal::pmem_flush_range(&nb->entries[0],
+                                              sizeof(Entry));
+            // The new bucket is its own "dirty bucket"; its add_bits
+            // includes bit-0 (the entry we just placed). The chain
+            // attach to `tail` is recorded as a separate dirty
+            // touching tail->header.
+            auto& dnb = find_or_create_dirty(nb);
+            dnb.add_bits |= 0x1ull;
+            // Attach: tail->header gets has_overflow + next_idx. We
+            // can't do this with fetch_or because the next-idx bits
+            // need to land atomically with the has_overflow flag; do
+            // a CAS loop that's normally one-shot under apply_mu_.
+            const std::uint64_t attach_bits = (1ull << 7) | (alloc_idx << 8);
+            while (true) {
+                const std::uint64_t cur_hdr
+                    = tail->header.load(std::memory_order_acquire);
+                if ((cur_hdr >> 8) != kNoOverflow) {
+                    // Some other writer (legacy single-key upsert from a
+                    // recovery worker, say) already attached. Walk down
+                    // to the new tail and retry the attach there.
+                    tail = overflow_bucket_of(rid, cur_hdr >> 8);
+                    continue;
+                }
+                const std::uint64_t desired
+                    = (cur_hdr & 0x7full) | attach_bits;
+                std::uint64_t expected = cur_hdr;
+                if (tail->header.compare_exchange_strong(
+                        expected, desired,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    // Don't pmem_persist tail->header here — defer to
+                    // Phase 2's batched flush.
+                    auto& dt = find_or_create_dirty(tail);
+                    // No new occupancy bits on tail; the attach bits
+                    // are already applied via the CAS itself.
+                    (void)dt;
+                    break;
+                }
+                // Lost the CAS, retry.
+            }
+            region_at(rid).num_entries.fetch_add(
+                1, std::memory_order_relaxed);
+            ++written;
+        }
+
+        if (dirty.empty()) return written;
+
+        // Phase 1 drain: commit all entry-data flushes issued above.
+        viper::internal::pmem_drain();
+
+        // Phase 2: flip occupancy bits and persist headers. Headers
+        // live on a separate cache line from entries (Bucket layout:
+        // header at offset 0; entries start at 8). One flush_range
+        // covering the header word is enough; we batch the drain.
+        for (auto& d : dirty) {
+            if (d.add_bits != 0ull) {
+                d.b->header.fetch_or(d.add_bits,
+                                     std::memory_order_acq_rel);
+            }
+            // Flush the cache line holding `header` regardless — chain
+            // attach (CAS above) may have also modified it without
+            // any add_bits update.
+            viper::internal::pmem_flush_range(&d.b->header,
+                                              sizeof(d.b->header));
+        }
+        viper::internal::pmem_drain();
+        return written;
     }
 
     template <typename Visitor>
