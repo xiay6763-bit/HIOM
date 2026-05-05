@@ -6,6 +6,7 @@
 #include "benchmark.hpp"
 #include "fixtures/common_fixture.hpp"
 #include "fixtures/viper_fixture.hpp"
+#include "fixtures/hiom_fixture.hpp"
 #include "fixtures/utree_fixture.hpp"
 #include "fixtures/faster_fixture.hpp"
 #include "fixtures/dash_fixture.hpp"
@@ -182,6 +183,7 @@ void bm_delete(benchmark::State& state, BaseFixture& fixture) {
 
 //ALL_BMS(DashFixture);
 ALL_BMS(ViperFixture);
+ALL_BMS(HiOMFixture);
 //ALL_BMS(PmemHybridFasterFixture);
 //ALL_BMS(PmemKVFixture);
 //ALL_BMS(CrlFixture);

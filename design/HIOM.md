@@ -128,6 +128,14 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     `Viper::open(skip_recovery=true)` + ColdTier/Checkpoint/HiOM
     ctor with `tail_scan=true`. Default sweep N ∈ {1M, 10M};
     `--full` adds 100M.
+  - `benchmark/fixtures/hiom_fixture.hpp` (~280 lines, **new
+    2026-05-05**): Google Benchmark fixture wrapping HiOM<K,V>
+    for the same harness used by ViperFixture. Mirrors the
+    `BaseFixture` interface (InitMap / DeInitMap / setup_and_*
+    / run_ycsb); manages Viper + ColdTier + Checkpoint + HiOM
+    lifetimes under `/pmem0/hiom_bench/`. Wired into
+    `all_ops_benchmark.cpp` (ALL_BMS via KeyType16 × ValueType200)
+    and `ycsb_bm.cpp` (KeyType8 × ValueType200 specialisation).
   - `test/hiom_integration_test.cpp` (~1450 lines after M4 Phase E,
     **8 tests** with 4-phase recovery + 6-iteration crash stress):
     M6 added `run_recovery_persistence` Phases A/B/C; M6.5 full added
@@ -212,10 +220,39 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   cost-benefit doesn't favor adding it now. The infrastructure
   (`epoch-reclaimer` already in CMake fetch) is ready when it
   does. Closes M1's "deferred to M4" and M4 Phase D in one stroke.
-- **Implementation share**: ~85% (7.6 weeks / 9 weeks of impl), up
-  from ~80% before Phase D analysis + Phase E. Remaining: 100M
-  `--full` measurement (deferred follow-up, noise-free PM time slot
-  needed); M7 (full evaluation).
+- **Bench-fixture parity (2026-05-05)** — `HiOMFixture<KeyT,ValueT>`
+  added at `benchmark/fixtures/hiom_fixture.hpp`, mirroring the
+  ViperFixture interface (`InitMap` / `DeInitMap` / `setup_and_*` /
+  `run_ycsb`). Wired into `all_ops_benchmark.cpp` (full ALL_BMS
+  template instantiation for KeyType16 × ValueType200) and
+  `ycsb_bm.cpp` (KeyType8 × ValueType200 specialisation). All HiOM
+  PM artefacts live under `/pmem0/hiom_bench/{viper, cold.bin,
+  chkpt.bin}`; cleanup is prefix-guarded per CLAUDE.md (only this
+  prefix is touched). HotTier capacity defaults to 2^18 buckets =
+  4M slots = 36 MB DRAM (~2× the 1M+1M ALL_OPS workload size,
+  comfortable margin against SIEVE eviction churn). Initial 1M smoke
+  numbers (single-thread):
+  | op     | ViperFixture  | HiOMFixture   | ratio HiOM/Viper |
+  |--------|---------------|---------------|------------------|
+  | insert | 525 K/s       | 200 K/s       | 0.38× (HiOM 2.6× slower) |
+  | get    | 1.57 M/s      | 1.69 M/s      | 1.08× (HiOM 8% faster) |
+  | update | 2.53 M/s      | 0.57 M/s      | 0.22× (HiOM 4.4× slower) |
+  | delete | 0.93 M/s      | 0.60 M/s      | 0.65× (HiOM 1.5× slower) |
+  Reads parity confirmed (consistent with the integration-test
+  microbench's 1.04× ratio). Writes are slower than expected: at
+  thread=8 the gap **widens to ~30× on inserts** (Viper 29 M/s
+  aggregate vs HiOM 1 M/s aggregate), pointing to a real
+  multi-threaded contention bottleneck on the write path —
+  candidates: `commit_seq_` global atomic, moodycamel mpmc enqueue
+  contention, or the flusher's per-entry `cold_->upsert` PM fence
+  cost saturating PM bandwidth with 8 producers feeding it. This
+  was always the next-priority M3 follow-up ("cache-line-aligned
+  bulk writes to ColdTier"); the fixture made it visible. See
+  *M3 follow-ups* below for the planned attack surface.
+- **Implementation share**: ~87% (7.8 weeks / 9 weeks of impl), up
+  from ~85% before the bench-fixture wire-up. Remaining: write-path
+  perf optimization (M3 follow-up surfaced by bench-fixture); 100M
+  `--full` measurement; M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -909,13 +946,31 @@ empty (10K writes, 10K reads, 0 misses, hot_delta=10K). Post-flush
 ColdTier holds the full set. M0 sub-tests still pass; `cold_tier_test`
 unchanged.
 
-**M3 follow-ups (next):**
-1. Inline-flush + `pin_failures` back-pressure (lifts to M4 with the
-   PINNED → IN_FLUSH → UNPINNED state machine).
-2. Cache-line-aligned bulk writes to ColdTier (PM-bandwidth tuning,
-   independent of correctness).
-3. Multi-thread shared-key stress (M2 deferred; depends on M4 state
-   machine for clean semantics).
+**M3 follow-ups (next, prioritised by bench-fixture findings):**
+1. **Cache-line-aligned bulk writes to ColdTier** (high priority).
+   The 2026-05-05 bench-fixture wire-up showed HiOMFixture's insert
+   throughput is 2.6× slower than ViperFixture single-thread and
+   ~30× slower at thread=8. Single-thread overhead points at the
+   commit-buffer push + flusher path; multi-thread suggests
+   contention or PM-bandwidth saturation. The flusher's
+   `apply_batch` currently does one `cold_->upsert(fp64, off)`
+   per entry, each with its own `pmem_persist` (clwb + sfence).
+   Sorted-and-coalesced batches per ColdTier bucket / cache line
+   would amortize the fence and unblock the multi-thread write
+   path. Aligns with the design constraint #5
+   ("Cold tier writes are batched. Single-key flush is a bug").
+2. **Per-thread commit-buffer lanes** (medium priority). Even with
+   moodycamel ProducerTokens the global `commit_seq_` atomic and
+   the shared mpsc enqueue can contend at high writer count. A
+   lane-per-thread design with a global merge step at apply time
+   would localise the hot path.
+3. **Inline-flush + `pin_failures` back-pressure landed in M4
+   Phase B** — done.
+4. **Multi-thread shared-key stress** — M2 deferred; M4 Phase E's
+   `run_recovery_stress` partially covers this with disjoint
+   per-thread key ranges. A same-key-across-threads stress remains
+   useful for catching CCEH dup-entry races (out of scope for
+   HiOM; lives in `cceh.hpp`).
 
 ### M4 — Pin invariants + state machine (1 week) — ✅ complete (2026-05-05)
 

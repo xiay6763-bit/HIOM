@@ -8,6 +8,7 @@
 #include "benchmark.hpp"
 #include "fixtures/common_fixture.hpp"
 #include "fixtures/viper_fixture.hpp"
+#include "fixtures/hiom_fixture.hpp"
 #include "fixtures/faster_fixture.hpp"
 #include "fixtures/crl_fixture.hpp"
 #include "fixtures/dash_fixture.hpp"
@@ -138,6 +139,7 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
 }
 
 ALL_BMS(ViperFixture);
+ALL_BMS(HiOMFixture);
 //ALL_BMS(PmemKVFixture);
 //ALL_BMS(UTreeFixture);
 //ALL_BMS(CrlFixture);
