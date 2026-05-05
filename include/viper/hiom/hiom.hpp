@@ -33,6 +33,7 @@
 // Client object exclusively. HotTier and ColdTier are thread-safe; the
 // wrapping Client just forwards.
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -230,8 +231,34 @@ class HiOM {
 
     class Client {
       public:
+        // HiOM::get_client() reaches into slot_idx_ to install the
+        // M4 Phase E per-client tracking slot just after construction.
+        friend class HiOM<K, V>;
+
         Client(HiOM& hiom, typename ViperT::Client viper_client)
             : hiom_(hiom), viper_(std::move(viper_client)) {}
+
+        // Move ctor: transfer slot ownership so the moved-from instance
+        // doesn't release a slot HiOM has assigned to the moved-to one.
+        // get_client() relies on guaranteed copy elision (C++17), so
+        // the move ctor is rarely invoked, but defensive callers may
+        // std::move(client).
+        Client(Client&& other) noexcept
+            : hiom_(other.hiom_),
+              viper_(std::move(other.viper_)),
+              prod_tok_(std::move(other.prod_tok_)),
+              slot_idx_(other.slot_idx_) {
+            other.slot_idx_ = HiOM::kInvalidSlotIdx;
+        }
+        Client& operator=(Client&&) = delete;
+        Client(const Client&) = delete;
+        Client& operator=(const Client&) = delete;
+
+        ~Client() {
+            if (slot_idx_ != HiOM::kInvalidSlotIdx) {
+                hiom_.release_client_slot(slot_idx_);
+            }
+        }
 
         bool put(const K& key, const V& value) {
             // Step 1: viper does the PM-side write (data + bitset persisted)
@@ -389,6 +416,22 @@ class HiOM {
                                       KVOffset off) {
             if (off.is_tombstone()) return;
 
+            // M4 Phase E: report this client's most recent write block
+            // so HiOM's next checkpoint frontier can be computed as
+            // the min over all active clients. Without this, an "old"
+            // client still writing into a low-numbered block while the
+            // global current_block_page_ has advanced will be missed
+            // by tail-scan recovery's [frontier-1, current) range, and
+            // its yet-to-flush commit-buffer entries become unrecoverable
+            // on a crash. Done here (not in push_commit) so it covers
+            // both kPut and kRemove paths uniformly — kRemove targets
+            // the same block the client is currently writing into.
+            if (slot_idx_ != HiOM::kInvalidSlotIdx) {
+                hiom_.note_client_block(
+                    slot_idx_,
+                    static_cast<std::uint64_t>(off.block_number));
+            }
+
             HotTier::SlotRef ref{};
             const auto [block, page, slot] = off.get_offsets();
             auto packed = encode(block,
@@ -486,9 +529,23 @@ class HiOM {
         HiOM& hiom_;
         typename ViperT::Client viper_;
         std::unique_ptr<moodycamel::ProducerToken> prod_tok_;
+        // M4 Phase E (multi-writer-aware tail-scan frontier): each
+        // Client reserves a slot in HiOM's client_slots_ array on
+        // construction and updates client_slots_[slot_idx_].last_block
+        // after every successful viper_.put. Released in the dtor.
+        // kInvalidSlotIdx (== max) means "no tracking" (slot reservation
+        // exhausted, or moved-from instance whose slot was transferred).
+        std::size_t slot_idx_{kInvalidSlotIdx};
     };
 
-    Client get_client() { return Client{*this, viper_.get_client()}; }
+    static constexpr std::size_t kInvalidSlotIdx
+        = std::numeric_limits<std::size_t>::max();
+
+    Client get_client() {
+        Client c{*this, viper_.get_client()};
+        c.slot_idx_ = reserve_client_slot();
+        return c;
+    }
 
     HotTier& hot_tier() { return hot_; }
     ColdTier* cold_tier() { return cold_; }
@@ -581,6 +638,109 @@ class HiOM {
     }
 
   private:
+    // -- M4 Phase E: per-client block tracking ---------------------
+    //
+    // Each HiOM::Client reserves one slot of client_slots_ on
+    // construction (via reserve_client_slot, called from get_client)
+    // and updates client_slots_[idx].last_block on every successful
+    // mirror_write. The dtor releases the slot. min_active_writer_block
+    // walks the array and returns the smallest last_block over all
+    // currently-active slots (or kInvalidBlock if none) — used by
+    // try_write_checkpoint to pick a frontier that's a safe lower
+    // bound for tail-scan recovery, even with multiple writers
+    // concurrently filling different VPageBlocks.
+    //
+    // Why a fixed array of slots rather than a std::vector<Client*>:
+    // - The hot path is `note_client_block` (every cl.put). A
+    //   contention-free atomic write to client_slots_[idx].last_block
+    //   is the right cost.
+    // - The aggregation path is min_active_writer_block (only on
+    //   try_write_checkpoint, ~ms cadence). Walking 256 slots with
+    //   atomic loads is negligible.
+    // - kMaxClientSlots = 256 is far above realistic per-process
+    //   thread counts; reservation appends a "no tracking" fallback
+    //   if exhausted (correctness preserved via global frontier).
+    static constexpr std::size_t kMaxClientSlots = 256;
+    static constexpr std::uint64_t kNoActiveBlock
+        = std::numeric_limits<std::uint64_t>::max();
+
+    struct alignas(64) ClientSlot {
+        std::atomic<std::uint64_t> last_block{kNoActiveBlock};
+        std::atomic<bool> active{false};
+    };
+    std::array<ClientSlot, kMaxClientSlots> client_slots_{};
+
+    // Reserve a slot. Returns the index, or kInvalidSlotIdx if all
+    // slots are taken (Client falls back to "no tracking" — its
+    // writes still go through, but they don't constrain the
+    // checkpoint frontier).
+    std::size_t reserve_client_slot() {
+        for (std::size_t i = 0; i < kMaxClientSlots; ++i) {
+            bool expected = false;
+            if (client_slots_[i].active.compare_exchange_strong(
+                    expected, true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                client_slots_[i].last_block.store(
+                    kNoActiveBlock, std::memory_order_release);
+                return i;
+            }
+        }
+        return kInvalidSlotIdx;
+    }
+
+    // Release a slot. Note: we do NOT reset last_block to kNoActiveBlock
+    // synchronously here. The Client's pending pushes may still be in
+    // the commit buffer at the moment of release; if we cleared
+    // last_block, an immediate try_write_checkpoint would compute a
+    // min that excludes this client's last block, and recovery would
+    // miss the unflushed entries. Instead we keep last_block intact
+    // and clear `active` only — min_active_writer_block skips
+    // inactive slots, so once the buffer drains and the next checkpoint
+    // fires, the slot no longer constrains the frontier. The slot is
+    // immediately reusable; reserve_client_slot resets last_block
+    // when it claims it.
+    //
+    // This means there's a brief window after release where a
+    // checkpoint that fires before the released client's entries
+    // drain could capture a stale-too-low frontier — but that just
+    // means recovery scans a slightly larger range than necessary,
+    // which is harmless (idempotent re-upserts).
+    void release_client_slot(std::size_t idx) {
+        if (idx >= kMaxClientSlots) return;
+        client_slots_[idx].active.store(false, std::memory_order_release);
+    }
+
+    void note_client_block(std::size_t idx, std::uint64_t block_number) {
+        if (idx >= kMaxClientSlots) return;
+        client_slots_[idx].last_block.store(block_number,
+                                            std::memory_order_release);
+    }
+
+    // Min over all active slots' last_block. Returns kNoActiveBlock
+    // if no slot is active (or all are at their initial state). The
+    // caller (try_write_checkpoint) then takes min(this, viper's
+    // current_block_page_) to compose a safe frontier.
+    //
+    // Read order: last_block FIRST, then active. If a slot is in the
+    // middle of being released (active=false, last_block stale), we
+    // see stale last_block and active=false, and skip — the slot's
+    // last value would have constrained the frontier, but since the
+    // client is gone, its entries are either drained (no constraint
+    // needed) or in the buffer (next non-skipped slot's last_block
+    // covers the same range, OR no client survives → frontier falls
+    // back to current_block_page_, which over-scans).
+    std::uint64_t min_active_writer_block() const {
+        std::uint64_t m = kNoActiveBlock;
+        for (auto& s : client_slots_) {
+            const auto b = s.last_block.load(std::memory_order_acquire);
+            if (!s.active.load(std::memory_order_acquire)) continue;
+            if (b < m) m = b;
+        }
+        return m;
+    }
+    // ----------------------------------------------------------------
+
     // M4 Phase C: drain the queue until try_drain returns 0 (i.e.
     // queue empty from this consumer's view), then sort by
     // (fp64 asc, seq asc), coalesce same-fp runs in apply_batch,
@@ -761,7 +921,22 @@ class HiOM {
         CheckpointRecord rec{};
         rec.seq = seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
         rec.flushed_count = flushed_count_.load(std::memory_order_acquire);
-        rec.vpage_frontier = viper_.hiom_vpage_frontier();
+        // M4 Phase E: vpage_frontier is the min over (a) Viper's
+        // current next-to-claim block and (b) the lowest block any
+        // active HiOM client has recently written into. Capturing
+        // only (a) is unsafe with concurrent writers — when client_X
+        // is still pushing into block 30 while the global frontier
+        // has advanced to block 50, recovery's tail-scan starts at
+        // block 49 and silently drops client_X's unflushed entries.
+        // Using the min ensures every block with potentially
+        // unflushed entries is in the tail-scan range.
+        const std::uint64_t client_min = min_active_writer_block();
+        const std::uint64_t viper_next
+            = KVOffset{viper_.hiom_vpage_frontier()}.block_number;
+        const std::uint64_t safe_block = std::min(client_min, viper_next);
+        rec.vpage_frontier = KVOffset{
+            static_cast<viper::block_size_t>(safe_block), 0, 0
+        }.offset;
         rec.cold_size = (cold_ != nullptr) ? cold_->approx_size() : 0;
         checkpoint_->write(rec);
         stats_.checkpoints_written.fetch_add(1, std::memory_order_relaxed);

@@ -1450,6 +1450,241 @@ int run_multi_producer_correctness() {
     return 0;
 }
 
+// M4 Phase E: multi-thread + crash injection stress.
+//
+// Goal: prove recovery completeness under concurrent writers with a
+// random crash point.
+//
+// Workload: kNumThreads writers, each owning a disjoint key range
+//   thread t: keys [base_t, base_t + kPerThread), where
+//   base_t = t * (kPerThread + 1) + 1 (the +1 gap leaves room for
+//   key 0 to mean "unused").
+// Per-thread atomic completed_t bumps after each cl.put returns; this
+// is the worker's view of "puts that have definitely returned".
+//
+// Because Viper's pmem_persist runs INSIDE viper_.put, then HiOM's
+// mirror_write (HotTier upsert + commit-buffer push, possibly inline-
+// flush drain-to-empty on the bucket-full path) runs after, then
+// cl.put returns, then we bump completed_t — everything that the bump
+// counts has its VPage entry durable on PM. Tail-scan recovery reads
+// VPages, so every counted put MUST be recoverable. Lossy recovery
+// here is a real correctness regression in the persistence ordering.
+//
+// Crash protocol: the simulate_crash_for_test() hook resets
+// commit_buf_, which would NULL-deref any in-flight mirror_write. We
+// therefore use a cooperative crashed_flag that workers check before
+// each put — workers stop, join, *then* we sim the crash. The
+// resulting on-PM state is identical to a real SIGKILL: HotTier and
+// commit buffer (DRAM) are gone; ColdTier and Checkpoint (PM) are
+// whatever the flusher had time to durably write.
+//
+// Two flusher modes:
+//   FAST: default 5 ms interval; the flusher usually catches up by
+//         the time the writers stop, so cold@crash ≈ completed and
+//         tail-scan is mostly idempotent re-upserts.
+//   SLOW: 500 ms interval + unreachable watermark; the buffer
+//         accumulates aggressively, sim_crash drops it, and tail-scan
+//         must rebuild ColdTier from VPages alone. This is the path
+//         the paper's recovery-time claim relies on.
+int run_recovery_stress() {
+    std::cout << "=== HiOM multi-thread + crash injection stress (M4 Phase E) ==="
+              << std::endl;
+
+    constexpr std::size_t kHotBucketsRS = 1ULL << 12;  // 4K × 16 = 64K slots
+    constexpr int kNumThreads = 8;
+    constexpr int kPerThread = 20'000;        // ~600 ms total at ~250 Kops/s
+
+    enum class FlusherMode { kFast, kSlow };
+    struct IterCfg {
+        FlusherMode mode;
+        int crash_ms;
+    };
+    // Mix of fast/slow flusher and early/mid/late crash points.
+    // Fast flusher lets us validate the steady-state path (most
+    // entries already in cold; tail-scan is idempotent). Slow
+    // flusher forces tail-scan to do real work — buffer is dropped
+    // wholesale, ColdTier rebuilds from VPages.
+    constexpr int kIterations = 6;
+    const IterCfg iters[kIterations] = {
+        {FlusherMode::kFast, 25},
+        {FlusherMode::kFast, 80},
+        {FlusherMode::kFast, 250},
+        {FlusherMode::kSlow, 50},   // most entries buffered → tail-scan loaded
+        {FlusherMode::kSlow, 200},  // mid-stream slow-flusher crash
+        {FlusherMode::kSlow, 600},  // writers finish, dtor sees full buffer
+    };
+
+    std::mt19937 seed_rng(0xE5EEDull);
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+
+        std::vector<std::atomic<int>> completed_per_thread(kNumThreads);
+        for (auto& c : completed_per_thread) c.store(0);
+        std::atomic<bool> crashed{false};
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+
+        // Phase 1: write + crash.
+        std::vector<std::thread> writers;
+        const int crash_delay_ms
+            = iters[iter].crash_ms
+              + static_cast<int>(seed_rng() % 7);
+        const FlusherMode mode = iters[iter].mode;
+
+        {
+            auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+            auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+            auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+            HiOMT::FlusherConfig fcfg;
+            HiOMT::CheckpointConfig ccfg;
+            if (mode == FlusherMode::kSlow) {
+                // Buffer accumulates aggressively; flusher only wakes
+                // every 500 ms and the watermark is unreachable, so
+                // most entries are still in DRAM at crash time.
+                fcfg.interval = std::chrono::milliseconds(500);
+                fcfg.high_watermark = 1ULL << 30;
+                ccfg.cadence_entries = 1ULL << 30;  // no auto checkpoints
+            } else {
+                ccfg.cadence_entries = 1024;        // realistic checkpoint pace
+            }
+            HiOMT hiom(*viper_db, kHotBucketsRS, cold.get(),
+                       fcfg, chkpt.get(), ccfg);
+
+            writers.reserve(kNumThreads);
+            for (int t = 0; t < kNumThreads; ++t) {
+                writers.emplace_back([&, t]() {
+                    auto cl = hiom.get_client();
+                    const std::uint64_t base
+                        = static_cast<std::uint64_t>(t)
+                          * (kPerThread + 1) + 1;
+                    ready.fetch_add(1, std::memory_order_release);
+                    while (!go.load(std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                    for (int i = 0; i < kPerThread; ++i) {
+                        if (crashed.load(std::memory_order_acquire)) break;
+                        const std::uint64_t key = base + i;
+                        const std::uint64_t val
+                            = (static_cast<std::uint64_t>(t) << 32)
+                              | static_cast<std::uint64_t>(i);
+                        cl.put(key, val);
+                        // After cl.put returns, Viper has persisted
+                        // the VPage entry and HiOM's mirror_write has
+                        // completed. Bumping the count here means
+                        // "this put is durably recoverable via tail
+                        // scan". Recovery MUST find every key in
+                        // [base, base + completed).
+                        completed_per_thread[t].store(
+                            i + 1, std::memory_order_release);
+                    }
+                });
+            }
+            while (ready.load(std::memory_order_acquire) < kNumThreads) {
+                std::this_thread::yield();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            go.store(true, std::memory_order_release);
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(crash_delay_ms));
+            crashed.store(true, std::memory_order_release);
+            for (auto& w : writers) w.join();
+            writers.clear();
+            const auto t1 = std::chrono::steady_clock::now();
+            const double write_ms
+                = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            std::size_t total_completed = 0;
+            for (int t = 0; t < kNumThreads; ++t) {
+                total_completed += completed_per_thread[t].load();
+            }
+            std::cout << "  iter " << iter
+                      << " mode=" << (mode == FlusherMode::kSlow ? "slow" : "fast")
+                      << " crash@" << crash_delay_ms << "ms"
+                      << " (" << write_ms << " ms total)"
+                      << " completed=" << total_completed
+                      << " cold@crash=" << hiom.cold_tier()->approx_size()
+                      << std::endl;
+
+            // Now drop the buffer + stop the flusher → on-PM state is
+            // frozen at whatever Viper VPages + ColdTier + Checkpoint
+            // currently have. dtor's drain becomes a no-op.
+            hiom.simulate_crash_for_test();
+        }
+
+        // Phase 2: reopen with skip_recovery=true; tail-scan brings
+        // ColdTier back in sync with PM VPages.
+        viper::ViperConfig vcfg;
+        vcfg.skip_recovery = true;
+        auto viper_db = ViperT::open(kPoolDir, vcfg);
+        auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+        auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+        HiOMT::RecoveryConfig rcfg;
+        rcfg.tail_scan = true;
+        rcfg.recovery_threads = 8;
+        HiOMT hiom(*viper_db, kHotBucketsRS, cold.get(),
+                   HiOMT::FlusherConfig{}, chkpt.get(),
+                   HiOMT::CheckpointConfig{}, rcfg);
+        const auto replayed = hiom.stats().recovery_replayed.load();
+        const std::size_t cold_after = hiom.cold_tier()->approx_size();
+
+        // Phase 3: read back every key counted by completed_per_thread.
+        // Every one of these had its viper_.put return before the
+        // crash, hence has a durable VPage entry. Tail-scan must have
+        // re-installed them in ColdTier.
+        auto cl = hiom.get_client();
+        std::size_t expected = 0, recovered = 0, lost = 0;
+        std::size_t mismatch = 0;
+        std::size_t worst_thread_lost = 0;
+        for (int t = 0; t < kNumThreads; ++t) {
+            const int completed = completed_per_thread[t].load();
+            const std::uint64_t base
+                = static_cast<std::uint64_t>(t) * (kPerThread + 1) + 1;
+            std::size_t local_lost = 0;
+            for (int i = 0; i < completed; ++i) {
+                ++expected;
+                const std::uint64_t key = base + i;
+                const std::uint64_t want
+                    = (static_cast<std::uint64_t>(t) << 32)
+                      | static_cast<std::uint64_t>(i);
+                std::uint64_t got = 0;
+                if (!cl.get(key, &got)) {
+                    ++lost;
+                    ++local_lost;
+                } else if (got != want) {
+                    ++mismatch;
+                }
+                else {
+                    ++recovered;
+                }
+            }
+            worst_thread_lost = std::max(worst_thread_lost, local_lost);
+        }
+        std::cout << "    post-recovery: replayed=" << replayed
+                  << " cold=" << cold_after
+                  << " expected=" << expected
+                  << " recovered=" << recovered
+                  << " lost=" << lost
+                  << " mismatch=" << mismatch
+                  << " worst-thread-lost=" << worst_thread_lost
+                  << std::endl;
+        if (lost != 0 || mismatch != 0) {
+            std::cerr << "  FAIL iter " << iter
+                      << ": persistence ordering violation — every put "
+                      << "that returned before the crash should be "
+                      << "recoverable via tail-scan, but lost=" << lost
+                      << " mismatch=" << mismatch << std::endl;
+            return 1;
+        }
+    }
+
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1462,6 +1697,7 @@ int main() {
     rc |= run_checkpoint_persistence();
     rc |= run_recovery_persistence();
     rc |= run_multi_producer_correctness();
+    rc |= run_recovery_stress();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

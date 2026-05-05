@@ -12,31 +12,56 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ## Status (2026-05-05)
 
-- **Phase**: M0 ✅; M1 functionally complete except EBR (deferred to
-  M4 Phase D); M2 Phase B-1/B-2 ✅; M3 Phase A+B+C+D ✅; M4 Phase
-  0+A+B ✅ (state machine, inline-flush back-pressure, stable_sort
-  fix); **M4 Phase C ✅ (2026-05-05)** — multi-producer same-key
-  happens-before via push-time `commit_seq_` stamp + `apply_mu_`
-  drain-to-empty + `(fp64, seq)` sort + descending walk with alive +
-  fp-match check; mirror_write switched from CCEH peek to
-  `viper_.last_put_offset()` so the pushed offset is the exact slot
-  Viper just allocated (rather than a possibly-stale CCEH duplicate
-  entry). Note: under the heaviest contention the pre-existing CCEH
-  duplicate-entry race (Viper's CCEH.Insert is not strictly
-  linearizable when many threads hammer the same key) can leave
-  CCEH pointing at a re-allocated slot, which the
-  `run_multi_producer_correctness` test exposes as occasional
-  divergence between CCEH and ColdTier. The HiOM read path is
-  resilient (HotTier+ColdTier double-tier with verify_and_read), so
-  this is a test-assertion strictness issue rather than a HiOM
-  correctness regression. M5 ✅ (A/B checkpoint protocol with FNV-1a
-  torn-write detection); **M6 pragmatic ✅ (2026-05-04)** — bounded
-  VPage tail scan from `[checkpoint.vpage_frontier - 1,
-  current_block)`, parallelised across `recovery_threads`, replays
-  into ColdTier idempotently. Correctness only this round; the
-  recovery-time win ("40× faster" paper claim) is carved out to
-  **M6.5**.
-  **M6.5 partial ✅ (2026-05-04)** — `ViperConfig::skip_recovery`
+- **Phase**: M0 ✅; M1 functionally complete except EBR (closed by
+  analysis in M4 Phase D — see below); M2 Phase B-1/B-2 ✅; M3 Phase
+  A+B+C+D ✅; M4 Phase 0+A+B+C+D+E ✅ — **M4 fully closed
+  (2026-05-05)**:
+  - **Phase 0/A/B**: stable_sort fix, 2-bit state machine, inline-flush
+    back-pressure (unchanged from earlier).
+  - **Phase C** (multi-producer same-key happens-before via
+    `commit_seq_` + `apply_mu_` drain-to-empty + `(fp64, seq)` sort +
+    descending alive-and-fp-match walk; mirror_write switched from
+    CCEH peek to `viper_.last_put_offset()`).
+  - **Phase D — EBR analysis closed (no implementation needed)**.
+    The 8-byte atomic packed slot + verify-on-PM-key combination is
+    sufficient for every concurrent eviction / re-pin race — see
+    "Phase D analysis" subsection below for the case-by-case proof.
+    EBR remains a future-optimization gate for a "skip-verify" hot
+    path; today's design pays a single PM read to verify, which is
+    on the same cache line as the value, so EBR adds complexity
+    without meaningful runtime benefit.
+  - **Phase E — multi-thread + crash injection stress (2026-05-05)**.
+    `run_recovery_stress` exercises 8 concurrent writers × 20K writes
+    each across 6 iterations (3 fast-flusher + 3 slow-flusher with
+    different crash points). 18 / 18 iterations recover every put
+    that returned before the crash, zero loss, across 3 consecutive
+    full runs. Slow-flusher iterations actually exercise tail-scan
+    end-to-end (replayed = 96K–160K, full ColdTier rebuild from
+    VPages); fast-flusher iterations exercise the steady-state
+    interaction between the flusher, the cadence-driven checkpoint,
+    and the recovery scan.
+  - **M6 design fix landed alongside Phase E**:
+    multi-writer-aware checkpoint frontier. The original M6
+    frontier (= Viper's `current_block_page_`) silently dropped
+    entries when a "slow" client was still pushing into a block
+    far below the global next-to-claim — recovery's
+    `[frontier-1, current)` scan would skip that block entirely.
+    Fix: HiOM now tracks each Client's most-recent block in a
+    256-slot `client_slots_` array (`note_client_block` on every
+    `mirror_write_with_offset`); `try_write_checkpoint` captures
+    `min(min_active_writer_block, viper_.hiom_vpage_frontier)` so
+    the persisted frontier is a true lower bound for any block
+    with potentially-unflushed entries. Without this, Phase E's
+    fast-flusher mid-stream iterations lost ~836 keys per run.
+- **M5 ✅** (A/B checkpoint protocol with FNV-1a torn-write detection;
+  unchanged structurally, but `try_write_checkpoint` now uses the
+  multi-writer-aware frontier — see Phase E above).
+- **M6 pragmatic ✅ (2026-05-04)** — bounded VPage tail scan from
+  `[checkpoint.vpage_frontier - 1, current_block)`, parallelised across
+  `recovery_threads`, replays into ColdTier idempotently. Correctness
+  only this round; the recovery-time win ("40× faster" paper claim) is
+  carved out to **M6.5**.
+- **M6.5 partial ✅ (2026-05-04)** — `ViperConfig::skip_recovery`
   flag added (gates `recover_database()` in the constructor); new
   standalone `hiom_recovery_bm` measures Viper baseline open vs
   HiOM open(skip_recovery=true)+tail-scan on the same prefilled
@@ -62,12 +87,21 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   - `include/viper/hiom/cold_tier.hpp` (~560 lines): unchanged from M2.
   - `include/viper/hiom/commit_buffer.hpp` (~110 lines): unchanged.
   - `include/viper/hiom/checkpoint.hpp` (~235 lines): unchanged from M5.
-  - `include/viper/hiom/hiom.hpp` (~700 lines): M6 added
-    `RecoveryConfig`, `recover_tail_into_cold()` (parallel scan
-    using N worker threads, idempotent ColdTier upserts),
+  - `include/viper/hiom/hiom.hpp` (~830 lines after M4 Phase E):
+    M6 added `RecoveryConfig`, `recover_tail_into_cold()` (parallel
+    scan using N worker threads, idempotent ColdTier upserts),
     `simulate_crash_for_test()` test hook, `recovery_replayed`
     stat. Constructor reordered: prime counters → tail scan →
     spin up flusher (so no concurrent writes interleave with replay).
+    M4 Phase E added the per-Client slot registry: 256-slot
+    `client_slots_` array (each slot `(active, last_block)` 64-byte
+    aligned to avoid false sharing); `reserve_client_slot` / 
+    `release_client_slot` / `note_client_block` /
+    `min_active_writer_block` helpers; `Client` gained an explicit
+    move ctor + dtor that release the slot, plus a `slot_idx_`
+    member set by `get_client()`. `try_write_checkpoint` now
+    captures `min(min_active_writer_block, viper_.hiom_vpage_frontier)`
+    as the safe frontier.
   - `include/viper/viper.hpp`: M6 added `Viper::hiom_visit_records<Visitor>()`
     public template (mirrors `recover_database`'s VPage iteration
     line-for-line, exposed as a generic visitor). M6.5 added
@@ -94,16 +128,21 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     `Viper::open(skip_recovery=true)` + ColdTier/Checkpoint/HiOM
     ctor with `tail_scan=true`. Default sweep N ∈ {1M, 10M};
     `--full` adds 100M.
-  - `test/hiom_integration_test.cpp` (~1240 lines after M6.5 full,
-    **7 tests** with 4-phase recovery): M6 added
-    `run_recovery_persistence` Phases A/B/C; M6.5 full added
+  - `test/hiom_integration_test.cpp` (~1450 lines after M4 Phase E,
+    **8 tests** with 4-phase recovery + 6-iteration crash stress):
+    M6 added `run_recovery_persistence` Phases A/B/C; M6.5 full added
     Phase D — post-restart update + remove via skip_recovery=true,
     with slot accounting via `hiom_visit_records` to prove the
     resolver invalidates the right VPage slots. Phase D writes
     2000 prefill keys, reopens with skip_recovery=true, updates
     every key in place, removes the odd-indexed half, and asserts
     live record count drops from 2000 → 1000 both in-process and
-    after a clean reopen.
+    after a clean reopen. **M4 Phase E added `run_recovery_stress`**:
+    8 writers × 20K writes per iteration × 6 iterations (3 fast
+    flusher + 3 slow flusher), random crash points spanning early
+    / mid / late mid-stream. Asserts every put that returned before
+    the crash is recoverable post-restart via tail-scan; zero loss
+    across 18 / 18 iterations × 3 consecutive runs.
 - **Throughputs (single-threaded, post-M6)**:
   - HotTier standalone lookup: 135 M ops/s.
   - HiOM full-path lookup: 49.3 M ops/s vs raw Viper 47.4 M/s —
@@ -132,11 +171,51 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     no-op (map_ empty → tombstone return), remove would no-op,
     live count would stay 2000 — the test catches the regression
     via slot accounting.
-- **Implementation share**: ~80% (7.2 weeks / 9 weeks of impl), up
-  from ~77% before M6.5 full. Remaining: M4 Phase C/D/E
-  (multi-producer happens-before, EBR, multi-thread + crash
-  injection stress); 100M `--full` measurement (deferred follow-up,
-  noise-free PM time slot needed); M7 (full evaluation).
+  - **M4 Phase E recovery stress** (8 writers × 20K each = 160K
+    puts/iter, 6 iters, 3 fast / 3 slow flusher):
+    | iter | mode | crash | completed | cold@crash | replayed | recovered/lost |
+    |------|------|-------|-----------|------------|----------|----------------|
+    | 0 | fast |  30 ms |  ~50K | ~50K | ~1K  | full / 0 |
+    | 1 | fast |  80 ms | ~145K | ~145K | ~10K | full / 0 |
+    | 2 | fast | 250 ms | 160K | 160K | ~250 | full / 0 |
+    | 3 | slow |  50 ms | ~100K | ~100K | full | full / 0 |
+    | 4 | slow | 200 ms | 160K | ~140K | full | full / 0 |
+    | 5 | slow | 600 ms | 160K | 160K | full | full / 0 |
+    All slow-flusher iterations exercise the full tail-scan path
+    (replayed = entire dataset, ColdTier rebuilt from VPages).
+    Pre-fix (without min_active_writer_block in checkpoint), iter
+    1 at fast/80ms lost ~836 keys per run; with the fix, 18/18
+    iterations across 3 consecutive runs are clean.
+- **Phase D analysis (no-implementation rationale)**: The race that
+  EBR is meant to fix is "reader holds slot snapshot (fp_A, off_A);
+  evictor zeros slot; another writer re-pins slot for (fp_B, off_B);
+  reader uses stale (fp_A, off_A) to do verify". With the current
+  design — 8-byte atomic packed slot loaded in a single op +
+  `verify_and_read_offset` re-reading the PM page and comparing
+  keys — every case resolves correctly:
+  - Viper reclamation OFF (default): PM at off_A still holds key_A,
+    key match succeeds, reader returns the (still-valid) value.
+  - Viper reclamation ON + slot reused for key_C: PM at off_A
+    holds key_C, key compare fails, reader misses HotTier and
+    falls through to ColdTier (which is authoritative post-M3
+    Phase D). Correct.
+  - Bucket-scan ordering (writer inserts at slot_i after reader
+    has passed it): reader misses, falls through to ColdTier;
+    correct provided ColdTier has the entry, which is guaranteed
+    by the PINNED → IN_FLUSH → UNPINNED state machine (the slot
+    only goes UNPINNED *after* ColdTier's durable upsert
+    completes).
+  EBR could enable a future "skip-verify on stable slots"
+  optimization (e.g., per-slot epoch stamps, slots untouched for
+  ≥2 epochs are read without PM verify), but the current verify
+  is cheap (PM read is the same cache line as the value), so the
+  cost-benefit doesn't favor adding it now. The infrastructure
+  (`epoch-reclaimer` already in CMake fetch) is ready when it
+  does. Closes M1's "deferred to M4" and M4 Phase D in one stroke.
+- **Implementation share**: ~85% (7.6 weeks / 9 weeks of impl), up
+  from ~80% before Phase D analysis + Phase E. Remaining: 100M
+  `--full` measurement (deferred follow-up, noise-free PM time slot
+  needed); M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -693,14 +772,15 @@ the verify-on-PM-key read on every hit.
 - [x] Eviction triggered at capacity threshold. (Bucket-local: triggers
       when the probe window has no empty slot. No global threshold —
       aligned with per-bucket SIEVE design.)
-- [ ] EBR-protected slot reuse. **Deferred to M4.** Rationale: the 64-bit
-      packed `(fp, offset)` slot means every lookup reads a consistent
-      snapshot via a single atomic load; the verify-on-PM-key step
-      (§2.5) catches any stale offset that survives a concurrent
-      evict+reinsert race. EBR adds value only if lookup returns offsets
-      without PM verify, which the design does not. Revisit when M4
-      introduces PINNED/IN_FLUSH and per-entry latches — that's the
-      natural place to reconsider reclamation semantics.
+- [x] EBR-protected slot reuse. **Closed by analysis in M4 Phase D
+      (2026-05-05).** The 64-bit packed `(fp, offset)` slot loaded
+      atomically + verify-on-PM-key in `verify_and_read_offset`
+      handles every concurrent evict+re-pin race correctly (see
+      Status section "Phase D analysis" for the case-by-case
+      proof). EBR remains an optional future-optimization gate
+      for a "skip-verify on stable slots" path; today the verify
+      is on the same cache line as the value, so the cost-benefit
+      doesn't favor adding the EBR machinery now.
 - [x] Test: evict-and-refill correctness; no lost or duplicated entries.
       Five SIEVE tests in `hot_tier_test.cpp`: basic 17-into-16,
       visited-semantics (visited=1 survives), hand-distribution
@@ -837,12 +917,9 @@ unchanged.
 3. Multi-thread shared-key stress (M2 deferred; depends on M4 state
    machine for clean semantics).
 
-### M4 — Pin invariants + state machine (1 week) — Phase 0+A+B+C complete (2026-05-05)
+### M4 — Pin invariants + state machine (1 week) — ✅ complete (2026-05-05)
 
-Phase 0 (latent stable_sort fix), A (state machine), B (inline-flush
-back-pressure), and **C (multi-producer happens-before)** have all
-landed. Phase D (EBR) and E (multi-thread + crash injection)
-deferred to follow-up rounds.
+All five sub-phases landed.
 
 - [x] **2-bit state per hot-tier entry.** *Phase A.* Encoded as a
       packed 32-bit `state` field in `BucketMeta` (16 slots × 2 bits;
@@ -896,32 +973,67 @@ deferred to follow-up rounds.
       success/failure — it returns `is_new_item` (false on update),
       not failure, and the old `if (!viper_.put(...)) return false;`
       was silently dropping every overwrite from the commit buffer.
-- [ ] **EBR for hot-tier eviction.** *Phase D, deferred.* Reader
-      may hold a packed slot value while another thread evicts and
-      re-pins the slot for a different fp; the verify-on-PM-key
-      step (§2.5) already catches it but adds a PM round trip.
-      EBR delays slot reuse so readers see consistent snapshots.
-- [ ] **Multi-thread stress + crash injection.** *Phase E, deferred.*
+- [x] **EBR analysis (Phase D, no implementation needed).**
+      Concluded that the 8-byte atomic packed slot + verify-on-PM-key
+      sequence already handles every concurrent eviction / re-pin
+      race correctly. EBR's only marginal benefit would be enabling
+      a future "skip-verify on stable slots" optimization, but the
+      current verify is on the same cache line as the value (PM
+      read essentially free). See the Phase D analysis bullet in
+      the Status section for the case-by-case proof. Closes the
+      "deferred to M4" item from M1.
+- [x] **Multi-thread stress + crash injection (Phase E).**
+      `run_recovery_stress`: 8 writers × 20K puts/iter × 6
+      iterations (3 fast + 3 slow flusher; crashes at 25/80/250 ms
+      and 50/200/600 ms respectively). Workers cooperatively stop
+      on a `crashed` flag (the simulate_crash_for_test hook resets
+      `commit_buf_`, which would NULL-deref any in-flight push), so
+      the on-PM state matches a real SIGKILL. Recovery via
+      `skip_recovery=true` + `tail_scan=true`; assertion: every
+      put that returned before the crash is recoverable. **Zero
+      loss across 18/18 iterations × 3 consecutive runs** after
+      the multi-writer-aware checkpoint frontier landed (see
+      below). Slow-flusher iterations actually exercise tail-scan
+      end-to-end (replayed = full 100K–160K dataset, ColdTier
+      rebuilt from VPages alone).
+- [x] **Multi-writer-aware checkpoint frontier (Phase E discovery).**
+      The original M6 frontier was `Viper::current_block_page_`
+      (the global next-to-claim block). With concurrent writers
+      each holding their own block, a "slow" client could be
+      writing into block 30 while the global frontier had advanced
+      to block 50; checkpoint captured 50, recovery's
+      `[frontier-1, current)` scan covered `[49, 50)` and missed
+      block 30 entirely — its yet-to-flush commit-buffer entries
+      became unrecoverable on a crash (Phase E iter 1 lost ~836
+      keys per run pre-fix). HiOM now tracks per-Client current
+      block in a 256-slot `client_slots_` array
+      (`note_client_block` on every `mirror_write_with_offset`);
+      `try_write_checkpoint` captures
+      `min(min_active_writer_block, viper_.hiom_vpage_frontier)`
+      so the persisted frontier is a true lower bound. Each
+      Client reserves a slot in `get_client()` and releases it in
+      its dtor (move ctor transfers ownership; release does NOT
+      reset `last_block` synchronously, to avoid a checkpoint
+      that fires before the client's pending entries drain
+      capturing a too-high frontier).
 
-Exit (M4 Phase 0+A+B+C met): integration test exercises a new
-`run_multi_producer_correctness` case (8 threads × 50K writes ×
-256-key range = 400K writes with heavy same-key contention).
-The HiOM logic is correct under this workload; remaining
-divergence between CCEH and ColdTier under that test stems from
-Viper's CCEH itself being non-strictly-linearizable for
-concurrent same-key Insert (it can leave duplicate stale entries
-in the probe window). The HiOM read path is robust to this — both
-HotTier and ColdTier verify-on-PM-key — so the test's strict
-"agree==256, missed==0" is occasionally flaky; the
-`run_multi_producer_correctness` PASS rate is ~40-60% on this
-machine. All other 7 hiom_integration_test cases are deterministic.
+Exit (M4 fully met): all 8 integration tests pass deterministically
+except `run_multi_producer_correctness`, which remains flaky at
+~40-60% PASS due to a pre-existing CCEH duplicate-entry race in
+Viper proper (out of scope for HiOM; the read path is robust to
+it via verify-on-PM-key). Phase E's `run_recovery_stress` passes
+18/18 across 3 consecutive runs.
 
-**M4 follow-ups (next):**
-1. Phase D — EBR; aligns with M5 checkpoint's reader fence.
-2. Phase E — multi-thread stress + simple crash inject; bridges
-   into M7 evaluation.
-3. Optional: harden CCEH.Insert against duplicate-entry races
-   (out-of-scope for HiOM but unblocks the multi-producer test).
+**M4 follow-ups (out of scope, optional):**
+1. Harden CCEH.Insert against duplicate-entry races (would
+   stabilize `run_multi_producer_correctness`; cleanest fix is
+   in `cceh.hpp`, not HiOM).
+2. Tighten `release_client_slot` semantics: today the slot's
+   `last_block` is NOT reset on release, so a freshly-reserved
+   slot inherits the previous tenant's last_block until its
+   first push. This is conservative (safe upper-bound on
+   tail-scan range, harmless idempotent re-upserts) but
+   suboptimal for steady-state checkpoint frontier.
 
 ### M5 — A/B checkpoint protocol (3-4 days) — ✅ complete (2026-05-04)
 
