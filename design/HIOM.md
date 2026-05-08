@@ -10,7 +10,7 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
-## Status (2026-05-05)
+## Status (2026-05-08)
 
 - **Phase**: M0 ✅; M1 functionally complete except EBR (closed by
   analysis in M4 Phase D — see below); M2 Phase B-1/B-2 ✅; M3 Phase
@@ -322,10 +322,85 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     longer in the cold-tier write path; it points at the
     `commit_seq_` global atomic and moodycamel mpmc enqueue
     contention (M3 follow-up #2).
-- **Implementation share**: ~88% (8.0 weeks / 9 weeks of impl), up
-  from ~87% before bulk_upsert landed. Remaining: per-thread
-  commit-buffer lanes (M3 follow-up #2, multi-thread write-path
-  contention), 100M `--full` measurement, M7 (full evaluation).
+- **M3 follow-up #2 — investigation, NOT landed (2026-05-08)**.
+  Goal: cut the thread:8 insert gap by removing the `commit_seq_`
+  global atomic and the single-MPMC moodycamel queue contention.
+  Two attempts, both rolled back; surface unchanged.
+  - **Attempt A — N-lane sharded commit buffer**. Sharded the
+    single `moodycamel::ConcurrentQueue<CommitEntry>` into 16
+    cache-line-aligned per-lane queues; each Client maps to a
+    fixed lane via `slot_idx_ & lane_mask_` so producers don't
+    contend on a shared MPMC queue's implicit-producer lookup,
+    and the flusher takes a per-lane `ConsumerToken` and round-
+    robin-drains every lane under `apply_mu_`. Surface change
+    was small (≈210 added LOC across `commit_buffer.hpp`,
+    `hiom.hpp`, plus a `commit_lanes` knob on `FlusherConfig`).
+    *Result*: thread:1 insert dropped from 191–201 K/s to
+    103–104 K/s (~2× regression, three-run mean). Even with
+    `commit_lanes=1` (effectively master shape), throughput
+    landed at 145–154 K/s — i.e. some of the regression is
+    intrinsic to the wrapping (extra `std::vector<Lane>`
+    indirection, per-lane `size_approx()` per drain pass), and
+    some is the multi-lane drain itself. Not enough wall-clock
+    headroom to chase the rest down before commit; rolled back.
+  - **Attempt B — replace `seq` with `__rdtsc()`**. Stamped
+    each CommitEntry with the Invariant TSC at push time
+    instead of bumping the global `commit_seq_` atomic. Idea:
+    same-thread monotonicity is free, cross-thread monotonicity
+    comes from the shared hardware counter, and apply-time
+    `(fp64, tsc)` sort + descending alive-and-fp-match walk
+    still picks the latest writer. *Result*: 17 mismatched +
+    17 missed keys on the `multi-producer same-key
+    correctness` test (8 threads × 50K writes / 256 keys);
+    `_mm_lfence()` before `__rdtsc()` cut it to 2 mismatched +
+    2 missed but didn't close it. Root cause: `__rdtsc` is
+    not serializing — the TSC read can be reordered before
+    the preceding CCEH CAS, and even with `lfence` the
+    cross-core monotonicity bound is on the order of tens of
+    cycles, comparable to the CAS-to-fetch_add interval at
+    heavy contention. So a CCEH-CAS loser ends up with a
+    higher TSC than the CCEH-CAS winner, the descending walk
+    picks the wrong entry, and ColdTier diverges from CCEH.
+    *Note*: while reproducing the failure on master to confirm
+    the TSC change wasn't to blame, I found master is **also
+    flaky** on this test (15–21 mismatches per run). The race
+    is inherent to "bump seq AFTER CAS" — a CCEH winner can
+    be preempted between CAS retire and `fetch_add`, letting
+    a later-CAS-loser get a smaller seq. This is independent
+    of M3 follow-up #2 and is now its own follow-up: see
+    *Open: multi-producer apply_batch winner picker* below.
+  - **Where this leaves M3 follow-up #2**: the right next
+    attempt is probably either (a) skip the global counter
+    entirely and use **CCEH-truth at apply time** as the
+    winner-picker (read PM at the entry's `off` to get the
+    key, query CCEH, pick the entry whose `off` matches the
+    canonical one), which also incidentally fixes the
+    pre-existing flake, or (b) keep the global counter but
+    add a per-fp64 strict-monotone hint via the offset itself
+    (offsets are unique and CAS order ≅ slot-claim order
+    within a Viper Client, but cross-Client interleaving
+    breaks the strict ordering).
+- **Open: multi-producer apply_batch winner picker (preexisting,
+  surfaced 2026-05-08)**. The `multi-producer same-key
+  correctness` test (8 threads × 50K writes / 256 keys) is flaky
+  on master at 15–21 mismatch+miss out of 256 keys per run. The
+  race: HiOM bumps `commit_seq_` AFTER `viper_.put`'s CCEH CAS,
+  so a thread whose CAS won can be preempted before it reads
+  `seq`, and a later-CAS-loser ends up with a smaller seq. The
+  apply path's descending-seq alive-and-fp-match walk then picks
+  the loser (its slot is still alive under reclamation-off
+  defaults, and fp matches because the slots collide on the same
+  key). Fix candidates ranked: (1) at apply time, for each fp64
+  run, derive CCEH ground truth (read PM at `off`, extract key,
+  CCEH lookup, pick entry whose `off` matches); (2) carry the
+  key in CommitEntry (size grows by `sizeof(K)`; OK for K8 keys,
+  borderline for K16); (3) make seq + CAS atomic via `cmpxchg16b`
+  on a packed `(seq, offset)` slot (deep CCEH surgery).
+- **Implementation share**: unchanged at ~88% (8.0 weeks / 9
+  weeks of impl) — no code landed in this round. Remaining:
+  multi-producer winner picker fix, retry on M3 follow-up #2
+  (commit-buffer lanes) once the picker is in place, 100M
+  `--full` measurement, M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
