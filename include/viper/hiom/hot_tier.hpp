@@ -296,6 +296,32 @@ class HotTier {
         return std::nullopt;
     }
 
+    // Snapshot view of a slot at the address `ref` points at. Used by
+    // HiOM::apply_batch for the HotTier-truth winner-picker fast path
+    // (M3 follow-up #2 / 2026-05-09): the kPut entry whose packed off
+    // matches the slot's current packed off is the canonical writer
+    // for this fp32 (the slot was last set by HotTier::upsert_pinned's
+    // CAS, which is the linearization point for same-fp32 writes after
+    // CCEH retired from the write path in P0). fp == kEmptyFp means
+    // the slot was cleared (kRemove or post-eviction). The (fp, off)
+    // pair is a snapshot — by the time the caller acts on it another
+    // upsert may have CAS-overwritten the slot; that's fine for the
+    // picker, which falls back to the alive-and-fp-match walk when no
+    // batch entry matches the snapshot.
+    struct SlotView {
+        std::uint32_t fp;          // kEmptyFp ⇒ slot empty
+        std::uint32_t packed_off;  // valid only when fp != kEmptyFp
+    };
+    SlotView read_slot(SlotRef ref) const {
+        if (!ref.valid) return SlotView{kEmptyFp, 0};
+        assert(ref.bucket_idx < num_buckets_);
+        assert(ref.slot_idx < kSlotsPerBucket);
+        const std::uint64_t v = buckets_[ref.bucket_idx]
+            .slots[ref.slot_idx]
+            .packed.load(std::memory_order_acquire);
+        return SlotView{unpack_fp(v), unpack_off(v)};
+    }
+
     // Remove entry by fingerprint. Returns true if removed.
     bool remove(std::uint32_t fingerprint) {
         assert(fingerprint != kEmptyFp);

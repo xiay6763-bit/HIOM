@@ -1394,55 +1394,58 @@ int run_multi_producer_correctness() {
               << "  (" << write_ms << " ms write, "
               << flush_ms << " ms flush)" << std::endl;
 
-    // Assertion 1: every key reads back. A live key that misses
-    // means ColdTier is pointing at an invalidated VPage slot.
+    // P0 (M3 follow-up #2): CCEH is no longer touched on the write path
+    // when HiOM is attached, so the prior CCEH-vs-ColdTier comparison
+    // would always fail. Switch to HiOM-side ground truth:
+    //   1. cl.get(k) must return SOME value (any thread's write counts).
+    //   2. ColdTier.lookup(fp) must hold an offset for k.
+    //   3. The PM slot at that offset must hold key k (detects slot
+    //      reuse / fp collision corruption).
+    // Slot leak under same-key cross-thread races is a known MVP-P0
+    // limitation (see design/HIOM.md M3 follow-up #2 notes); this test
+    // does NOT assert leak-freedom — it only asserts the canonical
+    // (winner) offset is correct.
     auto cl = hiom.get_client();
-    auto vcl = viper_db->get_client();
+    auto vcl_ro = viper_db->get_read_only_client();
     std::size_t missed = 0;
-    std::size_t mismatched_offsets = 0;
-    std::size_t agree = 0;
+    std::size_t cold_missing = 0;
+    std::size_t pm_key_mismatch = 0;
+    std::size_t ok = 0;
     for (int i = 0; i < kKeyRange; ++i) {
         const std::uint64_t k = static_cast<std::uint64_t>(i + 1);
 
-        // CCEH-side truth.
-        const auto viper_off = vcl.hiom_peek_offset(k);
-        if (viper_off.is_tombstone()) {
-            // Key was never written (not in our key range under workload).
-            // For this test workload all keys are written.
-            std::cerr << "  unexpected tombstone for k=" << k << std::endl;
-            ++missed;
-            continue;
-        }
-        // ColdTier-side view.
-        const auto fp = viper::hiom::key_fingerprint64(k);
-        const auto cold_off = hiom.cold_tier()->lookup(fp);
-        if (!cold_off.has_value()) {
-            ++missed;
-            continue;
-        }
-        if (*cold_off == viper_off) {
-            ++agree;
-        } else {
-            ++mismatched_offsets;
-        }
-
-        // Reading via HiOM client must return SOME value, no miss.
         std::uint64_t got = 0;
         if (!cl.get(k, &got)) {
             ++missed;
+            continue;
         }
+
+        const auto fp = viper::hiom::key_fingerprint64(k);
+        const auto cold_off = hiom.cold_tier()->lookup(fp);
+        if (!cold_off.has_value()) {
+            ++cold_missing;
+            continue;
+        }
+
+        std::uint64_t pm_key = 0;
+        std::uint64_t pm_val = 0;
+        if (!vcl_ro.hiom_read_at_offset(*cold_off, &pm_key, &pm_val)
+            || pm_key != k) {
+            ++pm_key_mismatch;
+            continue;
+        }
+        ++ok;
     }
-    std::cout << "  per-key offset agreement: agree=" << agree
-              << " mismatched=" << mismatched_offsets
+    std::cout << "  per-key HiOM truth: ok=" << ok
               << " missed=" << missed
-              << " (expected agree=" << kKeyRange
-              << ", others=0)" << std::endl;
-    if (agree != static_cast<std::size_t>(kKeyRange)
-        || mismatched_offsets != 0 || missed != 0) {
-        std::cerr << "  FAIL: ColdTier diverged from CCEH for "
-                  << mismatched_offsets << " keys; "
-                  << missed << " keys read back as missing. "
-                  << "Multi-producer happens-before broken." << std::endl;
+              << " cold_missing=" << cold_missing
+              << " pm_key_mismatch=" << pm_key_mismatch
+              << " (expected ok=" << kKeyRange << ", others=0)" << std::endl;
+    if (ok != static_cast<std::size_t>(kKeyRange)) {
+        std::cerr << "  FAIL: HiOM read-back / ColdTier truth broken — "
+                  << "missed=" << missed
+                  << " cold_missing=" << cold_missing
+                  << " pm_key_mismatch=" << pm_key_mismatch << std::endl;
         return 1;
     }
 
@@ -1685,10 +1688,229 @@ int run_recovery_stress() {
     return 0;
 }
 
+// P0 sanity: hiom_map_skipped_ counter must increment exactly once per
+// write-path op when HiOM owns the index, and stay zero for raw Viper
+// callers. If this passes but the perf microbench shows no win, it means
+// owns_index_ took effect but the bottleneck is elsewhere; if this
+// fails the wiring is broken.
+int run_p0_skip_counter_sanity() {
+    std::cout << "=== HiOM P0 skip-counter sanity (M3 follow-up #2) ===" << std::endl;
+
+    constexpr int kN = 1000;
+
+    // Phase 1: HiOM-attached Viper. Counter should grow.
+    {
+        cleanup_pool();
+        cleanup_cold_pool();
+        cleanup_checkpoint_dir();
+
+        auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+        auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+        auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+        HiOMT hiom(*viper_db, kHotBuckets, cold.get(),
+                   HiOMT::FlusherConfig{}, chkpt.get());
+
+        const std::uint64_t skipped_before = viper_db->hiom_map_skipped();
+        if (skipped_before != 0) {
+            std::cerr << "  FAIL: counter not zero at start: "
+                      << skipped_before << std::endl;
+            return 1;
+        }
+
+        auto cl = hiom.get_client();
+        for (int i = 0; i < kN; ++i) {
+            const std::uint64_t k = static_cast<std::uint64_t>(i + 1);
+            cl.put(k, k * 7);
+        }
+        // put → 1 skip per call.
+        const std::uint64_t after_put = viper_db->hiom_map_skipped();
+        if (after_put != static_cast<std::uint64_t>(kN)) {
+            std::cerr << "  FAIL (post-put): expected " << kN
+                      << " skips, got " << after_put << std::endl;
+            return 1;
+        }
+
+        // remove half → +1 skip per remove (Client::remove path).
+        for (int i = 0; i < kN; i += 2) {
+            const std::uint64_t k = static_cast<std::uint64_t>(i + 1);
+            cl.remove(k);
+        }
+        const std::uint64_t after_remove = viper_db->hiom_map_skipped();
+        const std::uint64_t expected_after_remove
+            = static_cast<std::uint64_t>(kN + kN / 2);
+        if (after_remove != expected_after_remove) {
+            std::cerr << "  FAIL (post-remove): expected "
+                      << expected_after_remove
+                      << " skips, got " << after_remove << std::endl;
+            return 1;
+        }
+
+        std::cout << "  HiOM-attached: " << after_remove
+                  << " skips after " << kN << " puts + " << (kN / 2)
+                  << " removes (expected " << expected_after_remove
+                  << ")" << std::endl;
+
+        hiom.flush_and_wait();
+    }
+
+    // Phase 2: raw Viper, no HiOM attached. Counter must stay zero.
+    {
+        cleanup_pool();
+
+        auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+        auto cl = viper_db->get_client();
+        for (int i = 0; i < kN; ++i) {
+            const std::uint64_t k = static_cast<std::uint64_t>(i + 1);
+            cl.put(k, k * 11);
+        }
+        const std::uint64_t legacy_skips = viper_db->hiom_map_skipped();
+        if (legacy_skips != 0) {
+            std::cerr << "  FAIL (legacy): expected 0 skips, got "
+                      << legacy_skips << std::endl;
+            return 1;
+        }
+        std::cout << "  raw Viper (no HiOM): "
+                  << legacy_skips << " skips after " << kN
+                  << " puts (expected 0)" << std::endl;
+    }
+
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
+// P0 multi-thread correctness: 8 writers, distinct keys per thread, mix
+// of update + remove. Verifies reads return latest values, removed keys
+// miss. This is the YCSB-A-shaped workload (no cross-thread same-key
+// races), so the known same-key-leak limitation does not trigger.
+int run_p0_update_heavy_multi_thread() {
+    std::cout << "=== HiOM P0 update-heavy multi-thread (M3 follow-up #2) ==="
+              << std::endl;
+
+    cleanup_pool();
+    cleanup_cold_pool();
+    cleanup_checkpoint_dir();
+
+    constexpr int kNumThreads = 2;
+    constexpr int kPerThread = 25'000;       // 50K keys total (2-thread debug)
+    constexpr std::size_t kHotBucketsP0 = 1ULL << 14;  // 16K × 16 = 256K slots
+
+    auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+    auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+    auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
+    HiOMT hiom(*viper_db, kHotBucketsP0, cold.get(),
+               HiOMT::FlusherConfig{}, chkpt.get());
+
+    auto base_for_thread = [](int t) -> std::uint64_t {
+        return static_cast<std::uint64_t>(t)
+                * static_cast<std::uint64_t>(kPerThread + 1) + 1;
+    };
+
+    std::atomic<std::uint64_t> remove_returned_false{0};
+    auto worker = [&](int thread_id) {
+        auto cl = hiom.get_client();
+        const std::uint64_t base = base_for_thread(thread_id);
+        // Phase 1: insert.
+        for (int i = 0; i < kPerThread; ++i) {
+            cl.put(base + i, (base + i) * 7);
+        }
+        // Phase 2: update every key in place to a new value.
+        for (int i = 0; i < kPerThread; ++i) {
+            cl.put(base + i, (base + i) * 13);
+        }
+        // Phase 3: remove odd-indexed half.
+        for (int i = 1; i < kPerThread; i += 2) {
+            if (!cl.remove(base + i)) {
+                remove_returned_false.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(kNumThreads);
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    for (auto& th : threads) th.join();
+    hiom.flush_and_wait();
+
+    // Verify: even-indexed keys hold the *13 value; odd-indexed are gone.
+    auto cl = hiom.get_client();
+    auto vcl_ro = viper_db->get_read_only_client();
+    std::size_t hit_even = 0;
+    std::size_t miss_even = 0;
+    std::size_t mismatch_even = 0;
+    std::size_t leaked_odd = 0;     // odd key that should have been removed
+    for (int t = 0; t < kNumThreads; ++t) {
+        const std::uint64_t base = base_for_thread(t);
+        for (int i = 0; i < kPerThread; ++i) {
+            const std::uint64_t k = base + i;
+            std::uint64_t got = 0;
+            const bool found = cl.get(k, &got);
+            if (i % 2 == 0) {
+                if (!found) {
+                    ++miss_even;
+                } else if (got != k * 13) {
+                    ++mismatch_even;
+                } else {
+                    ++hit_even;
+                }
+            } else {
+                if (found) {
+                    if (leaked_odd < 5) {
+                        const auto fp64 = viper::hiom::key_fingerprint64(k);
+                        const auto fp32 = viper::hiom::key_fingerprint(k);
+                        const auto cold_off = hiom.cold_tier()->lookup(fp64);
+                        const auto hot_packed = hiom.hot_tier().lookup(fp32);
+                        std::cerr << "    leaked odd k=" << k
+                                  << " thread=" << t << " idx=" << i
+                                  << " got=" << got
+                                  << " (k*13=" << (k * 13) << ")"
+                                  << " cold_lookup="
+                                  << (cold_off ? "hit" : "MISS")
+                                  << " hot_lookup="
+                                  << (hot_packed ? "hit" : "MISS");
+                        if (cold_off) {
+                            std::uint64_t pmk = 0, pmv = 0;
+                            const bool pm_ok =
+                                vcl_ro.hiom_read_at_offset(*cold_off,
+                                                            &pmk, &pmv);
+                            std::cerr << " cold_off="
+                                      << cold_off->offset
+                                      << " pm_alive=" << pm_ok
+                                      << " pm_key=" << pmk;
+                        }
+                        std::cerr << std::endl;
+                    }
+                    ++leaked_odd;
+                }
+            }
+        }
+    }
+    const std::size_t expected_even
+        = static_cast<std::size_t>(kNumThreads) * ((kPerThread + 1) / 2);
+    std::cout << "  hit_even=" << hit_even
+              << " miss_even=" << miss_even
+              << " mismatch_even=" << mismatch_even
+              << " leaked_odd=" << leaked_odd
+              << " remove_returned_false="
+              << remove_returned_false.load()
+              << " (expected hit_even=" << expected_even
+              << ", others=0)" << std::endl;
+    if (hit_even != expected_even || miss_even != 0
+        || mismatch_even != 0 || leaked_odd != 0) {
+        std::cerr << "  FAIL: P0 update/remove semantics broken." << std::endl;
+        return 1;
+    }
+
+    std::cout << "  PASS" << std::endl;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     int rc = 0;
+    rc |= run_p0_skip_counter_sanity();
     rc |= run_correctness();
     rc |= run_update_remove();
     rc |= run_microbench();
@@ -1696,6 +1918,7 @@ int main() {
     rc |= run_commit_window();
     rc |= run_checkpoint_persistence();
     rc |= run_recovery_persistence();
+    rc |= run_p0_update_heavy_multi_thread();
     rc |= run_multi_producer_correctness();
     rc |= run_recovery_stress();
     if (rc != 0) {

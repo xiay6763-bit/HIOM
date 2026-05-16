@@ -532,6 +532,19 @@ class Viper {
         hiom_old_offset_resolver_ = std::move(fn);
     }
 
+    // M3 follow-up #2 / P0: when true, write paths
+    // (Client::put / update / remove / free_occupied_slot) skip
+    // map_.Insert / map_.Get and use hiom_old_offset_resolver_ as
+    // the sole source of old offsets — HiOM owns the index.
+    // Default false; set to true by HiOM's constructor when
+    // ColdTier is wired up. The resolver MUST be installed before
+    // this flag is set; the put/update/remove paths assume both
+    // are present together.
+    void set_hiom_owns_index(bool b) { hiom_owns_index_ = b; }
+    std::uint64_t hiom_map_skipped() const {
+        return hiom_map_skipped_.load(std::memory_order_relaxed);
+    }
+
     // M4 Phase C: cheap "is this offset still pointing at a live
     // record" predicate. Used by HiOM's apply_batch coalesce path
     // to skip cold-tier writes for offsets whose VPage slot has
@@ -597,6 +610,19 @@ class Viper {
     // (empty std::function) means "no HiOM attached"; the
     // operator bool() check in the write paths gates the fallback.
     OldOffsetResolver hiom_old_offset_resolver_;
+
+    // M3 follow-up #2 / P0: see set_hiom_owns_index(). When true,
+    // the legacy CCEH-on-write-path is fully bypassed in favour
+    // of the resolver. Default false keeps every legacy / M0 / M5
+    // caller byte-identical.
+    bool hiom_owns_index_{false};
+
+    // P0 instrumentation: bumped each time a write path skipped
+    // map_.Insert / map_.Get because hiom_owns_index_ was set.
+    // Cheap atomic; safe to leave on after measurements (the
+    // counter is consumed by hiom_integration_test for the
+    // skip-counter sanity check).
+    mutable std::atomic<std::uint64_t> hiom_map_skipped_{0};
 
     std::vector<VPageBlock*> v_blocks_;
     std::atomic<size_t> num_v_blocks_;
@@ -1225,25 +1251,39 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
     last_put_offset_ = kv_offset;
     KVOffset old_offset;
 
-    if constexpr (using_fp) {
-        auto key_check_fn = [&](auto key, auto offset) { return this->viper_.check_key_equality(key, offset); };
-        old_offset = this->viper_.map_.Insert(key, kv_offset, key_check_fn);
+    if (this->viper_.hiom_owns_index_) {
+        // M3 follow-up #2 / P0: HiOM owns the index. Skip
+        // map_.Insert entirely and use the resolver
+        // (HotTier→ColdTier; installed by HiOM's ctor) as the
+        // sole source of the prior offset for free_occupied_slot.
+        // Invariant: hiom_owns_index_ ⇒ resolver is installed.
+        // Saves one CCEH segment-level CAS per put (the actual
+        // multi-thread insert bottleneck — segment sema +
+        // possible split contend across writers).
+        this->viper_.hiom_map_skipped_.fetch_add(
+            1, std::memory_order_relaxed);
+        old_offset = this->viper_.hiom_old_offset_resolver_(key);
     } else {
-        old_offset = this->viper_.map_.Insert(key, kv_offset);
-    }
+        if constexpr (using_fp) {
+            auto key_check_fn = [&](auto key, auto offset) { return this->viper_.check_key_equality(key, offset); };
+            old_offset = this->viper_.map_.Insert(key, kv_offset, key_check_fn);
+        } else {
+            old_offset = this->viper_.map_.Insert(key, kv_offset);
+        }
 
-    // M6.5 full: if map_ said "new key" but HiOM (ColdTier) holds a
-    // pre-restart offset for this key, use it. This is the only way
-    // to invalidate the stale VPage slot when skip_recovery=true left
-    // map_ empty for keys written before the previous shutdown. The
-    // resolver fires at most once per key per process: once we
-    // consume it, the just-completed map_.Insert above has already
-    // hydrated map_, and any subsequent put/update/remove hits the
-    // CCEH fast path.
-    if (old_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
-        const KVOffset resolved = this->viper_.hiom_old_offset_resolver_(key);
-        if (!resolved.is_tombstone()) {
-            old_offset = resolved;
+        // M6.5 full: if map_ said "new key" but HiOM (ColdTier) holds a
+        // pre-restart offset for this key, use it. This is the only way
+        // to invalidate the stale VPage slot when skip_recovery=true left
+        // map_ empty for keys written before the previous shutdown. The
+        // resolver fires at most once per key per process: once we
+        // consume it, the just-completed map_.Insert above has already
+        // hydrated map_, and any subsequent put/update/remove hits the
+        // CCEH fast path.
+        if (old_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+            const KVOffset resolved = this->viper_.hiom_old_offset_resolver_(key);
+            if (!resolved.is_tombstone()) {
+                old_offset = resolved;
+            }
         }
     }
 
@@ -1468,20 +1508,30 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
     };
 
     while (true) {
-        KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
-        // M6.5 full: post-restart with skip_recovery=true, map_ is
-        // empty for pre-existing keys; consult HiOM and hydrate map_
-        // so the next update on this key hits the fast path.
-        if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
-            const KVOffset resolved
-                = this->viper_.hiom_old_offset_resolver_(key);
-            if (!resolved.is_tombstone()) {
-                if constexpr (using_fp) {
-                    this->viper_.map_.Insert(key, resolved, key_check_fn);
-                } else {
-                    this->viper_.map_.Insert(key, resolved);
+        KVOffset kv_offset;
+        if (this->viper_.hiom_owns_index_) {
+            // M3 follow-up #2 / P0: skip map_.Get; resolver is the
+            // sole index. Resolver returns Tombstone if no prior
+            // entry — same semantics as map_.Get returning tombstone.
+            this->viper_.hiom_map_skipped_.fetch_add(
+                1, std::memory_order_relaxed);
+            kv_offset = this->viper_.hiom_old_offset_resolver_(key);
+        } else {
+            kv_offset = this->viper_.map_.Get(key, key_check_fn);
+            // M6.5 full: post-restart with skip_recovery=true, map_ is
+            // empty for pre-existing keys; consult HiOM and hydrate map_
+            // so the next update on this key hits the fast path.
+            if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+                const KVOffset resolved
+                    = this->viper_.hiom_old_offset_resolver_(key);
+                if (!resolved.is_tombstone()) {
+                    if constexpr (using_fp) {
+                        this->viper_.map_.Insert(key, resolved, key_check_fn);
+                    } else {
+                        this->viper_.map_.Insert(key, resolved);
+                    }
+                    kv_offset = resolved;
                 }
-                kv_offset = resolved;
             }
         }
         if (kv_offset.is_tombstone()) {
@@ -1511,14 +1561,22 @@ bool Viper<K, V>::Client::remove(const K& key) {
         return this->viper_.check_key_equality(key, offset);
     };
 
-    KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
-    // M6.5 full: skip_recovery=true means map_ may not know about
-    // pre-restart keys; consult HiOM. We do NOT hydrate map_ here
-    // because free_occupied_slot below will write a NONE tombstone
-    // into map_ via its own Insert call (line ~1463 of the
-    // delete_offset==true branch).
-    if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+    KVOffset kv_offset;
+    if (this->viper_.hiom_owns_index_) {
+        // M3 follow-up #2 / P0: skip map_.Get; resolver is the sole index.
+        this->viper_.hiom_map_skipped_.fetch_add(
+            1, std::memory_order_relaxed);
         kv_offset = this->viper_.hiom_old_offset_resolver_(key);
+    } else {
+        kv_offset = this->viper_.map_.Get(key, key_check_fn);
+        // M6.5 full: skip_recovery=true means map_ may not know about
+        // pre-restart keys; consult HiOM. We do NOT hydrate map_ here
+        // because free_occupied_slot below will write a NONE tombstone
+        // into map_ via its own Insert call (line ~1463 of the
+        // delete_offset==true branch).
+        if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+            kv_offset = this->viper_.hiom_old_offset_resolver_(key);
+        }
     }
     if (kv_offset.is_tombstone()) {
         return false;
@@ -1543,7 +1601,8 @@ void Viper<K, V>::Client::free_occupied_slot(const KVOffset offset_to_delete, co
     if (v_block_number_ == block_number && v_page_number_ == page_number) {
         // Old record to delete is on the same page. We already hold the lock here.
         invalidate_record(v_page_, data_offset);
-        if (delete_offset) {
+        if (delete_offset && !this->viper_.hiom_owns_index_) {
+            // P0: HiOM owns the index; no map_ to mark.
             this->viper_.map_.Insert(key, IndexV::NONE(), key_check_fn);
         }
         --size_delta_;
@@ -1613,7 +1672,8 @@ void Viper<K, V>::Client::free_occupied_slot(const KVOffset offset_to_delete, co
         }
     }
 
-    if (delete_offset) {
+    if (delete_offset && !this->viper_.hiom_owns_index_) {
+        // P0: HiOM owns the index; no map_ to mark.
         this->viper_.map_.Insert(key, IndexV::NONE(), key_check_fn);
     }
 

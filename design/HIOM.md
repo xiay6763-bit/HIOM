@@ -10,7 +10,7 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
-## Status (2026-05-08)
+## Status (2026-05-09)
 
 - **Phase**: M0 ✅; M1 functionally complete except EBR (closed by
   analysis in M4 Phase D — see below); M2 Phase B-1/B-2 ✅; M3 Phase
@@ -380,13 +380,231 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     (offsets are unique and CAS order ≅ slot-claim order
     within a Viper Client, but cross-Client interleaving
     breaks the strict ordering).
-- **Open: multi-producer apply_batch winner picker (preexisting,
-  surfaced 2026-05-08)**. The `multi-producer same-key
-  correctness` test (8 threads × 50K writes / 256 keys) is flaky
-  on master at 15–21 mismatch+miss out of 256 keys per run. The
-  race: HiOM bumps `commit_seq_` AFTER `viper_.put`'s CCEH CAS,
-  so a thread whose CAS won can be preempted before it reads
-  `seq`, and a later-CAS-loser ends up with a smaller seq. The
+  - **Attempt C — P0 / HiOM owns the write-path index — ✅ landed
+    (2026-05-09)**. The 2026-05-08 reasoning ("CCEH-truth at apply
+    time") inverted: instead of teaching apply_batch to consult
+    CCEH, we *retire* CCEH from the multi-thread write path
+    entirely. Every `Client::put` / `update` / `remove` was paying
+    a `map_.Insert` segment-level CAS even though M6.5 had already
+    proven HiOM (HotTier→ColdTier) is a sufficient index for the
+    write-path "what was the prior offset?" lookup. P0 makes that
+    the *only* index when ColdTier is attached; CCEH is still
+    constructed (the read-only legacy paths and recovery still
+    use it) but the write paths skip `map_.Insert` and `map_.Get`
+    entirely. New surface: `Viper::set_hiom_owns_index(bool)` and
+    `hiom_map_skipped_` counter (atomic, observable via
+    `hiom_map_skipped()`); HiOM's ctor calls
+    `set_hiom_owns_index(true)` right after installing the resolver.
+    The resolver itself was extended from M6.5's "ColdTier-only,
+    fires once per key" form to a full HotTier→ColdTier path
+    (HotTier check first; verify the slot's stored key matches
+    via PM read; fall through to ColdTier on fp32 collision /
+    stale slot; PM-verify ColdTier offset before returning).
+  - **Apply-batch correctness under update+remove + fp32 collision
+    (P0 fix, Option L)**. The naive "skip kRemove if `viper_.remove`
+    returns false" path leaks: if the resolver missed an in-flight
+    kPut for `key` (HotTier slot was overwritten by an fp32-colliding
+    key + ColdTier still holds the pre-update offset whose VPage
+    slot was already freed by the most-recent `Client::put`),
+    `viper_.remove` returns tombstone-not-found and HiOM's wrapper
+    bails without pushing kRemove. The flusher then upserts the
+    in-flight kPut into ColdTier, but no kRemove ever clears it —
+    `get(key)` succeeds when the user expected the key to be gone.
+    Fix: HiOM's wrapper always pushes a kRemove (and clears the
+    HotTier slot) regardless of the underlying `viper_.remove` return,
+    and returns `true` when ColdTier is attached. The (fp64, seq)
+    sort in `apply_batch` makes the kRemove the highest-seq entry
+    for that fp's run, the descending walk picks it, and ColdTier
+    is correctly evicted. *Known limitation*: the in-flight kPut's
+    VPage slot is leaked (alive on PM, no index points at it) when
+    this path triggers — we can't find that slot without scanning
+    the commit buffer. The slot is reclaimable by a future compact
+    pass; the leak is rare (requires both fp32 collision *and*
+    update→remove against the same key, after the most-recent
+    update's mirror has been overwritten). Reproduces deterministically
+    in `run_p0_update_heavy_multi_thread` (50 K keys, 16 K HotTier
+    buckets — load factor and key count tuned to land in the
+    fp32-collision regime).
+  - **Tests (M3 follow-up #2)**:
+    - `run_p0_skip_counter_sanity` (1 K keys, single-thread + a raw-
+      Viper baseline). Asserts `hiom_map_skipped()` increments by
+      exactly 1 per put/remove when HiOM is attached, and stays at 0
+      for raw Viper without HiOM.
+    - `run_p0_update_heavy_multi_thread` (2 threads × 25 K keys ×
+      insert+update+remove-half). Verifies even-indexed keys hold
+      the post-update value, odd-indexed keys are gone, and
+      `remove_returned_false == 0` after `flush_and_wait`. With
+      Option L the test passes deterministically across runs (3 / 3
+      consecutive runs ALL PASS); without Option L it leaks one
+      key on every run.
+    - `run_multi_producer_correctness` (8 threads × 50 K writes /
+      256 keys) — assertion adjusted: P0 retires CCEH from the
+      write path, so the test no longer compares HiOM truth
+      against `map_.Get`; it compares against direct PM-read at
+      the ColdTier-recorded offset (`hiom_read_at_offset`). The
+      "preexisting `commit_seq_` flake" caveat from the 2026-05-08
+      Open notes is no longer reproducible on the 50 K-keys / 256-
+      key-range workload (3 / 3 consecutive runs ok=256 / 256).
+  - **Bench numbers (`all_ops_bm` insert microbench, repeats=3)**:
+    - thread=1: HiOMFixture 215 K/s vs ViperFixture 376 K/s
+      (HiOM ≈ 0.57× — flusher/HotTier overhead at low fan-in).
+    - thread=8: HiOMFixture 990 K/s aggregate vs ViperFixture
+      27.3 M/s aggregate (HiOM ≈ 0.04×). The 8-thread gap is
+      *not* closed by P0 alone — `commit_seq_` global atomic and
+      moodycamel mpmc enqueue are still the steady-state bottleneck.
+      P0 retires the *segment-level CCEH CAS* per write, which is
+      a contributing factor at thread=8 but is dwarfed by queue +
+      seq contention. Closing the gap requires the lanes / TSC /
+      apply-time-truth work that's still open from the 2026-05-08
+      Status entry.
+- **M3 follow-up #2 — written (2026-05-09)**, supersedes the rolled-
+  back lanes + __rdtsc attempts. P0 + Option L both landed; the
+  thread=8 insert gap is narrower than before bulk_upsert but still
+  >20× behind raw Viper, so commit-buffer / seq contention work is
+  the next lever.
+- **Multi-producer apply_batch winner picker — HotTier-truth as
+  primary, alive-fp-match walk as fallback ✅ landed (2026-05-09)**.
+  Closes the "preexisting `commit_seq_` flake" surfaced on
+  2026-05-08. Mechanism: P0 retired CCEH from the write path, so
+  `HotTier::upsert_pinned`'s CAS is now the linearization point
+  for same-fp32 writes. apply_batch reads the slot's current
+  `(fp32, packed_off)` (one acquire-load per fp64 run, via the
+  new `HotTier::read_slot(SlotRef)`) and picks the batch entry
+  whose off matches; the canonical CAS-winner's data is exactly
+  what the slot points at, no `commit_seq_`-after-CAS race left
+  to lose. Fallback paths (HotTier slot evicted post-PINNED, fp32
+  collision overwrote the slot, HotTier holds an off from a
+  future not-yet-drained batch) still run the original descending
+  alive-and-fp-match walk with `seq` as tiebreaker. Surface change:
+  ~12 added LOC in `hot_tier.hpp` (the `SlotView` helper) and
+  ~80 LOC in `apply_batch` (fast path + fallback split).
+  Validation: 8 / 8 consecutive `run_multi_producer_correctness`
+  runs at ok=256 / 256 (8 threads × 50 K writes / 256 keys),
+  zero regressions on the rest of `hiom_integration_test`,
+  `all_ops_bm` insert numbers within run-to-run noise (thread=1
+  220 K/s vs 215 K/s pre-change; thread=8 unchanged at ~120 K/s).
+  Note: `seq` is still bumped per push (still a global atomic
+  contention point on the write path) — the picker change made
+  it not load-bearing for correctness, which clears the way for
+  the next round of M3 follow-up #2 work to *retire `commit_seq_`
+  entirely* (e.g., a per-lane local counter for tiebreaks).
+- **M3 follow-up #2 Step 3 — multi-flusher producer reachability:
+  two `ref.valid=false` paths fixed (2026-05-16)**. While
+  validating the Step 1+2+3 chain (per-Client local seq, 8-lane
+  sharded commit buffer, N background flushers each owning a
+  disjoint lane subset), `all_ops_bm HiOMFixture<KeyType16,
+  ValueType200> insert thread:1` ran at **18.3 K/s** (54.6 s for
+  1 M inserts) — vs `uint64_t/uint64_t` repro at 1.64 M/s on the
+  same Step 3 wiring. Real time was 15× CPU time (90% idle wait),
+  confirming a stall not a CPU bottleneck. Threadstack sampling
+  showed the main thread in `hrtimer_nanosleep` inside the
+  producer hot path; both flushers in `futex_wait`. Two
+  *independent* bugs in series:
+  - **Bug A — flusher predicate × wake_all_flushers conflict**:
+    `flusher_loop`'s `wait_for` predicate was
+    `(nonempty & my_lanes_mask) != 0 && size_hint() >= high_watermark`,
+    AND-ing the producer-side "early wake" knob (`high_watermark`,
+    default 1024) with the flusher-side wake-acceptance gate.
+    Whenever the producer-side back-pressure path nudged
+    `wake_all_flushers()` while total `size_hint() < 1024`
+    (the common case — back-pressure happens at low queue size),
+    the predicate rejected the wake and the flusher only ran on
+    the 5 ms timer. Fix: predicate is now just
+    `(nonempty & my_lanes_mask) != 0`. `high_watermark` retains
+    its producer-side role (`push_commit` only invokes
+    `wake_all_flushers` when total size crosses it). One-line
+    surface change in `hiom.hpp`.
+  - **Bug B — encode failure mistakenly triggers blocking drain**
+    (the real culprit, the throughput-killer). The producer hot
+    path declares `HotTier::SlotRef ref{}` default-constructed
+    (`valid=false`), then runs `upsert_pinned` *inside* an
+    `if (packed)` block where `packed` is `encode()`'s
+    `std::optional<compact_offset_t>`. If `encode()` returns
+    `nullopt`, the entire upsert_pinned + retry loop is skipped
+    and `ref` stays default-invalid. Later, the M4 Phase B
+    blocking-drain gate (`if (!ref.valid && commit_buf_)`)
+    interprets that as "upsert_pinned failed → block until
+    buffer drains" — but encode failure is a *different* case
+    (the put already landed in Viper PMem, push_commit will
+    route it to ColdTier asynchronously, reads fall through
+    HotTier-miss → ColdTier just fine). With encode failing on
+    every put once `block_number > 8191` (see Open below), the
+    producer paid one full commit-buffer drain (~50 µs) per put.
+    Fix: gate the blocking drain on a new `packed_ok` boolean
+    so it only fires when we *actually called* upsert_pinned
+    and it returned invalid (real M4 Phase B back-pressure).
+    `~20` LOC in `hiom.hpp`.
+  - **Validation**: rebuild + same `all_ops_bm HiOMFixture
+    <KeyType16, ValueType200> insert threads:1 --repetitions=1`
+    (which actually fans out 3 reps via `Repetitions(3)` on the
+    `BENCHMARK_REGISTER`):
+    | metric | pre-fix | post-fix |
+    |--------|---------|----------|
+    | real time / 1 M inserts | 54.6 s | **1.85 s** |
+    | items/s | 18.3 K/s | **541 K/s** (~30×) |
+    | `inline_flush_calls` | 1.115 M | 0 |
+    | `commits_flushed` | 2 M | 1.999 M |
+    | CPU / Real | 6.6% | 55% |
+    All measured with `num_flushers=2`, single-producer prefill
+    (`num_util_threads_ = 1` left in fixture as TEMP debug).
+    The 541 K/s ≈ 1/3 of the user's uint64_t Step 3 repro
+    (1.64 M/s) is explained by Viper write-path scaling with
+    value size, not HiOM overhead: 25× larger value → ~7× more
+    PMem cacheline writes per put, and VPage density drops
+    from hundreds-per-page (uint64_t) to 18/page (216 B entry),
+    so block frontier advances ~5× faster.
+  - **Multi-thread scaling (2026-05-16, TEMP-debug removed,
+    defaults: `num_flushers=4`, `num_util_threads=36`, 64 GiB
+    pool)**. Same workload (`all_ops_bm` insert,
+    KeyType16+ValueType200, 1 M prefill + 1 M timed inserts,
+    median over 3 reps):
+    | threads | Viper | HiOM | HiOM/Viper |
+    |--------:|------:|-----:|-----------:|
+    |       1 | 814 K/s | 530 K/s | 0.65× |
+    |       8 | 3.89 M/s | 2.06 M/s | 0.53× |
+    |      24 | 5.00 M/s | 2.71 M/s | 0.54× |
+    Stats clean across all 18 runs (3 reps × 6 thread×fixture
+    cells): `pin_failures=0`, `inline_flush_calls=0`. Compare
+    to the pre-Step-3 2026-05-09 measurement at thread=8
+    (HiOM 990 K/s vs Viper 27.3 M/s = **0.04×**) — Step 1+2+3
+    plus the two 2026-05-16 fixes close the 20× scaling gap
+    that motivated the follow-up. Per-thread overhead grows
+    with thread count (thread:1 = 0.66 µs, thread:24 = 4.0 µs
+    extra per put), so producer-side contention (CommitBuffer
+    enqueue, HotTier bucket CAS, `wake_all_flushers` lock
+    cascade) is the remaining lever; the bookkeeping cost
+    itself (HotTier + commit buffer + per-Client seq) is
+    constant ~0.7 µs/op at low fan-in.
+- **Open — `kBlockLowBits = 13` (`encode()` 8 K-block ceiling)**.
+  Surfaced by the Step 3 investigation above. Doc string in
+  `offset_codec.hpp` already flags it as an M0 limitation
+  ("M2/M3 will introduce real 32-region routing and lift this
+  ceiling"); the ceiling is still the original 13-bit one in
+  the M5/M6 code. KeyType16+ValueType200 hits it at
+  `1 M / (18 slots × 6 pages) ≈ 9259 blocks > 8191`, i.e.
+  ~885 K records into a single-region run. Bug B above made
+  this fatal; with that fix the ceiling is now silent
+  (HotTier just stops accepting entries past it, ColdTier
+  handles everything). To run the paper's 100 M sweep cleanly,
+  the codec needs widening — likely paths (not yet picked):
+  (1) widen to 16-bit block_low + 13-bit byte/slot data_offset
+  + 3-bit page; (2) drop page bits (the page is decomposable
+  from data_offset under the fixed-slot-per-page layout) and
+  give all 13 saved bits to block_low → 26-bit block_low,
+  64 M blocks; (3) commit to per-region routing (kNumRegions
+  = 32 → +5 bits via the routing prefix, but ColdTier already
+  uses fp64's top 5 bits for region routing and HiOM's
+  `route_to_region_default()` is stubbed to 0). (3) is the
+  designed path; the other two are escape hatches if region
+  routing isn't ready in time. None are urgent for the
+  Step 3 perf story now that the gate is fixed.
+- **Was-Open: multi-producer apply_batch winner picker (now closed
+  by the bullet above, kept here for the historical context)**. The
+  `multi-producer same-key correctness` test (8 threads × 50K writes
+  / 256 keys) was flaky on master at 15–21 mismatch+miss out of 256
+  keys per run. The race: HiOM bumps `commit_seq_` AFTER `viper_.put`'s
+  CCEH CAS, so a thread whose CAS won can be preempted before it
+  reads `seq`, and a later-CAS-loser ends up with a smaller seq. The
   apply path's descending-seq alive-and-fp-match walk then picks
   the loser (its slot is still alive under reclamation-off
   defaults, and fp matches because the slots collide on the same
@@ -395,12 +613,18 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   CCEH lookup, pick entry whose `off` matches); (2) carry the
   key in CommitEntry (size grows by `sizeof(K)`; OK for K8 keys,
   borderline for K16); (3) make seq + CAS atomic via `cmpxchg16b`
-  on a packed `(seq, offset)` slot (deep CCEH surgery).
-- **Implementation share**: unchanged at ~88% (8.0 weeks / 9
-  weeks of impl) — no code landed in this round. Remaining:
-  multi-producer winner picker fix, retry on M3 follow-up #2
-  (commit-buffer lanes) once the picker is in place, 100M
-  `--full` measurement, M7 (full evaluation).
+  on a packed `(seq, offset)` slot (deep CCEH surgery). Note that
+  P0 retires CCEH from the write path, so option (1) above now
+  reads "derive ground truth from HotTier+ColdTier" instead — the
+  same idea, with HiOM as the source of truth, applies. *Update
+  2026-05-09*: variant (1) over HotTier landed (`HotTier::read_slot`
+  + apply_batch fast path). Test now stable across 8 consecutive
+  runs.
+- **Implementation share**: ~90% (8.2 weeks / 9 weeks of impl), up
+  from ~89% pre winner-picker change. Remaining: commit-buffer
+  lanes + retire `commit_seq_` (now reduced to a write-path-
+  contention cleanup, no longer load-bearing for correctness),
+  100M `--full` measurement, M7 (full evaluation).
 - **Latent commit-buffer ordering bug — FIXED (M4 Phase 0)**: M3's
   `drain_once` used `std::sort` on `(fp64)`, which doesn't preserve
   enqueue order for equal keys. A `put X v1 → put X v2` sequence
@@ -1108,14 +1332,32 @@ unchanged.
    batches stay tiny under low producer fan-in; the win is held
    in reserve for higher-thread workloads where bulk batches grow.
    See the bench-fixture parity bullet in Status for the table.
-2. **Per-thread commit-buffer lanes** (now top priority — bulk_upsert
-   alone didn't close the multi-thread insert gap, so the
-   `commit_seq_` global atomic + moodycamel mpmc enqueue
-   contention is the dominant bottleneck at thread=8). Lane-per-
-   thread design with a global merge step at apply time.
-3. **Inline-flush + `pin_failures` back-pressure landed in M4
+2. **P0 — HiOM owns the write-path index, retire CCEH segment-
+   level CAS from `Client::put` / `update` / `remove`** — ✅ done
+   (2026-05-09). New `Viper::set_hiom_owns_index(bool)` +
+   `hiom_map_skipped_` counter; HiOM's ctor flips the flag after
+   installing a HotTier→ColdTier resolver. `apply_batch` /
+   `Client::remove` corrections (Option L) handle the
+   fp32-collision update+remove edge case at the cost of a rare
+   VPage slot leak. Tests: `run_p0_skip_counter_sanity` +
+   `run_p0_update_heavy_multi_thread`. See the M3 follow-up #2
+   "Attempt C" entry in Status for the full write-up.
+3. **Per-thread commit-buffer lanes + retire `commit_seq_`** (still
+   open after P0 + winner-picker rework). With CCEH out of the
+   write path *and* the apply_batch winner picker no longer
+   depending on `seq` for correctness (HotTier-truth fast path
+   landed 2026-05-09), the dominant thread=8 insert bottleneck
+   is now the `commit_seq_` global atomic + moodycamel mpmc
+   enqueue contention. The 2026-05-08 lanes attempt regressed
+   thread=1; revisit with `seq` reduced to a per-lane local
+   counter (apply_batch's fallback walk uses it only as
+   tiebreaker among multiple alive kPuts in the same fp64 run,
+   which only happens for cross-thread same-key races within a
+   single batch — rare, and the per-lane local counter still
+   gives intra-lane monotone ordering).
+4. **Inline-flush + `pin_failures` back-pressure landed in M4
    Phase B** — done.
-4. **Multi-thread shared-key stress** — M2 deferred; M4 Phase E's
+5. **Multi-thread shared-key stress** — M2 deferred; M4 Phase E's
    `run_recovery_stress` partially covers this with disjoint
    per-thread key ranges. A same-key-across-threads stress remains
    useful for catching CCEH dup-entry races (out of scope for
