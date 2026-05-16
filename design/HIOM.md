@@ -555,26 +555,97 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     so block frontier advances ~5× faster.
   - **Multi-thread scaling (2026-05-16, TEMP-debug removed,
     defaults: `num_flushers=4`, `num_util_threads=36`, 64 GiB
-    pool)**. Same workload (`all_ops_bm` insert,
-    KeyType16+ValueType200, 1 M prefill + 1 M timed inserts,
-    median over 3 reps):
-    | threads | Viper | HiOM | HiOM/Viper |
-    |--------:|------:|-----:|-----------:|
-    |       1 | 814 K/s | 530 K/s | 0.65× |
-    |       8 | 3.89 M/s | 2.06 M/s | 0.53× |
-    |      24 | 5.00 M/s | 2.71 M/s | 0.54× |
-    Stats clean across all 18 runs (3 reps × 6 thread×fixture
-    cells): `pin_failures=0`, `inline_flush_calls=0`. Compare
-    to the pre-Step-3 2026-05-09 measurement at thread=8
-    (HiOM 990 K/s vs Viper 27.3 M/s = **0.04×**) — Step 1+2+3
-    plus the two 2026-05-16 fixes close the 20× scaling gap
-    that motivated the follow-up. Per-thread overhead grows
-    with thread count (thread:1 = 0.66 µs, thread:24 = 4.0 µs
-    extra per put), so producer-side contention (CommitBuffer
-    enqueue, HotTier bucket CAS, `wake_all_flushers` lock
-    cascade) is the remaining lever; the bookkeeping cost
-    itself (HotTier + commit buffer + per-Client seq) is
-    constant ~0.7 µs/op at low fan-in.
+    pool)**. Same workload (`all_ops_bm`, KeyType16+ValueType200,
+    1 M prefill + 1 M timed ops, median over 3 reps; numbers are
+    `items_per_second` per-thread — aggregate = N × per-thread):
+    | op     | t=1 V | t=1 H | **t=1 H/V** | t=8 V | t=8 H | **t=8 H/V** | t=24 V | t=24 H | **t=24 H/V** |
+    |--------|------:|------:|------:|------:|------:|------:|------:|------:|------:|
+    | insert | 814 K | 530 K | 0.65× | 3.89 M | 2.06 M | 0.53× | 5.00 M | 2.71 M | 0.54× |
+    | get    | 1.57 M | 1.66 M | **1.06×** | 12.18 M | 12.54 M | **1.03×** | 31.25 M | 19.40 M | 0.62× |
+    | update | 2.54 M | 1.26 M | 0.50× | 11.31 M | 6.69 M | 0.59× | 13.76 M | 9.44 M | 0.69× |
+    | delete | 858 K | 1.10 M | **1.28×** | 5.88 M | 3.19 M | 0.54× | 11.26 M | 2.79 M | **0.25×** ⚠ |
+    Stats clean across all 36 runs (3 reps × 12 thread×fixture×op
+    cells): `pin_failures=0`, `inline_flush_calls=0`. Compare to
+    pre-Step-3 2026-05-09 measurement at thread=8 insert (HiOM
+    990 K vs Viper 27.3 M = **0.04×**) — Step 1+2+3 plus the two
+    2026-05-16 fixes close the 20× scaling gap for insert.
+    Read paths:
+    - **get is HiOM's strongest story**: at t=1 / t=8 HiOM is
+      slightly *ahead* of Viper (1.03–1.06×) — HotTier-DRAM hit
+      bypasses Viper's CCEH segment lookup. At t=24 drops to
+      0.62× (still 19 M/thread, ~466 M/s aggregate), suggesting
+      HotTier slot atomic / lookup-path contention at high
+      fan-in.
+    - **insert / update** behave like one another: ~0.5–0.7×
+      across t=1/8/24, dominated by HiOM's per-put bookkeeping
+      (HotTier upsert_pinned + commit-buffer push + Stage 2 CAS
+      dance). thread:1 update is the worst single ratio (0.50×)
+      because Viper's update path is comparatively cheap
+      (in-place value mutate + clwb) while HiOM still pays the
+      full producer-side ceremony.
+    - **delete at thread:1 is *faster* on HiOM** (1.28×) — see
+      Open below for explanation. At thread:24 it collapses to
+      0.25×; deep-dive in next bullet.
+    Per-thread overhead growth (insert): 0.66 µs (t=1) → 4.0 µs
+    (t=24) excess over Viper. Producer-side contention
+    (CommitBuffer enqueue, HotTier bucket CAS,
+    `wake_all_flushers` lock cascade) is the remaining lever.
+- **Open — delete thread:24 = 0.25× Viper (2026-05-16)**. Wall-
+  time deep-dive (the `items_per_second` 0.25× ratio is inflated
+  by HiOM's higher `found_counter` count, since `SetItemsProcessed`
+  uses the returned-true count; Option L makes HiOM return true
+  even when the key is already gone). On the same 1 M random-delete
+  attempts at thread:24, Viper completes in 2.34 ms vs HiOM
+  **14.95 ms** = **6.4× slower wall time**. Two-axis analysis:
+  - Per-op CPU time GROWS super-linearly with thread count for
+    HiOM but stays flat for Viper:
+    | threads | Viper µs/op CPU | HiOM µs/op CPU | HiOM/Viper |
+    |--------:|---------------:|---------------:|-----------:|
+    | 1       | 1.36           | 0.96 ✅        | 0.71× |
+    | 8       | 1.21           | 3.24           | 2.68× |
+    | 24      | 1.34           | 10.3           | **7.7×** |
+    HiOM is *cheaper* than Viper at t=1 (HotTier+ColdTier write
+    path is more efficient than CCEH tombstone for a single
+    thread) but pays a 10× cache-line-ping-pong penalty at
+    t=24 — pure contention growth, not per-op work growth.
+  - Per-op work HiOM does (constant across thread counts, from
+    `debug_kremove_pushed` / `debug_resolver_pmem_reads` /
+    `debug_cold_remove_called` instrumentation):
+    - 1 M kRemove pushes into commit buffer (Option L pushes
+      regardless of `viper_.remove` return)
+    - 633 K resolver PMem reads (216 B each — HotTier hit
+      verifies the stored key against the PMem record)
+    - 998 K background `cold_->remove(fp64)` calls (winner
+      picker promotes one kRemove per fp64 run)
+    - 368 K of the kRemoves are redundant (`viper_.remove`
+      returned false because the key was already gone — Option L
+      still pushes for the fp32-collision edge case)
+  - Hot-atomic ablation (replace one fetch_add with no-op,
+    re-measure):
+    | atomic | thread:24 perf | gain |
+    |--------|---------------:|-----:|
+    | baseline | 2.33 M/s | — |
+    | stub `Viper::hiom_map_skipped_.fetch_add` | 2.43 M/s | +4% |
+    | stub `HotTier::size_.fetch_sub` | 2.50 M/s | +7% |
+    No single dominant atomic; the gap is the cumulative
+    cache-line ping-pong across several diagnostic / accounting
+    atomics on the producer hot path plus the design-level
+    extra work above.
+  - Decision: **defer fixing**. The fix paths are
+    (1) move diagnostic atomics to per-Client + sum-on-read
+        (≈ +15% wall-time, doesn't change ratio class);
+    (2) tighten Option L so kRemove is skipped when
+        `viper_.remove` returned false AND no fp32 collision was
+        recently observed (≈ −37% kRemove pushes, but adds a
+        correctness escape hatch + needs a new test for the
+        edge case);
+    (3) accept that HiOM maintains a secondary index, so
+        delete-heavy workloads will always pay that — the paper
+        story is **get and recovery**, not delete throughput.
+    Paper-side framing: HiOM trades delete throughput for
+    cheaper get + crash-safe recovery; t=1 delete being faster
+    on HiOM is the surprising direction. The t=24 0.25× ratio
+    is documented as a known design cost, not a regression.
 - **Open — `kBlockLowBits = 13` (`encode()` 8 K-block ceiling)**.
   Surfaced by the Step 3 investigation above. Doc string in
   `offset_codec.hpp` already flags it as an M0 limitation
