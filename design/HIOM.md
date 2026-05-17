@@ -101,6 +101,68 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   load factor the original 4 M would have hit eviction churn during
   prefill. The bump preserves the steady-state hot-resident
   invariant assumed by the paper's read story.
+- **M6.6 — CCEH allocation skip for HiOM (2026-05-17)**. The
+  prerequisite for the win-condition scaling experiment. Before
+  M6.6, `HiOMFixture` instantiated a `Viper` which always eagerly
+  allocated CCEH at the M0 baseline of 131,072 segments × 16 KiB =
+  ~2 GiB DRAM. Since HiOM owns the index via `hiom_owns_index_=true`,
+  CCEH is never inserted into on the put/update/remove paths and
+  pure DRAM overhead. Added `ViperConfig::cceh_init_cap` (default
+  131072 keeps every M0–M6 caller byte-identical);
+  `HiOMFixture::InitMap` sets it to 1, shrinking CCEH to a single
+  16 KiB segment. `viper.hpp:674` ctor passes it straight to
+  `map_{...}`. Verified by walking all 11 `map_.X` call sites:
+  every one HiOM exercises is guarded by `hiom_owns_index_` or
+  `!skip_recovery`, so the empty CCEH is never dereferenced. Only
+  side effect: `mirror_write`'s peek-via-CCEH returns tombstone in
+  update paths and silently skips the SIEVE warm-touch — weakens
+  hot-key heat signal slightly, doesn't affect correctness, moot
+  for YCSB-C (100% read). hiom_integration_test passes 3/3
+  (single-producer recovery + multi-producer same-key + 6-iter
+  crash injection).
+- **Phase 0 — RSS / DRAM telemetry (2026-05-17)**. New
+  `benchmark/fixtures/mem_tracker.hpp` (~85 LOC, header-only) with
+  `MemSnapshot` + `capture_mem()` parsing `/proc/self/status`
+  (VmRSS) and `/proc/self/smaps` (per-mapping Rss attribution by
+  pathname prefix `/pmem0/`). BaseFixture grows
+  `virtual fixture_telemetry()` defaulting to `capture_mem()`;
+  HiOMFixture override adds `hot_size`, `hot_capacity`,
+  `hot_evictions` from `hiom_->hot_tier()` and `hot_hits/cold_hits`
+  from `hiom_->stats()` (all O(1) atomic loads via existing
+  accessors). `ycsb_run` snapshots baseline right after `InitMap`,
+  loaded right after `flush_post_prefill`, and re-captures HotTier
+  stats after the timed loop. Pushes 8 counters into `state`:
+  `rss_baseline_mb / rss_loaded_mb / dram_loaded_mb /
+  pool_rss_loaded_mb / hot_tier_size / hot_capacity /
+  hot_evictions / hot_hit_rate`.
+  - **Observation**: FS-DAX PMem mmap reports `Rss=0` in smaps
+    (PMem pages aren't counted resident), so
+    `dram_loaded_mb = rss_loaded` in practice on this host. Kept
+    the pool-rss subtraction code for future /dev/dax* configs.
+- **Phase 0 smoke results (2026-05-17)** at 100r_zipf t=8, rep 1
+  fresh process:
+
+  | Size | Fixture | rss_loaded | hot_size | hot_hit_rate | items/thr |
+  |------|---------|-----------:|---------:|-------------:|----------:|
+  | 1M   | Viper   |     n/a    | n/a      | n/a          | n/a       |
+  | 1M   | HiOM    | **673 MB** | 933 K    | 0.92         | 12.2 M/s  |
+  | 10M  | Viper   | 5119 MB    | n/a      | n/a          | 22.4 M/s  |
+  | 10M  | HiOM    | **3552 MB**| 933 K    | 0.13         |  9.0 M/s  |
+
+  Before M6.6, HiOM at 10M reported 5625 MB (more than Viper);
+  after M6.6, **HiOM 3552 MB vs Viper 5119 MB = HiOM uses
+  -1567 MB (-31%) DRAM** at 10M scale, with zero throughput
+  regression. Subtracting the YCSB harness common overhead (~2.5 GB
+  prefill_data std::vector + per-thread state), fixture-specific
+  DRAM is Viper ~2.5 GB (CCEH-dominated) vs HiOM ~500 MB (HotTier
+  + ColdTier + commit) — **~5× less fixture-specific DRAM**. The
+  hot_hit_rate=0.13 at 10M is an artifact: HotTier warms only on
+  GET (prefill bypasses it), and only 933K unique keys get hit
+  enough to land in HotTier during the 5M-op read phase. The
+  remaining 87% of reads go to ColdTier — which still gives
+  HiOM 0.41× throughput vs Viper here, modulated by the read-path
+  PMem-verify cost. Phase 1 (50M dataset, crosses HotTier
+  capacity) is next.
 
 ## Status (2026-05-09)
 

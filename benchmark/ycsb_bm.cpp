@@ -26,6 +26,27 @@ using namespace viper::kv_bm;
 static constexpr char BASE_DIR[] = "/pmem0/ycsb_data";
 static constexpr char PREFILL_FILE[] = "/ycsb_prefill.dat";
 
+// Returns ".dat" or "_<TAG>.dat" depending on the YCSB_SIZE_TAG env var,
+// so the same ycsb_bm binary can target multiple dataset sizes by pointing
+// at differently-suffixed workload files (e.g. ycsb_prefill_50M.dat).
+// Used by both the workload-file path inside DEFINE_BM_WITH_ARGS and the
+// prefill-file path in main(). Env var is read once at construction and
+// cached in a static, so the suffix is stable across all benchmarks in a
+// single binary invocation.
+inline std::string ycsb_size_suffix() {
+    static const std::string suffix = [] {
+        if (const char* tag = std::getenv("YCSB_SIZE_TAG"); tag && *tag) {
+            return std::string{"_"} + tag;
+        }
+        return std::string{};
+    }();
+    return suffix;
+}
+
+inline std::string ycsb_workload_path(const char* workload) {
+    return std::string{BASE_DIR} + "/ycsb_wl_" + workload + ycsb_size_suffix() + ".dat";
+}
+
 #define GENERAL_ARGS \
             ->Repetitions(3) \
             ->Iterations(1) \
@@ -47,12 +68,12 @@ static constexpr char PREFILL_FILE[] = "/ycsb_prefill.dat";
 #define DEFINE_BM_WITH_ARGS(fixture, workload, data, ARGS) \
             BENCHMARK_TEMPLATE2_DEFINE_F(fixture, workload ## _tp, KeyType8, ValueType200)(benchmark::State& state) { \
                 ycsb_run(state, *this, &data, \
-                    std::string{BASE_DIR} + "/ycsb_wl_" #workload ".dat", false); \
+                    ycsb_workload_path(#workload), false); \
             } \
             BENCHMARK_REGISTER_F(fixture, workload ## _tp) ARGS;  \
             BENCHMARK_TEMPLATE2_DEFINE_F(fixture, workload ## _lat, KeyType8, ValueType200)(benchmark::State& state) { \
                 ycsb_run(state, *this, &data, \
-                    std::string{BASE_DIR} + "/ycsb_wl_" #workload ".dat", true); \
+                    ycsb_workload_path(#workload), true); \
             } \
             BENCHMARK_REGISTER_F(fixture, workload ## _lat) ARGS
 
@@ -196,7 +217,10 @@ ALL_BMS(HiOMFixture);
 
 int main(int argc, char** argv) {
     std::cout << "Prefilling data..." << std::endl;
-    std::filesystem::path prefill_file = BASE_DIR + std::string{PREFILL_FILE};
+    // YCSB_SIZE_TAG suffix applies to the prefill file too, mirroring
+    // ycsb_workload_path: ycsb_prefill_<TAG>.dat when set.
+    std::filesystem::path prefill_file =
+        std::string{BASE_DIR} + "/ycsb_prefill" + ycsb_size_suffix() + ".dat";
     ycsb::read_workload_file(prefill_file, &prefill_data);
 
     // Optional fast-iteration knob: cap prefill to N records via env var.
