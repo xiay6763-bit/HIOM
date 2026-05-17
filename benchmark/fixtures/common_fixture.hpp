@@ -54,6 +54,12 @@ class BaseFixture : public benchmark::Fixture {
     virtual void InitMap(const uint64_t num_prefill_inserts = 0, const bool re_init = true) {};
     virtual void DeInitMap() {};
 
+    // Hook called by ycsb_bm AFTER prefill_ycsb finishes (init thread only),
+    // BEFORE the timed read/mixed phase starts. Default no-op; HiOMFixture
+    // overrides this to drain its async commit buffer so the timed loop
+    // doesn't contend with the background flusher for PMem bandwidth.
+    virtual void flush_post_prefill() {}
+
     template <typename PrefillFn>
     void prefill_internal(size_t num_prefills, PrefillFn prefill_fn);
 

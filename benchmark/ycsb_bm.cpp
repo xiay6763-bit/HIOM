@@ -33,23 +33,39 @@ static constexpr char PREFILL_FILE[] = "/ycsb_prefill.dat";
             ->UseRealTime() \
             ->Threads(1)->Threads(4)->Threads(8)->Threads(16)->Threads(24)->Threads(32)->Threads(36)
 
-#define DEFINE_BM(fixture, workload, data) \
+// Read-only workloads (YCSB-C analog) use a narrower thread sweep: t=24
+// already saturates the read path at ~466 M ops/s aggregate, so 32/36
+// add cache-line ping-pong cost without showing a new story. The
+// 4-op grid in HIOM.md uses the same 1/8/24 axis.
+#define READ_ARGS \
+            ->Repetitions(3) \
+            ->Iterations(1) \
+            ->Unit(BM_TIME_UNIT) \
+            ->UseRealTime() \
+            ->Threads(1)->Threads(8)->Threads(24)
+
+#define DEFINE_BM_WITH_ARGS(fixture, workload, data, ARGS) \
             BENCHMARK_TEMPLATE2_DEFINE_F(fixture, workload ## _tp, KeyType8, ValueType200)(benchmark::State& state) { \
                 ycsb_run(state, *this, &data, \
                     std::string{BASE_DIR} + "/ycsb_wl_" #workload ".dat", false); \
             } \
-            BENCHMARK_REGISTER_F(fixture, workload ## _tp) GENERAL_ARGS;  \
+            BENCHMARK_REGISTER_F(fixture, workload ## _tp) ARGS;  \
             BENCHMARK_TEMPLATE2_DEFINE_F(fixture, workload ## _lat, KeyType8, ValueType200)(benchmark::State& state) { \
                 ycsb_run(state, *this, &data, \
                     std::string{BASE_DIR} + "/ycsb_wl_" #workload ".dat", true); \
             } \
-            BENCHMARK_REGISTER_F(fixture, workload ## _lat) GENERAL_ARGS
+            BENCHMARK_REGISTER_F(fixture, workload ## _lat) ARGS
+
+#define DEFINE_BM(fixture, workload, data)      DEFINE_BM_WITH_ARGS(fixture, workload, data, GENERAL_ARGS)
+#define DEFINE_READ_BM(fixture, workload, data) DEFINE_BM_WITH_ARGS(fixture, workload, data, READ_ARGS)
 
 #define ALL_BMS(fixture) \
             DEFINE_BM(fixture, 5050_uniform, data_uniform_50_50); \
             DEFINE_BM(fixture, 1090_uniform, data_uniform_10_90); \
             DEFINE_BM(fixture, 5050_zipf,    data_zipf_50_50); \
-            DEFINE_BM(fixture, 1090_zipf,    data_zipf_10_90)
+            DEFINE_BM(fixture, 1090_zipf,    data_zipf_10_90); \
+            DEFINE_READ_BM(fixture, 100r_uniform, data_uniform_100r); \
+            DEFINE_READ_BM(fixture, 100r_zipf,    data_zipf_100r)
 
 
 static std::vector<ycsb::Record> prefill_data;
@@ -57,6 +73,8 @@ static std::vector<ycsb::Record> data_uniform_50_50;
 static std::vector<ycsb::Record> data_uniform_10_90;
 static std::vector<ycsb::Record> data_zipf_50_50;
 static std::vector<ycsb::Record> data_zipf_10_90;
+static std::vector<ycsb::Record> data_uniform_100r;
+static std::vector<ycsb::Record> data_zipf_100r;
 
 void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::Record>* data,
               const std::filesystem::path& wl_file, bool log_latency) {
@@ -65,6 +83,11 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
     if (is_init_thread(state)) {
         fixture.InitMap();
         fixture.prefill_ycsb(prefill_data);
+        // Drain any async post-prefill work (e.g., HiOM commit buffer)
+        // before the timed phase starts so steady-state reads don't
+        // contend with background flushers for PMem bandwidth. Default
+        // is a no-op for fixtures with synchronous write paths.
+        fixture.flush_post_prefill();
         if (data->empty()) {
             std::cout << "Reading workload file: " << wl_file << std::endl;
             ycsb::read_workload_file(wl_file, data);
@@ -168,6 +191,10 @@ int main(int argc, char** argv) {
 
     std::string exec_name = argv[0];
     const std::string arg = get_output_file("ycsb/ycsb");
-    return bm_main({exec_name, arg});
+    // Forward command-line flags (--benchmark_filter, --benchmark_repetitions,
+    // etc.) so filtering works. all_ops_benchmark does the same.
+    std::vector<std::string> args{exec_name, arg};
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    return bm_main(std::move(args));
 //    return bm_main({exec_name});
 }

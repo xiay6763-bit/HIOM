@@ -12,7 +12,7 @@ YCSB_DIR="${BASE_DIR}/ycsb-0.17.0"
 DATA_DIR="/pmem0/ycsb_data"
 
 PREFILL_CONF="${BASE_DIR}/config/ycsb_prefill.conf"
-CONFIGS=( "5050_uniform" "5050_zipf" "1090_uniform" "1090_zipf" )
+CONFIGS=( "5050_uniform" "5050_zipf" "1090_uniform" "1090_zipf" "100r_uniform" "100r_zipf" )
 
 # 确保目录存在
 mkdir -p "${DATA_DIR}"

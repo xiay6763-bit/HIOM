@@ -10,6 +10,98 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
+## Status (2026-05-17)
+
+- **YCSB read-heavy gap closed by `flush_post_prefill`**. Adding YCSB-C
+  (100% read, both uniform and zipfian) to the eval matrix surfaced a
+  surprise: at 10M-record scale HiOM/Viper read ratio came in at
+  **0.27-0.33×** — completely inverse to the 4-op grid's 1.04-1.06× at
+  1M+KeyType16. Two experiments isolated the dominant factor:
+  - **Step 1** (recordcount=1M, regenerated YCSB workload so the
+    keyspace matched the prefill): ratio only marginally better
+    (0.28-0.56×). Working-set L3 fit is *not* the dominant factor at
+    t=1; the structural per-op cost is.
+  - **Step 2** (add `flush_post_prefill()` hook in
+    `BaseFixture` / `HiOMFixture` so the timed read phase doesn't
+    contend with the background flusher's PMem writes still draining
+    the 10M-entry prefill): ratio jumps to **0.27-0.58×** across the
+    grid, with the biggest wins on t=1 / t=8 zipf where flusher
+    contention bit hardest. Final 10M-scale numbers
+    (`/tmp/ycsb_100r_flushonly_run.log`, 3-rep median, per-thread
+    items/s):
+
+    | workload | t=1 V/H (ratio) | t=8 V/H (ratio) | t=24 V/H (ratio) |
+    |----------|-----------------|-----------------|------------------|
+    | 100r_uniform | 2.42 M / 997 K (**0.41×**) | 14.51 M / 7.44 M (**0.51×**) | 32.41 M / 11.98 M (0.37×) |
+    | 100r_zipf    | 2.92 M / 1.47 M (**0.50×**) | 17.65 M / 10.15 M (**0.58×**) | 48.71 M / 12.96 M (0.27×) |
+
+    Compare to pre-fix: 100r_zipf t=1 was 0.27×, t=8 was 0.32× — the
+    flush-before-timed-loop change closed those gaps by **+85% / +81%
+    relative**. t=24 stays flat because at 24-way aggregate read
+    throughput (~466 M ops/s) even the flusher's writes can't move
+    the needle.
+- **Why `flush_post_prefill` matters (mechanism)**. `prefill_ycsb`
+  pushes 10M kPut entries through HiOM's commit buffer. The
+  background flusher needs ~1-2 s to drain them into ColdTier (PMem
+  writes ~9 GB/s ÷ ~16 B/entry × 4 flushers ≈ 8 M entries/s). If the
+  timed read phase starts before the drain finishes, HiOM's per-hit
+  PMem reads (for verify and value) and the flusher's PMem writes
+  contend on the same Optane DIMM write-buffer queue. Viper has no
+  async flusher so the baseline pays nothing here. Adding a single
+  `flush_and_wait()` between `prefill_ycsb` and the timed loop makes
+  the steady-state measurement what readers care about.
+- **Inline-K HotTier attempt — landed and then reverted (2026-05-17)**.
+  Hypothesis was that the 100r gap came from HotTier's mandatory
+  PM-verify on hit (the 8-byte slot only carries fp32+offset, no key,
+  so every hit reads PMem just to confirm fp32 wasn't a 1/2^32
+  collision). Implemented `template <typename K> class HotTier`
+  with a parallel `BucketKeys[K kSlotsPerBucket]` array, K-aware
+  `lookup(K, fp)` / `upsert(K, fp, off)` / `upsert_pinned(K, fp, off)`.
+  K stored *after* successful CAS on packed using release semantics.
+  - `hot_tier_test` and `hiom_integration_test` initially PASS;
+    YCSB 100r at 10M-scale ratios improved only marginally
+    (0.27-0.33× → 0.28-0.35×). all_ops_bm get at K16+1M ratio
+    preserved (1.05-1.10×). Microbench at 200K (L3 fit) went from
+    1.04× (pre-change baseline) to 0.96× (slight regression from
+    extra cache line load for keys array).
+  - Then the multi-producer correctness test went **flaky** under
+    repeat: 5/5 runs failed with `pm_key_mismatch` ranging 0-42
+    and `missed` 0-15. Root cause: when two writers concurrently
+    insert distinct keys into the same previously-occupied slot,
+    the post-CAS K-write window allows the second writer to see
+    stale K under the first writer's new fp → second writer skips
+    the slot (treating it as fp32 collision) and inserts elsewhere,
+    leaving **two HotTier slots for the same key** (stale-off slot
+    1 and new-off slot 2). Readers can hit either depending on
+    scan order, returning stale values.
+  - The correct fix is DCAS (`cmpxchg16b` on a 16-byte
+    `{K, packed}` slot for K=8B), which is a larger surface
+    change. Reverted hot_tier.hpp / hiom.hpp / commit_buffer.hpp /
+    hot_tier_test.cpp / hiom_integration_test.cpp; kept
+    `flush_post_prefill` since it's the actual win.
+  - Lesson: inline-K's theoretical benefit (skip per-hit PMem
+    verify) is small in practice because for KeyType8+ValueType200
+    the key occupies the same cache line as the value's first 56 B,
+    so the PMem read can't be shortened. The real per-op savings
+    is ~10-20 ns of pm_key copy + compare — not the 70-300 ns I
+    estimated upfront. The race added by post-CAS K-write isn't
+    worth the marginal win.
+- **YCSB workload matrix** now includes **6 workloads** in
+  `benchmark/config/`: `5050_uniform`, `5050_zipf`, `1090_uniform`,
+  `1090_zipf` (existing), plus **`100r_uniform`** and **`100r_zipf`**
+  (new, YCSB-C analog). The latter use a separate `READ_ARGS` macro
+  in `ycsb_bm.cpp` that registers only t=1/8/24 (vs `GENERAL_ARGS`'s
+  full 1/4/8/16/24/32/36 sweep) since 100% reads at t=24 already
+  saturate the read path. `generate_ycsb.sh` `CONFIGS` array
+  extended; raw YCSB data at `/pmem0/ycsb_data/ycsb_wl_100r_*.dat`
+  (1.06 GB each, 5 M READ records).
+- **`HotTier` default capacity bumped to 2^21 buckets** in
+  `HiOMFixture` (was 2^18 = 4 M slots; now 33 M slots, 256 MB DRAM).
+  The 4 M default was undersized for YCSB's 10 M prefill — at 28%
+  load factor the original 4 M would have hit eviction churn during
+  prefill. The bump preserves the steady-state hot-resident
+  invariant assumed by the paper's read story.
+
 ## Status (2026-05-09)
 
 - **Phase**: M0 ✅; M1 functionally complete except EBR (closed by

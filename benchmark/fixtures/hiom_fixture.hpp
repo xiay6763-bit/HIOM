@@ -74,6 +74,14 @@ class HiOMFixture : public BaseFixture {
                       const std::vector<ycsb::Record>& data,
                       hdr_histogram* hdr) final;
 
+    // Drains the HiOM commit buffer and joins the flusher's outstanding
+    // work so the timed YCSB read phase doesn't contend with PMem write
+    // traffic from the flusher. Called by ycsb_bm's ycsb_run after
+    // prefill_ycsb finishes (init thread only).
+    void flush_post_prefill() final {
+        if (hiom_) hiom_->flush_and_wait();
+    }
+
     HiOMT* getHiom() { return hiom_.get(); }
     ViperT* getViper() { return viper_.get(); }
 
@@ -106,11 +114,13 @@ class HiOMFixture : public BaseFixture {
     std::unique_ptr<HiOMT> hiom_;
     bool initialized_ = false;
 
-    // 2^18 buckets × 16 slots = 4M HotTier slots, ~36 MB DRAM. The
-    // ALL_OPS suite typically runs (prefill=1M, op=1M) = 2M live keys,
-    // so 2× that fits without SIEVE eviction churn. Override via
-    // SetHotTierBuckets() to exercise the eviction path explicitly.
-    std::size_t hot_buckets_pow2_ = (1ULL << 18);
+    // 2^21 buckets × 16 slots = 33 M HotTier slots, ~256 MB DRAM. The
+    // ALL_OPS suite runs (prefill=1M, op=1M) = 2 M live keys, plenty of
+    // headroom; YCSB prefills 10 M and the 5050/1090 mixes add up to
+    // ~5 M inserts ⇒ ~15 M working set — 2× margin so reads stay
+    // HotTier-resident instead of falling through to ColdTier PMem.
+    // Override via SetHotTierBuckets() to exercise eviction explicitly.
+    std::size_t hot_buckets_pow2_ = (1ULL << 21);
     std::uint64_t checkpoint_cadence_ = 4096;
 };
 
