@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "../benchmark.hpp"
+#include "mem_tracker.hpp"
 #include "ycsb_common.hpp"
 
 namespace viper::kv_bm {
@@ -59,6 +60,14 @@ class BaseFixture : public benchmark::Fixture {
     // overrides this to drain its async commit buffer so the timed loop
     // doesn't contend with the background flusher for PMem bandwidth.
     virtual void flush_post_prefill() {}
+
+    // Returns a memory snapshot for telemetry reporting. Default captures
+    // process-wide RSS + the /pmem0 pool RSS share. HiOMFixture overrides
+    // to additionally fill in HotTier size / capacity / evictions and
+    // hot/cold hit counters from hiom_->stats() — zero extra cost since
+    // those accessors already exist. Non-const so overrides can call
+    // hiom_->hot_tier() which returns a non-const reference.
+    virtual MemSnapshot fixture_telemetry() { return capture_mem(); }
 
     template <typename PrefillFn>
     void prefill_internal(size_t num_prefills, PrefillFn prefill_fn);

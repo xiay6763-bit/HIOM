@@ -80,14 +80,22 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
               const std::filesystem::path& wl_file, bool log_latency) {
     set_cpu_affinity(state.thread_index());
 
+    // Init-thread-only snapshots, kept at outer scope so the post-timed
+    // init-thread block can read them. Worker threads allocate these
+    // locally but never touch them.
+    MemSnapshot mem_baseline{};
+    MemSnapshot mem_loaded{};
+
     if (is_init_thread(state)) {
         fixture.InitMap();
+        mem_baseline = fixture.fixture_telemetry();
         fixture.prefill_ycsb(prefill_data);
         // Drain any async post-prefill work (e.g., HiOM commit buffer)
         // before the timed phase starts so steady-state reads don't
         // contend with background flushers for PMem bandwidth. Default
         // is a no-op for fixtures with synchronous write paths.
         fixture.flush_post_prefill();
+        mem_loaded = fixture.fixture_telemetry();
         if (data->empty()) {
             std::cout << "Reading workload file: " << wl_file << std::endl;
             ycsb::read_workload_file(wl_file, data);
@@ -152,6 +160,19 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
             // hdr_percentiles_print(global_hdr, stdout, 3, 1.0, CLASSIC);
             hdr_close(global_hdr);
         }
+
+        // Re-capture HotTier stats after the timed loop — eviction_count,
+        // hot_hits/cold_hits all moved during the run. RSS may also have
+        // grown if CCEH split a segment. Merge HotTier deltas into the
+        // post-prefill `mem_loaded` snapshot before reporting.
+        MemSnapshot mem_final = fixture.fixture_telemetry();
+        mem_loaded.hot_size = mem_final.hot_size;
+        mem_loaded.hot_evictions = mem_final.hot_evictions;
+        mem_loaded.hot_hits = mem_final.hot_hits;
+        mem_loaded.cold_hits = mem_final.cold_hits;
+        mem_loaded.rss_kb = mem_final.rss_kb;
+        mem_loaded.pool_rss_kb = mem_final.pool_rss_kb;
+        report_mem(state, mem_baseline, mem_loaded);
 
         fixture.DeInitMap();
     }

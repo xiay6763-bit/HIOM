@@ -76,6 +76,16 @@ struct ViperConfig {
     // the HiOM read path which is unaffected (M3 Phase D retired
     // CCEH on read). Full write-path retirement is M6.6.
     bool skip_recovery = false;
+    // M6.6: initial capacity for the CCEH directory. Default 131072
+    // (= 131,072 segments × 16 KB = 2 GiB eager DRAM, the M0 baseline
+    // sized to absorb every key without segment splits). HiOM callers
+    // that own the index via set_hiom_owns_index(true) can pass a
+    // tiny value (e.g. 1) so map_ allocates only one 16 KB segment —
+    // map_ remains constructed (so all Client paths compile and run
+    // for the non-HiOM-owned branches) but its DRAM cost drops from
+    // ~2 GB to ~16 KB. The legacy fallback paths (M0 caller without
+    // HiOM) still see the M0 default unless they explicitly opt in.
+    size_t cceh_init_cap = 131072;
 };
 
 namespace internal {
@@ -661,7 +671,7 @@ std::unique_ptr<Viper<K, V>> Viper<K, V>::open(const std::string& pool_file, Vip
 
 template <typename K, typename V>
 Viper<K, V>::Viper(ViperBase v_base, const std::filesystem::path pool_dir, const bool owns_pool, const ViperConfig v_config) :
-    v_base_{v_base}, map_{131072}, owns_pool_{owns_pool}, v_config_{v_config}, pool_dir_{pool_dir},
+    v_base_{v_base}, map_{v_config.cceh_init_cap}, owns_pool_{owns_pool}, v_config_{v_config}, pool_dir_{pool_dir},
     resize_threshold_{v_config.resize_threshold}, reclaim_threshold_{v_config.reclaim_threshold},
     num_recovery_threads_{v_config.num_recovery_threads} {
     current_block_page_ = 0;
