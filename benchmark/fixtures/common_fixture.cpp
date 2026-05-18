@@ -80,7 +80,7 @@ void BaseFixture::prefill(const size_t num_prefills) {
 void BaseFixture::prefill_ycsb(const std::vector<ycsb::Record>& data) {
     const size_t num_prefills = data.size();
     auto prefill_fn = [&](const size_t start, const size_t end) {
-        this->run_ycsb(start, end, data, nullptr);
+        this->run_ycsb(start, end, data, LatencyHistograms{});
     };
 
     prefill_internal(num_prefills, prefill_fn);

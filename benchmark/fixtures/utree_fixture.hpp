@@ -28,7 +28,7 @@ class UTreeFixture : public BaseFixture {
     uint64_t setup_and_find(uint64_t start_idx, uint64_t end_idx, uint64_t num_finds);
     uint64_t setup_and_delete(uint64_t start_idx, uint64_t end_idx, uint64_t num_deletes);
     uint64_t run_ycsb(uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data,
-                      hdr_histogram* hdr) final;
+                      LatencyHistograms hdrs) final;
     uint64_t insert(uint64_t start_idx, uint64_t end_idx) final;
     void prefill_ycsb(const std::vector<ycsb::Record>& data) override;
 
@@ -151,13 +151,15 @@ uint64_t UTreeFixture<std::string, std::string>::setup_and_delete(uint64_t, uint
 
 
 template <typename KeyT, typename ValueT>
-uint64_t UTreeFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t, const std::vector<ycsb::Record>&, hdr_histogram*) {
+uint64_t UTreeFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t, const std::vector<ycsb::Record>&, LatencyHistograms) {
     throw std::runtime_error{"YCSB not implemented for non-ycsb key/value types."};
 }
 
 template <>
 uint64_t UTreeFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
-    uint64_t end_idx, const std::vector<ycsb::Record>& data, hdr_histogram* hdr) {
+    uint64_t end_idx, const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) {
+    // Single-HDR fallback for non-active fixtures (Viper/HiOM do per-op split).
+    hdr_histogram* hdr = hdrs.write ? hdrs.write : hdrs.read;
 #ifdef YCSB_BM
     ValueType200 value;
     const ValueType200 null_value{0ul};

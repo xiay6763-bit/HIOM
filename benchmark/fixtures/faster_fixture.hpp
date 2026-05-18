@@ -27,7 +27,7 @@ class FasterFixture : public BaseFixture {
     uint64_t setup_and_update(uint64_t start_idx, uint64_t end_idx, uint64_t num_updates) final;
 
     uint64_t run_ycsb(uint64_t start_idx, uint64_t end_idx,
-                     const std::vector<ycsb::Record>& data, hdr_histogram* hdr) final;
+                     const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) final;
 
     virtual std::string get_base_dir() = 0;
     virtual bool is_nvm_log() { return false; };
@@ -731,13 +731,15 @@ uint64_t FasterFixture<std::string, std::string>::setup_and_delete(uint64_t, uin
 
 template <typename KeyT, typename ValueT>
 uint64_t FasterFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t,
-    const std::vector<ycsb::Record>&, hdr_histogram*) {
+    const std::vector<ycsb::Record>&, LatencyHistograms) {
     throw std::runtime_error{"YCSB not implemented for non-ycsb key/value types."};
 }
 
 template <>
 uint64_t FasterFixture<KeyType8, ValueType200>::run_ycsb(
-    uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data, hdr_histogram* hdr) {
+    uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) {
+    // Single-HDR fallback for non-active fixtures (Viper/HiOM do per-op split).
+    hdr_histogram* hdr = hdrs.write ? hdrs.write : hdrs.read;
     uint64_t op_count = 0;
 
     db_->StartSession();

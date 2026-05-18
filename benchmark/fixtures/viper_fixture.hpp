@@ -29,7 +29,7 @@ class ViperFixture : public BaseFixture {
     uint64_t setup_and_get_update(uint64_t start_idx, uint64_t end_idx, uint64_t num_updates);
 
     uint64_t run_ycsb(uint64_t start_idx, uint64_t end_idx,
-        const std::vector<ycsb::Record>& data, hdr_histogram* hdr) final;
+        const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) final;
 
     ViperT* getViper() {
         return viper_.get();
@@ -241,35 +241,46 @@ uint64_t ViperFixture<std::string, std::string>::setup_and_get_update(uint64_t, 
 }
 
 template <typename KeyT, typename ValueT>
-uint64_t ViperFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t, const std::vector<ycsb::Record>&, hdr_histogram*) {
+uint64_t ViperFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t, const std::vector<ycsb::Record>&, LatencyHistograms) {
     throw std::runtime_error{"YCSB not implemented for non-ycsb key/value types."};
 }
 
 template <>
 uint64_t ViperFixture<KeyType8, ValueType200>::run_ycsb(
-    uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data, hdr_histogram* hdr) {
+    uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) {
     uint64_t op_count = 0;
     auto v_client = viper_->get_client();
     ValueType200 value;
     const ValueType200 null_value{0ul};
 
+    const bool log_latency = (hdrs.read != nullptr || hdrs.write != nullptr);
     std::chrono::high_resolution_clock::time_point start;
     for (int op_num = start_idx; op_num < end_idx; ++op_num) {
         const ycsb::Record& record = data[op_num];
 
-        if (hdr != nullptr) {
+        if (log_latency) {
             start = std::chrono::high_resolution_clock::now();
         }
 
+        // Route latency sample by op semantics: GET → read tail,
+        // INSERT/UPDATE → write tail. Mixed workloads need this
+        // separation because write tail is dominated by CCEH segment
+        // splits / PMem flush whereas read tail is index lookup; a
+        // merged CDF blurs both. 100% read or 100% write workloads
+        // are unaffected (one histogram stays empty and is dropped
+        // by the JSON emitter).
+        hdr_histogram* op_hdr = nullptr;
         switch (record.op) {
             case ycsb::Record::Op::INSERT: {
                 v_client.put(record.key, record.value);
                 op_count++;
+                op_hdr = hdrs.write;
                 break;
             }
             case ycsb::Record::Op::GET: {
                 const bool found = v_client.get(record.key, &value);
                 op_count += found && (value != null_value);
+                op_hdr = hdrs.read;
                 break;
             }
             case ycsb::Record::Op::UPDATE: {
@@ -278,6 +289,7 @@ uint64_t ViperFixture<KeyType8, ValueType200>::run_ycsb(
                     internal::pmem_persist(value->data.data(), sizeof(uint64_t));
                 };
                 op_count += v_client.update(record.key, update_fn);
+                op_hdr = hdrs.write;
                 break;
             }
             default: {
@@ -285,14 +297,13 @@ uint64_t ViperFixture<KeyType8, ValueType200>::run_ycsb(
             }
         }
 
-
-        if (hdr == nullptr) {
+        if (!log_latency || op_hdr == nullptr) {
             continue;
         }
 
         const auto end = std::chrono::high_resolution_clock::now();
         const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-        hdr_record_value(hdr, duration.count());
+        hdr_record_value(op_hdr, duration.count());
     }
 
     return op_count;

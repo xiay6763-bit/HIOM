@@ -32,7 +32,7 @@ public:
     uint64_t setup_and_update(uint64_t start_idx, uint64_t end_idx, uint64_t num_updates) final;
 
     uint64_t run_ycsb(uint64_t start_idx, uint64_t end_idx,
-                      const std::vector<ycsb::Record>& data, hdr_histogram* hdr) final;
+                      const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) final;
 
 protected:
     std::unique_ptr<DramMapType> dram_map_;
@@ -132,13 +132,15 @@ uint64_t TbbFixture<KeyT, ValueT>::setup_and_delete(uint64_t start_idx, uint64_t
 }
 
 template <typename KeyT, typename ValueT>
-uint64_t TbbFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t, const std::vector<ycsb::Record>&, hdr_histogram*) {
+uint64_t TbbFixture<KeyT, ValueT>::run_ycsb(uint64_t, uint64_t, const std::vector<ycsb::Record>&, LatencyHistograms) {
     throw std::runtime_error{"YCSB not implemented for non-ycsb key/value types."};
 }
 
 template <>
 uint64_t TbbFixture<KeyType8, ValueType200>::run_ycsb(
-        uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data, hdr_histogram* hdr) {
+        uint64_t start_idx, uint64_t end_idx, const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) {
+    // Single-HDR fallback for non-active fixtures (Viper/HiOM do per-op split).
+    hdr_histogram* hdr = hdrs.write ? hdrs.write : hdrs.read;
     uint64_t op_count = 0;
     for (int op_num = start_idx; op_num < end_idx; ++op_num) {
         const ycsb::Record& record = data[op_num];

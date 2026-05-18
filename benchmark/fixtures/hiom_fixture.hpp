@@ -72,7 +72,7 @@ class HiOMFixture : public BaseFixture {
 
     uint64_t run_ycsb(uint64_t start_idx, uint64_t end_idx,
                       const std::vector<ycsb::Record>& data,
-                      hdr_histogram* hdr) final;
+                      LatencyHistograms hdrs) final;
 
     // Drains the HiOM commit buffer and joins the flusher's outstanding
     // work so the timed YCSB read phase doesn't contend with PMem write
@@ -302,7 +302,7 @@ uint64_t HiOMFixture<KeyT, ValueT>::setup_and_update(uint64_t start_idx,
 template <typename KeyT, typename ValueT>
 uint64_t HiOMFixture<KeyT, ValueT>::run_ycsb(
     uint64_t /*start_idx*/, uint64_t /*end_idx*/,
-    const std::vector<ycsb::Record>& /*data*/, hdr_histogram* /*hdr*/) {
+    const std::vector<ycsb::Record>& /*data*/, LatencyHistograms /*hdrs*/) {
     throw std::runtime_error{
         "YCSB not implemented for non-(KeyType8, ValueType200) HiOM."};
 }
@@ -311,29 +311,33 @@ uint64_t HiOMFixture<KeyT, ValueT>::run_ycsb(
 template <>
 inline uint64_t HiOMFixture<KeyType8, ValueType200>::run_ycsb(
     uint64_t start_idx, uint64_t end_idx,
-    const std::vector<ycsb::Record>& data, hdr_histogram* hdr) {
+    const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) {
     auto cl = hiom_->get_client();
     ValueType200 value;
     const ValueType200 null_value{0ul};
 
+    const bool log_latency = (hdrs.read != nullptr || hdrs.write != nullptr);
     uint64_t op_count = 0;
     std::chrono::high_resolution_clock::time_point start;
     for (uint64_t op_num = start_idx; op_num < end_idx; ++op_num) {
         const ycsb::Record& record = data[op_num];
 
-        if (hdr != nullptr) {
+        if (log_latency) {
             start = std::chrono::high_resolution_clock::now();
         }
 
+        hdr_histogram* op_hdr = nullptr;
         switch (record.op) {
             case ycsb::Record::Op::INSERT: {
                 cl.put(record.key, record.value);
                 ++op_count;
+                op_hdr = hdrs.write;
                 break;
             }
             case ycsb::Record::Op::GET: {
                 const bool found = cl.get(record.key, &value);
                 op_count += found && (value != null_value);
+                op_hdr = hdrs.read;
                 break;
             }
             case ycsb::Record::Op::UPDATE: {
@@ -343,6 +347,7 @@ inline uint64_t HiOMFixture<KeyType8, ValueType200>::run_ycsb(
                         v->data.data(), sizeof(uint64_t));
                 };
                 op_count += cl.update(record.key, update_fn);
+                op_hdr = hdrs.write;
                 break;
             }
             default: {
@@ -352,11 +357,11 @@ inline uint64_t HiOMFixture<KeyType8, ValueType200>::run_ycsb(
             }
         }
 
-        if (hdr == nullptr) continue;
+        if (!log_latency || op_hdr == nullptr) continue;
         const auto end = std::chrono::high_resolution_clock::now();
         const auto duration
             = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-        hdr_record_value(hdr, duration.count());
+        hdr_record_value(op_hdr, duration.count());
     }
     return op_count;
 }

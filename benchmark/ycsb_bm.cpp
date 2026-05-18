@@ -136,13 +136,17 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
             }
         }
         hdr_init(1, 1000000000, 4, &fixture.hdr_);
+        hdr_init(1, 1000000000, 4, &fixture.hdr_read_);
+        hdr_init(1, 1000000000, 4, &fixture.hdr_write_);
     }
 
-    struct hdr_histogram* hdr;
+    struct hdr_histogram* hdr_read = nullptr;
+    struct hdr_histogram* hdr_write = nullptr;
+    struct hdr_histogram* hdr_all = nullptr;
     if (log_latency) {
-        hdr_init(1, 1000000000, 4, &hdr);
-    } else {
-        hdr = nullptr;
+        hdr_init(1, 1000000000, 4, &hdr_read);
+        hdr_init(1, 1000000000, 4, &hdr_write);
+        hdr_init(1, 1000000000, 4, &hdr_all);
     }
 
     uint64_t start_idx = 0;
@@ -156,30 +160,62 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
         end_idx = start_idx + num_ops_per_thread;
 
         // Actual benchmark
-        op_counter = fixture.run_ycsb(start_idx, end_idx, *data, hdr);
+        op_counter = fixture.run_ycsb(start_idx, end_idx, *data,
+                                       LatencyHistograms{hdr_read, hdr_write});
 
         state.SetItemsProcessed(num_ops_per_thread);
         if (log_latency) {
-            fixture.merge_hdr(hdr);
-            hdr_close(hdr);
+            // Aggregated HDR for legacy single-tail metrics; read+write
+            // separately for the new mixed-workload tail breakdown.
+            if (hdr_read) hdr_add(hdr_all, hdr_read);
+            if (hdr_write) hdr_add(hdr_all, hdr_write);
+            fixture.merge_hdr(hdr_all);
+            fixture.merge_hdr_read(hdr_read);
+            fixture.merge_hdr_write(hdr_write);
+            hdr_close(hdr_read);
+            hdr_close(hdr_write);
+            hdr_close(hdr_all);
         }
     }
 
     if (is_init_thread(state)) {
         if (log_latency) {
+            auto emit = [&](const char* prefix, hdr_histogram* h) {
+                state.counters[std::string(prefix) + "max"] = hdr_max(h);
+                state.counters[std::string(prefix) + "avg"] = hdr_mean(h);
+                state.counters[std::string(prefix) + "min"] = hdr_min(h);
+                state.counters[std::string(prefix) + "std"] = hdr_stddev(h);
+                state.counters[std::string(prefix) + "median"]
+                    = hdr_value_at_percentile(h, 50.0);
+                state.counters[std::string(prefix) + "90"]
+                    = hdr_value_at_percentile(h, 90.0);
+                state.counters[std::string(prefix) + "95"]
+                    = hdr_value_at_percentile(h, 95.0);
+                state.counters[std::string(prefix) + "99"]
+                    = hdr_value_at_percentile(h, 99.0);
+                state.counters[std::string(prefix) + "999"]
+                    = hdr_value_at_percentile(h, 99.9);
+                state.counters[std::string(prefix) + "9999"]
+                    = hdr_value_at_percentile(h, 99.99);
+            };
             hdr_histogram* global_hdr = fixture.get_hdr();
-            state.counters["hdr_max"] = hdr_max(global_hdr);
-            state.counters["hdr_avg"] = hdr_mean(global_hdr);
-            state.counters["hdr_min"] = hdr_min(global_hdr);
-            state.counters["hdr_std"] = hdr_stddev(global_hdr);
-            state.counters["hdr_median"] = hdr_value_at_percentile(global_hdr, 50.0);
-            state.counters["hdr_90"] = hdr_value_at_percentile(global_hdr, 90.0);
-            state.counters["hdr_95"] = hdr_value_at_percentile(global_hdr, 95.0);
-            state.counters["hdr_99"] = hdr_value_at_percentile(global_hdr, 99.0);
-            state.counters["hdr_999"] = hdr_value_at_percentile(global_hdr, 99.9);
-            state.counters["hdr_9999"] = hdr_value_at_percentile(global_hdr, 99.99);
-            // hdr_percentiles_print(global_hdr, stdout, 3, 1.0, CLASSIC);
+            hdr_histogram* global_hdr_read = fixture.get_hdr_read();
+            hdr_histogram* global_hdr_write = fixture.get_hdr_write();
+            emit("hdr_", global_hdr);
+            // Skip emitting read/write percentile rows when that
+            // category has zero samples (e.g., 100r workloads have no
+            // writes); the percentile getters return 0 for empty
+            // histograms which would pollute the JSON with misleading
+            // zeros.
+            if (global_hdr_read->total_count > 0) {
+                emit("hdr_read_", global_hdr_read);
+            }
+            if (global_hdr_write->total_count > 0) {
+                emit("hdr_write_", global_hdr_write);
+            }
             hdr_close(global_hdr);
+            hdr_close(global_hdr_read);
+            hdr_close(global_hdr_write);
         }
 
         // Re-capture HotTier stats after the timed loop — eviction_count,

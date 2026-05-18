@@ -47,6 +47,19 @@ using VarSizeKVs = std::pair<std::vector<std::string>, std::vector<std::string>>
 
 void zero_block_device(const std::string& block_dev, size_t length);
 
+// Pair of HDR histograms used for split read/write tail-latency
+// reporting in YCSB benchmarks. Mixed workloads (5050, 1090, YCSB-A,
+// YCSB-B) want read tail separated from write tail because flusher
+// back-pressure hits writes but not cache-resident reads — a single
+// merged CDF would smear two physically different distributions and
+// hide the precise claim ("HiOM read p99 stays flat under mixed
+// load"). Aggregated `hdr_all` is retained for legacy callers and
+// 100% read/write workloads where the split is meaningless.
+struct LatencyHistograms {
+    hdr_histogram* read = nullptr;
+    hdr_histogram* write = nullptr;
+};
+
 class BaseFixture : public benchmark::Fixture {
   public:
     void SetUp(benchmark::State& state) override {}
@@ -84,7 +97,7 @@ class BaseFixture : public benchmark::Fixture {
     virtual uint64_t setup_and_delete(uint64_t start_idx, uint64_t end_idx, uint64_t num_deletes) = 0;
 
     virtual uint64_t run_ycsb(uint64_t start_idx, uint64_t end_idx,
-                              const std::vector<ycsb::Record>& data, hdr_histogram* hdr) {
+                              const std::vector<ycsb::Record>& data, LatencyHistograms hdrs) {
         throw std::runtime_error("YCSB not implemented");
     }
 
@@ -92,9 +105,21 @@ class BaseFixture : public benchmark::Fixture {
         std::lock_guard lock{hdr_lock_};
         hdr_add(hdr_, other);
     }
+    void merge_hdr_read(hdr_histogram* other) {
+        std::lock_guard lock{hdr_lock_};
+        hdr_add(hdr_read_, other);
+    }
+    void merge_hdr_write(hdr_histogram* other) {
+        std::lock_guard lock{hdr_lock_};
+        hdr_add(hdr_write_, other);
+    }
 
     hdr_histogram* get_hdr() { return hdr_; }
-    hdr_histogram* hdr_ = nullptr;
+    hdr_histogram* get_hdr_read() { return hdr_read_; }
+    hdr_histogram* get_hdr_write() { return hdr_write_; }
+    hdr_histogram* hdr_ = nullptr;        // Aggregated (legacy).
+    hdr_histogram* hdr_read_ = nullptr;   // Read-only latency.
+    hdr_histogram* hdr_write_ = nullptr;  // Insert+Update latency.
 
     static void log_find_count(benchmark::State& state, const uint64_t num_found, const uint64_t num_expected);
 
