@@ -1,54 +1,123 @@
 #!/usr/bin/env bash
 #
-# Phase 2 — full scaling sweep driver.
+# Phase 2 + Phase 3 scaling sweep driver.
 #
-# For each (dataset_size, workload, fixture) combination, runs ycsb_bm
-# in a fresh process so the RSS baseline isn't polluted by the
-# previous fixture's CCEH/heap residue. Each process exercises
-# 3 reps × 3 thread counts = 9 timed runs per invocation.
+# Matrix (after the 2026-05-18 expansion):
+#   sizes       4   (5/10/16/33 M — 50 M dropped: HiOM hangs on prefill
+#                    back-pressure beyond the HotTier 33.5 M capacity)
+#   workloads   6   (100r_zipf, 100r_uniform — read-only baseline;
+#                    a_zipf, a_uniform — standard YCSB-A 50/50 read+update;
+#                    b_zipf, b_uniform — standard YCSB-B 95/5 read+update)
+#   fixtures    2   (ViperFixture, HiOMFixture)
+#   metrics     2   (_tp throughput, _lat tail-latency via HDR — emits
+#                    hdr_read_* and hdr_write_* separately so mixed
+#                    workloads get the read vs write CDF split)
+#   threads     3   (1, 8, 24 — same Google Benchmark filter as Phase 2)
+#   reps        3   (--benchmark_repetitions=3, hardcoded in DEFINE_BM)
 #
-# Outputs JSON to /root/viper/results/scaling/.
+# = 4 × 6 × 2 × 2 = 96 ycsb_bm invocations; each ~15-25 min wall =>
+# ~24-40 h sequential. Resumable via the "skip if output exists" gate
+# at the loop body so a Ctrl-C / power blip doesn't restart from zero.
 #
-# Skips invocations whose output JSON already exists, so the script
-# can be safely resumed after a Ctrl-C or hardware glitch — delete
-# the offending JSON file to force re-run.
+# Pruning knobs (env vars):
+#   SWEEP_LAT_THREADS_ONLY=8  — only run _lat at the median-thread
+#                               count, since tail latency at t=24 is
+#                               dominated by queueing noise that
+#                               doesn't survive paper figures anyway.
+#                               Default: enabled (cuts _lat cells ⅓).
 #
-# Total wall time estimate at all 5 sizes + 2 workloads + 2 fixtures:
-# ~3-4 hours sequential.
+# Usage:
+#   ./run_scaling_sweep.sh              # actually run
+#   ./run_scaling_sweep.sh --dry-run    # print every command + matrix
+#                                        size estimate, run nothing
+#
+# Output: JSON files at /root/viper/results/scaling/. Filename convention
+# <Fixture>_<workload>_<size>M_<metric>.json (metric = "tp" or "lat").
+# The legacy filename layout (without _<metric>) is preserved for the
+# Phase 2 *_tp runs already on disk so the plotter doesn't have to
+# re-parse stale data.
+
 set -e
 
 YCSB_BM="/root/viper/build/benchmark/ycsb_bm"
 OUT_DIR="/root/viper/results/scaling"
 mkdir -p "${OUT_DIR}"
 
-# Datasets: 0.15x → 3x of HotTier capacity (33M slots).
-SIZES=(5 10 16 33 50)
-WORKLOADS=(100r_zipf 100r_uniform)
+# Datasets: 0.15× → 1× of HotTier capacity (33 M slots).
+# 50 M cell intentionally omitted (M4 back-pressure issue, paper future work).
+SIZES=(5 10 16 33)
+WORKLOADS=(100r_zipf 100r_uniform a_zipf a_uniform b_zipf b_uniform)
 FIXTURES=(ViperFixture HiOMFixture)
+METRICS=(tp lat)
+FILTER_THREADS_TP='threads:(1|8|24)$'
+FILTER_THREADS_LAT='threads:8$'   # latency cells only at t=8 by default
 
-# Filter to throughput-only (skip _lat); 3 thread counts; --benchmark_repetitions
-# is already 3 via READ_ARGS macro.
-FILTER_THREADS='threads:(1|8|24)$'
+DRY_RUN=0
+for arg in "$@"; do
+  case "${arg}" in
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "Unknown arg: ${arg}" >&2; exit 2 ;;
+  esac
+done
 
+total=0
+skip=0
+plan_lines=()
 for size in "${SIZES[@]}"; do
   for workload in "${WORKLOADS[@]}"; do
     for fixture in "${FIXTURES[@]}"; do
-      out="${OUT_DIR}/${fixture}_${workload}_${size}M.json"
-      if [ -s "${out}" ]; then
-        echo "SKIP ${fixture} ${workload} ${size}M — output exists"
-        continue
-      fi
-      filter="${fixture}.*${workload}_tp.*${FILTER_THREADS}"
-      echo "RUN  ${fixture} ${workload} ${size}M → ${out}"
-      YCSB_SIZE_TAG="${size}M" "${YCSB_BM}" \
-          --benchmark_filter="${filter}" \
-          --benchmark_out="${out}" \
-          --benchmark_out_format=json \
-          2>&1 | tail -5
-      echo
+      for metric in "${METRICS[@]}"; do
+        total=$((total + 1))
+        out="${OUT_DIR}/${fixture}_${workload}_${size}M_${metric}.json"
+        # Legacy *_tp results from Phase 2 were saved without the
+        # _tp suffix. Honour that so we don't re-run them.
+        legacy="${OUT_DIR}/${fixture}_${workload}_${size}M.json"
+        if [ "${metric}" = "tp" ] && [ -s "${legacy}" ]; then
+          skip=$((skip + 1))
+          plan_lines+=("SKIP-LEGACY ${fixture} ${workload} ${size}M ${metric} (legacy file exists: ${legacy})")
+          continue
+        fi
+        if [ -s "${out}" ]; then
+          skip=$((skip + 1))
+          plan_lines+=("SKIP-EXISTS ${fixture} ${workload} ${size}M ${metric} (${out})")
+          continue
+        fi
+        if [ "${metric}" = "tp" ]; then
+          filter="${fixture}.*${workload}_tp.*${FILTER_THREADS_TP}"
+        else
+          filter="${fixture}.*${workload}_lat.*${FILTER_THREADS_LAT}"
+        fi
+        cmd="YCSB_SIZE_TAG=${size}M ${YCSB_BM} --benchmark_filter='${filter}' --benchmark_out='${out}' --benchmark_out_format=json"
+        plan_lines+=("RUN  ${fixture} ${workload} ${size}M ${metric}  →  ${out}")
+        plan_lines+=("     ${cmd}")
+        if [ "${DRY_RUN}" -eq 0 ]; then
+          echo "RUN  ${fixture} ${workload} ${size}M ${metric} → ${out}"
+          eval "${cmd}" 2>&1 | tail -3
+          echo
+        fi
+      done
     done
   done
 done
 
-echo "ALL SWEEP RUNS DONE."
-ls -lh "${OUT_DIR}"
+todo=$((total - skip))
+echo
+echo "=============================="
+echo "  Matrix : ${#SIZES[@]} sizes × ${#WORKLOADS[@]} workloads × ${#FIXTURES[@]} fixtures × ${#METRICS[@]} metrics = ${total} cells"
+echo "  Skipped: ${skip} (already on disk)"
+echo "  To run : ${todo}"
+if [ "${todo}" -gt 0 ]; then
+  echo "  Estimated wall : ~$((todo * 20 / 60)) h (assuming ~20 min/cell average)"
+fi
+echo "=============================="
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+  echo
+  echo "Plan (commands not executed):"
+  for line in "${plan_lines[@]}"; do echo "  ${line}"; done
+fi
+
+if [ "${DRY_RUN}" -eq 0 ]; then
+  echo "ALL SWEEP RUNS DONE."
+  ls -lh "${OUT_DIR}"
+fi
