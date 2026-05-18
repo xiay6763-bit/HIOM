@@ -1874,6 +1874,19 @@ inline bool Viper<K, V>::Client::get_value_from_offset(const KVOffset offset, V*
 template <typename K, typename V>
 inline typename Viper<K, V>::KVOffset
 Viper<K, V>::Client::hiom_peek_offset(const K& key) {
+    if (this->viper_.hiom_owns_index_) {
+        // M6.6 + UPDATE bug fix (2026-05-18): when HiOM owns the index
+        // the CCEH directory has been shrunk to cceh_init_cap=1 and
+        // never inserted into, so map_.Get would dereference an
+        // uninitialized segment slot — SEGV. UPDATE's mirror_write
+        // path hit this because, unlike INSERT, it has no
+        // last_put_offset() short-circuit and goes through this peek.
+        // Route through the resolver (HotTier-then-ColdTier) instead;
+        // the resolver is guaranteed installed because
+        // set_hiom_owns_index(true) is sequenced after
+        // set_hiom_old_offset_resolver() in HiOM's constructor.
+        return this->viper_.hiom_old_offset_resolver_(key);
+    }
     auto key_check_fn = [&](auto k, auto offset) {
         return this->viper_.check_key_equality(k, offset);
     };
