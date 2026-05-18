@@ -7,23 +7,34 @@
 //   page_number  : 3 bits    (0..5 within a 6-page block)
 //   data_offset  : 16 bits   (slot index within a page, or byte offset)
 //
-// HiOM compacts this to 4 bytes (§2.1.1 of design):
-//   bits 0..15  : data_offset    (16 bits, full)
-//   bits 16..18 : page_number    (3 bits, full)
-//   bits 19..31 : block_number_low (13 bits)
+// HiOM compacts this to 4 bytes (§2.1.1 of design). Bit layout was
+// widened in M3.5 (2026-05-17) so a single region covers a large
+// fraction of the 64 GiB pool:
+//   bits 0..7   : data_offset      (8 bits — slot index up to 255.
+//                                   Smallest practical Viper entry
+//                                   is 16 B (uint64+uint64) yielding
+//                                   PAGE_SIZE/16 = 256 slots per page,
+//                                   which just fits. Production
+//                                   workloads with K8+V200 use 19.)
+//   bits 8..10  : page_number      (3 bits, unchanged)
+//   bits 11..31 : block_number_low (21 bits — 2 Mi blocks ≈ 48 GiB
+//                                   per region. Covers all win-
+//                                   condition dataset sizes (max
+//                                   100 M × 208 B = 20.8 GiB) and
+//                                   leaves margin. Multi-region
+//                                   routing remains future work for
+//                                   pool usage > 48 GiB.)
 //
 // The high 32 bits of block_number are recovered by lookup into a
 // per-region block_base_map (§3 routes keys to one of 32 regions).
-// For M0 — where there is exactly one region and block_base_map[0] == 0 —
-// the encoded form addresses up to 2^13 = 8192 blocks ≈ 192 MB of PMem.
-// That ceiling is plenty for the M0 integration test (which uses
-// ≤10M 16-byte records, ~7300 blocks). M2/M3 will introduce real
-// 32-region routing and lift the ceiling.
+// For M0 / M2 — where there is exactly one region and
+// block_base_map[0] == 0 — the encoded form addresses up to 2^21 =
+// 2097152 blocks ≈ 48 GiB of PMem. M3+ multi-region routing remains
+// future work for pool usage > 48 GiB.
 //
-// Reserved sentinel: kInvalidCompactOffset == 0xFFFFFFFFu — used by
-// HotTier to mean "miss". It corresponds to (block=8191, page=7,
-// data_offset=0xFFFF), which is unreachable in valid Viper state
-// (page_number is bounded by NUM_DIMMS=6, so page=7 is impossible).
+// Reserved sentinel: kInvalidCompactOffset == 0xFFFFFFFFu — still
+// reachable only via (page=7, ...) which is impossible because
+// page_number is bounded by NUM_DIMMS=6.
 
 #include <array>
 #include <cstdint>
@@ -35,9 +46,9 @@ using compact_offset_t = std::uint32_t;
 
 inline constexpr compact_offset_t kInvalidCompactOffset = 0xFFFFFFFFu;
 
-inline constexpr unsigned kBlockLowBits = 13;
+inline constexpr unsigned kBlockLowBits = 21;
 inline constexpr unsigned kPageBits = 3;
-inline constexpr unsigned kDataOffsetBits = 16;
+inline constexpr unsigned kDataOffsetBits = 8;
 static_assert(kBlockLowBits + kPageBits + kDataOffsetBits == 32,
               "compact offset must pack into 32 bits");
 
@@ -72,6 +83,13 @@ inline std::optional<compact_offset_t> encode(std::uint64_t block_number,
     const std::uint64_t low = block_number - base;
     if (low > kBlockLowMask) return std::nullopt;
     if (page_number > kPageMask) return std::nullopt;
+    // M3.5: data_offset must fit in kDataOffsetBits (7 bits = 127).
+    // Old codec used 16 bits, so uint16_t input always fit. With 7-bit
+    // field, slot indices > 127 (only possible for entry size < 32 B)
+    // or byte offsets (variable-size path) would silently corrupt the
+    // page_number bits via OR. Reject these explicitly — caller treats
+    // nullopt as "not encodable" and skips HotTier mirroring.
+    if (data_offset > kDataOffMask) return std::nullopt;
     const compact_offset_t packed
         = (static_cast<compact_offset_t>(low) << (kPageBits + kDataOffsetBits))
         | (static_cast<compact_offset_t>(page_number & kPageMask)
