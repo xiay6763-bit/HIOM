@@ -27,14 +27,17 @@ import matplotlib.pyplot as plt
 
 RESULTS_DIR = "/root/viper/results/scaling"
 OUTPUT_DIR = "/root/viper/eval/charts"
-WORKLOADS = ("100r_zipf", "100r_uniform")
+# 6-workload matrix: read-only (100r), YCSB-A (50/50 read+update),
+# YCSB-B (95/5 read+update), each in zipf + uniform. The 5050/1090
+# legacy mixes are out — they're read+INSERT, not the standard
+# YCSB-A/B semantics, kept for compat in the binary but not plotted.
+WORKLOADS = (
+    "100r_zipf", "100r_uniform",
+    "a_zipf", "a_uniform",
+    "b_zipf", "b_uniform",
+)
 THREAD_AXES = (1, 8, 24)
 FIXTURES = ("ViperFixture", "HiOMFixture")
-# Cap the plotted range to the largest size where both fixtures completed.
-# HiOM hangs at 50M due to the M4 back-pressure pathology — drop that
-# column so the headline figure has two symmetric lines, and discuss the
-# 50M limitation in the paper text instead of inviting a "why is HiOM
-# missing here" question via an unbalanced chart.
 MAX_SIZE_M = 33
 STYLES = {
     "ViperFixture": {"color": "#1f77b4", "marker": "o", "ms": 8, "label": "Viper"},
@@ -43,9 +46,10 @@ STYLES = {
 
 # Parses a Google Benchmark "name" field like
 #   HiOMFixture<KeyType8,ValueType200>/100r_zipf_tp/iterations:1/repeats:3/real_time/threads:8_median
-# returning (workload, threads, agg) or None.
+#   HiOMFixture<KeyType8,ValueType200>/a_zipf_lat/iterations:1/repeats:3/real_time/threads:8_median
+# returning (fixture, workload, metric, threads, agg) or None.
 NAME_RE = re.compile(
-    r"^(?P<fixture>\w+Fixture)<[^>]+>/(?P<workload>\w+)_tp/.+threads:(?P<threads>\d+)(?:_(?P<agg>\w+))?$"
+    r"^(?P<fixture>\w+Fixture)<[^>]+>/(?P<workload>\w+)_(?P<metric>tp|lat)/.+threads:(?P<threads>\d+)(?:_(?P<agg>\w+))?$"
 )
 
 
@@ -57,9 +61,14 @@ def parse_results():
         print(f"No JSON files in {RESULTS_DIR} — nothing to plot.")
         return data
     for path in json_paths:
-        # Filename convention: <Fixture>_<workload>_<size>M.json
+        # Filename convention:
+        #   <Fixture>_<workload>_<size>M.json          — Phase 2 legacy (tp)
+        #   <Fixture>_<workload>_<size>M_tp.json       — Phase 3 throughput
+        #   <Fixture>_<workload>_<size>M_lat.json      — Phase 3 latency
         fname = os.path.basename(path)
-        m = re.match(r"(?P<fixture>\w+Fixture)_(?P<workload>\w+)_(?P<size>\d+)M\.json$", fname)
+        m = re.match(
+            r"(?P<fixture>\w+Fixture)_(?P<workload>\w+)_(?P<size>\d+)M(?:_(?P<metric>tp|lat))?\.json$",
+            fname)
         if not m:
             continue
         fixture = m.group("fixture")
@@ -74,36 +83,35 @@ def parse_results():
             if not n or n.group("agg") != "median":
                 continue
             threads = int(n.group("threads"))
+            metric = n.group("metric")
             cell = data[workload][fixture][size_m][threads]
-            # Per-thread throughput (Google Benchmark already normalizes).
-            cell["ips_per_thr"] = bm.get("items_per_second", 0)
-            cell["dram_mb"] = bm.get("dram_loaded_mb", 0)
-            cell["rss_mb"] = bm.get("rss_loaded_mb", 0)
-            cell["rss_baseline_mb"] = bm.get("rss_baseline_mb", 0)
-            # Fixture-only DRAM = total DRAM minus the YCSB harness's
-            # two std::vector<ycsb::Record> buffers:
-            #   1. prefill_data — loaded in main() before any benchmark
-            #      runs. Size = recordcount × sizeof(Record) ≈ 216 B.
-            #   2. data_<workload> — the per-workload static vector
-            #      loaded inside ycsb_run on the first benchmark
-            #      instance. By threads:8 (our reported median) the
-            #      threads:1 instance has already populated it, so its
-            #      footprint is included in rss_loaded. zipf workloads
-            #      are 5 M ops (constant), uniform are 100 M ops (per
-            #      generate_ycsb.sh defaults).
-            # rss_baseline_mb is captured *after* InitMap so it already
-            # includes the fixture's index allocation and is NOT the
-            # right thing to subtract (would zero out the very gap we
-            # want to highlight). Use structural estimates instead.
-            PREFILL_RECORD_BYTES = 216
-            workload_ops_m = 100 if workload.startswith("100r_uniform") else 5
-            prefill_mb = size_m * 1e6 * PREFILL_RECORD_BYTES / (1024 ** 2)
-            workload_mb = workload_ops_m * 1e6 * PREFILL_RECORD_BYTES / (1024 ** 2)
-            cell["fixture_dram_mb"] = max(0.0,
-                cell["dram_mb"] - prefill_mb - workload_mb)
-            cell["hot_size"] = bm.get("hot_tier_size", 0)
-            cell["hot_evictions"] = bm.get("hot_evictions", 0)
-            cell["hot_hit_rate"] = bm.get("hot_hit_rate", None)
+            if metric == "tp":
+                # Per-thread throughput (Google Benchmark already normalizes).
+                cell["ips_per_thr"] = bm.get("items_per_second", 0)
+                cell["dram_mb"] = bm.get("dram_loaded_mb", 0)
+                cell["rss_mb"] = bm.get("rss_loaded_mb", 0)
+                cell["rss_baseline_mb"] = bm.get("rss_baseline_mb", 0)
+                # Fixture-only DRAM (see comment block above for the
+                # subtraction logic). Workload ops vector size depends
+                # on the workload type — 100r_uniform is 100 M ops
+                # (stress), all others are 5 M ops.
+                PREFILL_RECORD_BYTES = 216
+                workload_ops_m = 100 if workload == "100r_uniform" else 5
+                prefill_mb = size_m * 1e6 * PREFILL_RECORD_BYTES / (1024 ** 2)
+                workload_mb = workload_ops_m * 1e6 * PREFILL_RECORD_BYTES / (1024 ** 2)
+                cell["fixture_dram_mb"] = max(0.0,
+                    cell["dram_mb"] - prefill_mb - workload_mb)
+                cell["hot_size"] = bm.get("hot_tier_size", 0)
+                cell["hot_evictions"] = bm.get("hot_evictions", 0)
+                cell["hot_hit_rate"] = bm.get("hot_hit_rate", None)
+            elif metric == "lat":
+                # HDR percentiles in nanoseconds. Separate read /
+                # write series; aggregated hdr_* kept as legacy.
+                for pct in ("median", "90", "95", "99", "999", "9999"):
+                    for prefix in ("hdr_", "hdr_read_", "hdr_write_"):
+                        key = f"{prefix}{pct}"
+                        if key in bm:
+                            cell[key] = bm[key]
     return data
 
 
@@ -196,6 +204,66 @@ def plot_workload(workload, w_data):
     print(f"  wrote {out_path}")
 
 
+def plot_latency(workload, w_data):
+    """Tail-latency plot: read p99/p999 and write p99/p999 vs size.
+
+    Two columns (read | write) × two rows (p99 | p999). Each panel
+    plots Viper and HiOM as separate lines vs dataset size at t=8
+    (the latency-only thread axis we collect in the sweep).
+    Workloads where the relevant op type has zero samples (e.g., the
+    write panel for 100r_*) simply have no line and a no-data note.
+    """
+    sizes = sorted({s for fx in FIXTURES
+                    for s in w_data.get(fx, {}).keys()})
+    if not sizes:
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"Tail latency — {workload} (t=8)",
+                 fontsize=14, fontweight="bold")
+    panels = [
+        (0, 0, "hdr_read_99",   "Read p99"),
+        (0, 1, "hdr_write_99",  "Write p99"),
+        (1, 0, "hdr_read_999",  "Read p99.9"),
+        (1, 1, "hdr_write_999", "Write p99.9"),
+    ]
+    any_data = False
+    for (r, c, key, title) in panels:
+        ax = axes[r, c]
+        for fixture in FIXTURES:
+            xs, ys = [], []
+            for size_m in sizes:
+                cell = w_data[fixture].get(size_m, {}).get(8, {})
+                if key in cell and cell[key] > 0:
+                    xs.append(size_m)
+                    ys.append(cell[key] / 1000.0)  # ns → μs
+            if xs:
+                any_data = True
+                ax.plot(xs, ys,
+                        **{k: v for k, v in STYLES[fixture].items() if k != "label"},
+                        label=STYLES[fixture]["label"])
+        ax.set_title(title)
+        ax.set_ylabel("μs")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3, which="both")
+        if ax.lines:
+            ax.legend()
+        else:
+            ax.text(0.5, 0.5, "no data\n(workload has\nno ops of this type)",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color="gray", fontsize=9)
+        if r == 1:
+            ax.set_xlabel("Dataset size (M records)")
+    if not any_data:
+        plt.close()
+        return
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    out_path = os.path.join(OUTPUT_DIR, f"latency_{workload}.pdf")
+    plt.savefig(out_path)
+    plt.close()
+    print(f"  wrote {out_path}")
+
+
 def print_summary(data):
     """Compact tabular summary to stdout."""
     print("\n=== Summary (median of 3 reps; threads=8 row) ===")
@@ -232,6 +300,7 @@ def main():
         if workload in data:
             print(f"Plotting {workload}…")
             plot_workload(workload, data[workload])
+            plot_latency(workload, data[workload])
     print_summary(data)
 
 
