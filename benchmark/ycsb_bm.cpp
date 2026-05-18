@@ -85,6 +85,10 @@ inline std::string ycsb_workload_path(const char* workload) {
             DEFINE_BM(fixture, 1090_uniform, data_uniform_10_90); \
             DEFINE_BM(fixture, 5050_zipf,    data_zipf_50_50); \
             DEFINE_BM(fixture, 1090_zipf,    data_zipf_10_90); \
+            DEFINE_BM(fixture, a_uniform,    data_uniform_ycsb_a); \
+            DEFINE_BM(fixture, a_zipf,       data_zipf_ycsb_a); \
+            DEFINE_BM(fixture, b_uniform,    data_uniform_ycsb_b); \
+            DEFINE_BM(fixture, b_zipf,       data_zipf_ycsb_b); \
             DEFINE_READ_BM(fixture, 100r_uniform, data_uniform_100r); \
             DEFINE_READ_BM(fixture, 100r_zipf,    data_zipf_100r)
 
@@ -96,6 +100,12 @@ static std::vector<ycsb::Record> data_zipf_50_50;
 static std::vector<ycsb::Record> data_zipf_10_90;
 static std::vector<ycsb::Record> data_uniform_100r;
 static std::vector<ycsb::Record> data_zipf_100r;
+// YCSB-A: 50/50 read+update (standard YCSB-A, not the 5050 read+insert variant).
+// YCSB-B: 95/5 read+update (standard YCSB-B, read-mostly cache scenario).
+static std::vector<ycsb::Record> data_uniform_ycsb_a;
+static std::vector<ycsb::Record> data_zipf_ycsb_a;
+static std::vector<ycsb::Record> data_uniform_ycsb_b;
+static std::vector<ycsb::Record> data_zipf_ycsb_b;
 
 void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::Record>* data,
               const std::filesystem::path& wl_file, bool log_latency) {

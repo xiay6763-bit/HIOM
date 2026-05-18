@@ -86,15 +86,23 @@ gen_prefill() {
 if [ -z "${SIZE_M}" ]; then
   # Legacy invocation — original 6-workload mix at 10M prefill / 5M ops.
   gen_prefill ""
-  for wl in 5050_uniform 5050_zipf 1090_uniform 1090_zipf 100r_uniform 100r_zipf; do
+  for wl in 5050_uniform 5050_zipf 1090_uniform 1090_zipf 100r_uniform 100r_zipf \
+            a_uniform a_zipf b_uniform b_zipf; do
     gen_one_workload "${wl}" 5 ""
   done
 else
-  # Scaling-sweep invocation — prefill + zipf(5M ops) + uniform(stress 100M ops).
+  # Scaling-sweep invocation — prefill + read-only / mixed / standard YCSB.
+  #   - 100r_zipf   : 5M ops (low-pressure read-only baseline)
+  #   - 100r_uniform: 100M ops by default (stress, crosses HotTier capacity)
+  #   - YCSB-A/B    : 5M ops each (read+update mix, the standard mix story)
   SUFFIX="_${SIZE_M}M"
   gen_prefill "${SUFFIX}"
-  gen_one_workload "100r_zipf"    5               "${SUFFIX}"
+  gen_one_workload "100r_zipf"    5                  "${SUFFIX}"
   gen_one_workload "100r_uniform" "${UNIFORM_OPS_M}" "${SUFFIX}"
+  gen_one_workload "a_zipf"       5                  "${SUFFIX}"
+  gen_one_workload "a_uniform"    5                  "${SUFFIX}"
+  gen_one_workload "b_zipf"       5                  "${SUFFIX}"
+  gen_one_workload "b_uniform"    5                  "${SUFFIX}"
 fi
 
 echo "DONE."
