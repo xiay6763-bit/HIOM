@@ -112,7 +112,50 @@ def parse_results():
                         key = f"{prefix}{pct}"
                         if key in bm:
                             cell[key] = bm[key]
+
+    # Phase 3: tag cells that timed out in the sweep (see
+    # run_scaling_sweep.sh's SWEEP_PER_CELL_TIMEOUT_S handling — the
+    # partial JSON is renamed `<file>.timeout_<ts>` so the original
+    # path is missing and we'd otherwise silently drop the cell from
+    # the chart). We can't tell which specific thread count hung from
+    # the filename alone; tag all configured thread counts at that
+    # cell so the chart's HANG marker spans the panel where the
+    # corresponding line would have been.
+    for path in sorted(glob(os.path.join(RESULTS_DIR, "*.json.timeout_*"))):
+        fname = os.path.basename(path)
+        base = re.sub(r"\.timeout_[0-9_]+$", "", fname)
+        m = re.match(
+            r"(?P<fixture>\w+Fixture)_(?P<workload>\w+)_(?P<size>\d+)M(?:_(?P<metric>tp|lat))?\.json$",
+            base)
+        if not m:
+            continue
+        fixture = m.group("fixture")
+        workload = m.group("workload")
+        size_m = int(m.group("size"))
+        if size_m > MAX_SIZE_M:
+            continue
+        metric = m.group("metric") or "tp"
+        for t in THREAD_AXES:
+            cell = data[workload][fixture][size_m][t]
+            cell.setdefault("hang_metrics", set()).add(metric)
     return data
+
+
+def _mark_hang(ax, x, y_frac=0.5, label="HANG\n(M4)"):
+    """Draw a red HANG marker at x on the given axis. y is placed at
+    y_frac of the current ylim so it stays inside the plot area
+    regardless of log/linear y-scale."""
+    ymin, ymax = ax.get_ylim()
+    # On log scale, "fraction of way up" needs the geometric mean.
+    if ax.get_yscale() == "log" and ymin > 0:
+        y = (ymin * (ymax / ymin) ** y_frac)
+    else:
+        y = ymin + y_frac * (ymax - ymin)
+    ax.axvline(x, color="red", alpha=0.15, linestyle=":", linewidth=1.5)
+    ax.text(x, y, label, ha="center", va="center",
+            color="red", fontsize=9, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                      edgecolor="red", alpha=0.9))
 
 
 def plot_workload(workload, w_data):
@@ -130,6 +173,7 @@ def plot_workload(workload, w_data):
     # Row 1: throughput
     for j, t in enumerate(THREAD_AXES):
         ax = axes[0, j]
+        hang_xs = set()
         for fixture in FIXTURES:
             xs, ys = [], []
             for size_m in sizes:
@@ -137,6 +181,8 @@ def plot_workload(workload, w_data):
                 if cell and cell.get("ips_per_thr"):
                     xs.append(size_m)
                     ys.append(cell["ips_per_thr"] / 1e6)
+                elif cell and "tp" in cell.get("hang_metrics", set()):
+                    hang_xs.add(size_m)
             if xs:
                 ax.plot(xs, ys, **{k: v for k, v in STYLES[fixture].items() if k != "label"},
                         label=STYLES[fixture]["label"])
@@ -145,6 +191,9 @@ def plot_workload(workload, w_data):
         ax.set_xscale("log")
         ax.grid(True, alpha=0.3)
         ax.legend()
+        # Draw HANG markers AFTER lines so axis limits are settled.
+        for x in sorted(hang_xs):
+            _mark_hang(ax, x, label="HANG\n(M4)")
 
     # Row 2: fixture-only DRAM (subtracts YCSB harness baseline so the
     # comparison reflects what each system actually allocates, not the
@@ -229,6 +278,7 @@ def plot_latency(workload, w_data):
     any_data = False
     for (r, c, key, title) in panels:
         ax = axes[r, c]
+        hang_xs = set()
         for fixture in FIXTURES:
             xs, ys = [], []
             for size_m in sizes:
@@ -236,6 +286,8 @@ def plot_latency(workload, w_data):
                 if key in cell and cell[key] > 0:
                     xs.append(size_m)
                     ys.append(cell[key] / 1000.0)  # ns → μs
+                elif cell and "lat" in cell.get("hang_metrics", set()):
+                    hang_xs.add(size_m)
             if xs:
                 any_data = True
                 ax.plot(xs, ys,
@@ -252,6 +304,8 @@ def plot_latency(workload, w_data):
             ax.text(0.5, 0.5, "no data\n(workload has\nno ops of this type)",
                     ha="center", va="center", transform=ax.transAxes,
                     color="gray", fontsize=9)
+        for x in sorted(hang_xs):
+            _mark_hang(ax, x, label="HANG\n(M4)")
         if r == 1:
             ax.set_xlabel("Dataset size (M records)")
     if not any_data:
@@ -288,7 +342,13 @@ def print_summary(data):
             h_evict = h.get("hot_evictions", 0)
             h_hr = h.get("hot_hit_rate", None)
             hr_str = f"{h_hr:.3f}" if h_hr else "n/a"
-            print(f"  {s:3d}M     {v_ips:7.2f}M     {h_ips:7.2f}M     {ratio:6.3f}    {v_dram:10.0f}      {h_dram:10.0f}    {h_size:11.0f}    {h_evict:8.0f}    {hr_str}")
+            # Annotate HANG cells so the table parallels the chart.
+            v_hung = "tp" in v.get("hang_metrics", set())
+            h_hung = "tp" in h.get("hang_metrics", set())
+            v_str = "  HANG  " if v_hung else f"{v_ips:7.2f}M"
+            h_str = "  HANG  " if h_hung else f"{h_ips:7.2f}M"
+            r_str = "  n/a " if (v_hung or h_hung or not v_ips) else f"{ratio:6.3f}"
+            print(f"  {s:3d}M     {v_str}     {h_str}     {r_str}    {v_dram:10.0f}      {h_dram:10.0f}    {h_size:11.0f}    {h_evict:8.0f}    {hr_str}")
 
 
 def main():
