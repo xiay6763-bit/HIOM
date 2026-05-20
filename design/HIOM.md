@@ -337,8 +337,33 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   preserved at
   `results/scaling/HiOMFixture_{a_zipf_33M_tp,b_zipf_33M_lat}.json.timeout_*`.
 
-  Mechanism (matches the back-pressure path in
-  [hiom.hpp:578-637](../include/viper/hiom/hiom.hpp#L578-L637)):
+  Mechanism (**confirmed 2026-05-20 19:00 via gdb `thread apply all
+  bt` on a reproduced hang**, evidence at
+  `/tmp/hiom_evidence/a_zipf_33M_hang_20260520_1858/`):
+  At the snapshot point (t=10 min in the cell) and at the SIGKILL
+  point (t=25 min), the running ycsb_bm process had **identical**
+  thread distribution:
+  - **17 of 24** YCSB worker threads parked at
+    `__clock_nanosleep → ::Client::mirror_write_with_offset →
+     HiOMFixture::run_ycsb` — i.e. inside the producer back-pressure
+    spin at [hiom.hpp:578-637](../include/viper/hiom/hiom.hpp#L578-L637)
+    (50 µs sleep + retry).
+  - 7 of 24 workers parked at `benchmark::State::StartKeepRunning`
+    — they finished their iteration share and are waiting for
+    laggards at the GBenchmark barrier. So *some* producers are
+    making progress; the catastrophe is partial-not-total
+    starvation of the slow ones, who never catch up before the
+    timer expires.
+  - 4 flusher threads in `pthread_cond_clockwait` on
+    `wake_slots_[i].cv` (the timed wait at
+    [hiom.hpp:1376-1381](../include/viper/hiom/hiom.hpp#L1376-L1381))
+    — they wake on the 5 ms timer and on producer notifies, drain
+    a batch, then go back to wait. They are *not* starved; they
+    just can't keep up with 17 sustained producers spinning on
+    bucket-PINNED retry.
+
+  The static walkthrough below is therefore the actual runtime
+  mechanism, not a hypothesis:
   1. YCSB-A = 50% update; zipf-θ=0.99 concentrates writes on the
      hot keyspace, so a small set of fp32 buckets gets the
      overwhelming majority of `upsert_pinned` traffic.
@@ -356,7 +381,25 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
      `wake_all_flushers` cv-notify storm (one `lock_guard +
      notify_one` per flusher per producer, every 50 µs) starve
      the background flusher's `apply_batch` progress. The buffer
-     never drains to empty → no producer ever returns.
+     never drains to empty for the stuck 17 → those producers
+     never return.
+
+  **Reproducibility note**: the isolated `--benchmark_filter=
+  '...a_zipf_tp.*threads:24$'` cell (single-threaded prefill +
+  3 reps × threads:24 only) finished cleanly at 4.71 M/s in
+  ~30 s. The hang only reproduces with the original sweep filter
+  `threads:(1|8|24)$`, which runs threads:1 → threads:8 → threads:24
+  back-to-back in one ycsb_bm process (each fixture cell does a
+  full DeInitMap + InitMap rebuild of `/pmem0/hiom_bench/`, so
+  this isn't in-process state leakage). The most likely confounder
+  is cumulative PMem state — three sequential ~33M prefills exhaust
+  the Optane DCPMM write-buffer freshness, slow the flusher's
+  apply_batch latency, and shift the producer/flusher balance past
+  the back-pressure tipping point that isolated threads:24 stays
+  under. Workloads that completed at 33M in the same sweep
+  (a_uniform, b_uniform, b_zipf) avoid the trigger because either
+  writes spread uniformly or the write rate is too low to outrun
+  the flusher even when it's slowed.
 
   Workloads that completed at 33M show the same primitive is not
   fatal in general:
