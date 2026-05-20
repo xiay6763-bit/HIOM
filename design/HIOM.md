@@ -298,6 +298,114 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     scale. Treated as a known limitation for the paper write-up;
     fix candidate is per-region SIEVE clock pacing (TODO M7
     follow-up).
+## Status (2026-05-20)
+
+- **Phase 2 sweep completion — YCSB-A/B 33M write-heavy cells filled
+  in**. 30-cell run via `run_scaling_sweep.sh` (with new per-cell
+  `SWEEP_PER_CELL_TIMEOUT_S=1800`, 1h51min wall total) closed the
+  missing cells from 2026-05-18: full HiOM/Viper coverage for 16M
+  b_zipf/b_uniform/a_uniform_lat and the entire 33M block (read-only
+  100r was already done; YCSB-A/B was new at this scale). 28/30
+  cells passed; the 2 timeouts were both a_zipf 33M HiOM (tp + lat).
+  Resulting H/V tp ratios at t=24 (median of 3 reps):
+
+  | size | workload  | V tp/thr | H tp/thr | H/V    |
+  |------|-----------|---------:|---------:|-------:|
+  | 16M  | a_uniform |   18.75M |    4.57M | 0.24×  |
+  | 16M  | b_uniform |   30.05M |   13.58M | 0.45×  |
+  | 16M  | b_zipf    |   43.94M |   16.29M | 0.37×  |
+  | 33M  | a_uniform |   18.84M |    4.63M | 0.25×  |
+  | 33M  | a_zipf    |   24.82M |     HANG | —      |
+  | 33M  | b_uniform |   30.39M |   12.42M | 0.41×  |
+  | 33M  | b_zipf    |   39.96M |   15.60M | 0.39×  |
+
+  HiOM ratios on YCSB-A/B (50% / 5% update) are lower than the
+  100r baselines (0.27–0.81×) because the update path pays HotTier
+  upsert_pinned + commit-buffer push + flusher latency on top of
+  the read-side HotTier verify. The ratio trend t=1 → t=24
+  *worsens* (0.34× → 0.25× for a_uniform), reflecting producer-side
+  contention growth, not per-op work growth — consistent with the
+  delete t=24 deep-dive on 2026-05-16.
+
+- **The real M4 trigger identified: `a_zipf` at HotTier-cap**. Only
+  one workload reproduced a deadlock-equivalent livelock across the
+  30 sweep cells: HiOMFixture a_zipf 33M (both tp and lat; tp
+  SIGKILL'd at the 30-min cap). b_zipf_tp at 33M completed cleanly
+  (15.6 M/s @ t=24) but b_zipf_lat at 33M also timed out — lat-mode
+  adds per-op HDR histogram cost that pushes a marginal cell over,
+  but the root cause is the same as a_zipf's. Partial JSONs
+  preserved at
+  `results/scaling/HiOMFixture_{a_zipf_33M_tp,b_zipf_33M_lat}.json.timeout_*`.
+
+  Mechanism (matches the back-pressure path in
+  [hiom.hpp:578-637](../include/viper/hiom/hiom.hpp#L578-L637)):
+  1. YCSB-A = 50% update; zipf-θ=0.99 concentrates writes on the
+     hot keyspace, so a small set of fp32 buckets gets the
+     overwhelming majority of `upsert_pinned` traffic.
+  2. At 33M-scale dataset (= HotTier 33.5M slot capacity), SIEVE
+     eviction is already engaged for the working set; the eviction
+     hand must skip PINNED slots
+     ([hot_tier.hpp:421-449](../include/viper/hiom/hot_tier.hpp#L421-L449)).
+  3. With 24 producers all targeting the same handful of hot
+     buckets, the bucket reaches "16 slots, all PINNED" → 32
+     retries of `try_inline_flush(256)` → `push_commit` + the
+     unbounded `while (commit_buf_->size_hint() > 0)` drain wait
+     at [hiom.hpp:628-636](../include/viper/hiom/hiom.hpp#L628-L636).
+  4. Twenty-four simultaneous `try_inline_flush` try_lock
+     attempts on the 4 `flusher_mus_` slots + the
+     `wake_all_flushers` cv-notify storm (one `lock_guard +
+     notify_one` per flusher per producer, every 50 µs) starve
+     the background flusher's `apply_batch` progress. The buffer
+     never drains to empty → no producer ever returns.
+
+  Workloads that completed at 33M show the same primitive is not
+  fatal in general:
+  - a_uniform (50% write, uniform): writes spread across all
+    buckets, no bucket fills with PINNED → 4.63 M/s.
+  - b_uniform / b_zipf (5% write): write rate too low to fill any
+    single bucket with PINNED before the flusher catches up.
+
+- **2026-05-18 "16M a_uniform 24t hang" reclassified as env-noise
+  fluke (not a code bug)**. The 14607-byte truncated partial JSON
+  from the 5/18 sweep showed threads:1/8 complete then mid-write
+  termination at threads:24. Today's isolated re-run of the same
+  cell (binary unchanged — `git log` since 5/18 is plotter-only)
+  finished in ~90 s wall with 4.57 M/s @ t=24, hot_hit_rate=0.998,
+  hot_evictions ≈ 10 K. The full-sweep re-run today (different
+  process, fresh prefill, after the binary churned through several
+  other cells) also passed at 4.57 M/s. Two clean runs vs. one
+  hang during a 24-hour `/pmem0`-contended sweep points to PMem
+  bandwidth contention from other tenants as the proximate cause;
+  the producer-vs-flusher contention machinery exists but only
+  deadlocks under workload-specific conditions, which 16M+a_uniform
+  doesn't meet (uniform writes spread out, no bucket-PINNED
+  saturation). Evidence at
+  `/tmp/hiom_evidence/HiOMFixture_a_uniform_16M_tp.{partial_20260518,fresh24tonly_20260520}.json`.
+
+- **Paper M7 wording for the M4 known limitation** (proposed): "At
+  working sets ≥ HotTier capacity *and* skewed write workloads
+  (YCSB-A zipfian), HiOM's bucket-PINNED back-pressure can cause
+  writer starvation. The fix is per-bucket SIEVE clock pacing
+  (M7 follow-up) or a wait-free buffer drain protocol; the paper's
+  win-condition matrix excludes this cell." This is tighter than
+  the previous "post-cap back-pressure" framing — it names the
+  specific (workload, dataset-size) corner rather than implying
+  everything past the cap fails.
+
+- **Tooling added alongside the investigation**:
+  - `SWEEP_PER_CELL_TIMEOUT_S` knob in `run_scaling_sweep.sh`
+    (default 1800 s) wraps each ycsb_bm invocation in
+    `timeout --signal=KILL`; truncated outputs are renamed
+    `<file>.timeout_<ts>` and logged to
+    `results/scaling/.sweep_timeouts.log`. Makes the sweep
+    safe to run unattended.
+  - `benchmark/repro_m4_hang.sh`: standalone single-cell repro
+    template (now most useful for re-investigating the real
+    a_zipf 33M trigger, since 16M+a_uniform doesn't deadlock).
+    Captures gdb `thread apply all bt` + `perf record -g
+    --call-graph dwarf` automatically once the configured budget
+    elapses.
+
 ## Status (2026-05-09)
 
 - **Phase**: M0 ✅; M1 functionally complete except EBR (closed by

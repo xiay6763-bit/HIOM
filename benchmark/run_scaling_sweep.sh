@@ -43,6 +43,14 @@ YCSB_BM="/root/viper/build/benchmark/ycsb_bm"
 OUT_DIR="/root/viper/results/scaling"
 mkdir -p "${OUT_DIR}"
 
+# Per-cell wall-clock budget. A healthy HiOM cell at 16M finishes in
+# ~5-10 min; 33M write-heavy is unknown territory (M4 back-pressure
+# limit per HIOM.md). Cap each cell so a single hang doesn't block
+# the whole batch. On timeout, the cell's partial JSON is moved aside
+# and the loop continues to the next cell.
+SWEEP_PER_CELL_TIMEOUT_S="${SWEEP_PER_CELL_TIMEOUT_S:-1800}"
+TIMEOUT_LOG="${OUT_DIR}/.sweep_timeouts.log"
+
 # Datasets: 0.15× → 1× of HotTier capacity (33 M slots).
 # 50 M cell intentionally omitted (M4 back-pressure issue, paper future work).
 SIZES=(5 10 16 33)
@@ -91,8 +99,26 @@ for size in "${SIZES[@]}"; do
         plan_lines+=("RUN  ${fixture} ${workload} ${size}M ${metric}  →  ${out}")
         plan_lines+=("     ${cmd}")
         if [ "${DRY_RUN}" -eq 0 ]; then
-          echo "RUN  ${fixture} ${workload} ${size}M ${metric} → ${out}"
-          eval "${cmd}" 2>&1 | tail -3
+          echo "RUN  ${fixture} ${workload} ${size}M ${metric} → ${out} (timeout ${SWEEP_PER_CELL_TIMEOUT_S}s)"
+          # `set -e` is active for the script overall, but we need to
+          # observe the timeout exit code (124) and skip past it. Wrap
+          # the eval in a subshell with -e disabled so timeout's exit
+          # code propagates as a normal value we can branch on.
+          set +e
+          timeout --signal=KILL "${SWEEP_PER_CELL_TIMEOUT_S}" bash -c "${cmd}" 2>&1 | tail -3
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 137 ]; then
+            ts=$(date +%Y%m%d_%H%M%S)
+            echo "  TIMEOUT after ${SWEEP_PER_CELL_TIMEOUT_S}s — moving partial JSON aside and continuing"
+            if [ -s "${out}" ]; then
+              mv "${out}" "${out}.timeout_${ts}"
+            fi
+            echo "${ts} TIMEOUT ${fixture} ${workload} ${size}M ${metric}" >> "${TIMEOUT_LOG}"
+          elif [ "${rc}" -ne 0 ]; then
+            echo "  non-zero exit ${rc} — leaving artifact for inspection"
+            echo "$(date +%Y%m%d_%H%M%S) FAIL(${rc}) ${fixture} ${workload} ${size}M ${metric}" >> "${TIMEOUT_LOG}"
+          fi
           echo
         fi
       done
