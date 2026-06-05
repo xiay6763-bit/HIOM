@@ -23,9 +23,11 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   track). Rationale: the current evidence supports a *scoped* claim, not
   an across-the-board win over Viper. Write-heavy throughput is weak
   (YCSB-A/B 0.24–0.45× at t=24), `a_zipf-33M` livelocks (M4 back-pressure),
-  the 40× recovery claim still lacks the 100 M datapoint, and the Phase 2
-  DRAM numbers are computed by subtracting an *estimated* harness footprint
-  rather than measured directly. Narrowed thesis: **"a DRAM-efficient
+  the 40× recovery claim still lacks the 100 M datapoint, and (at the time
+  of this repositioning) the Phase 2 DRAM numbers were computed by
+  subtracting an *estimated* harness footprint rather than measured
+  directly — **since resolved**: DRAM is now directly white-box measured
+  (88ff547 / 7a2be60, see §Phase 2). Narrowed thesis: **"a DRAM-efficient
   tiered offset map for PM KV stores — trading acceptable throughput loss
   for large DRAM savings and bounded recovery, in DRAM-constrained
   read-heavy deployments."**
@@ -36,7 +38,8 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     block).
   - **Next steps (priority order, 2026-06-05)**:
     1. ✅ this repositioning (header + contributions + win condition).
-    2. **Direct fixture-DRAM measurement — white-box landed (88ff547)**.
+    2. ✅ **Direct fixture-DRAM measurement — white-box landed (88ff547);
+       Phase 2 grid re-run + tables replaced (7a2be60)**.
        RSS-diff (loaded − baseline) collapses on `repeats:N` (glibc doesn't
        return freed arenas; `DeInitMap` leaves RSS elevated, so rep>0 reads
        a polluted baseline). Replaced by a white-box metric: each fixture
@@ -46,9 +49,10 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
        `fixture_dram_rss_mb` cross-check). 1M `100r_zipf` t=1 smoke:
        white-box **constant across 3 reps (cv=0%)** — Viper 2052 MB vs
        HiOM 272 MB = **−86.7%**, matching the ~2 GB CCEH vs 256 MB HotTier
-       design point. **Still TODO**: re-run the Phase 2 grid to replace the
-       harness-subtraction DRAM tables with white-box numbers (DRAM is
-       workload-independent → one t=1 run per dataset size suffices).
+       design point. **Done (7a2be60)**: the Phase 2 grid was re-run at t=1
+       per dataset size (DRAM is workload-independent → one run suffices)
+       and the harness-subtraction DRAM tables in §Phase 2 are now replaced
+       with white-box numbers (−86.7%, flat across 5–50M).
     3. Recovery 10M/50M/100M: Viper full-rebuild vs HiOM tail-scan, plus
        checkpoint-cadence / tail-size sensitivity. Use a recovery-only
        oversized HotTier (≥ dataset) or slow single-thread prefill to dodge
