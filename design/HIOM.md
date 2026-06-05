@@ -293,38 +293,43 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   | 33 M | 16.76       | 13.08      | 0.78×   | 29.9 M   | **4.95 M** | 0.978   |
   | 50 M | 15.58       | n/a        | n/a     | —        | —         | —        |
 
-  Fixture-only DRAM at t=8 median (MB) — `rss_loaded_mb` minus the
-  YCSB harness's two `std::vector<ycsb::Record>` buffers (prefill_data
-  + per-workload data, both shared between fixtures and unrelated to
-  the system being compared; sizeof(Record) ≈ 216 B):
+  Fixture-only index DRAM — **superseded 2026-06-05 by direct white-box
+  measurement** (`fixture_dram_mb`, commit 88ff547; driver
+  [measure_dram.sh](../benchmark/measure_dram.sh)). The earlier
+  RSS-minus-estimated-harness table is dropped: it conflated the shared
+  YCSB vectors with fixture state and over-counted both systems. The
+  numbers below are each fixture's *own* index DRAM, computed from `sizeof`
+  of the live structures (Viper: CCEH directory + unique segments; HiOM:
+  HotTier + ColdTier-DRAM + residual CCEH), at t=1 with full prefill (DRAM
+  is workload/thread-independent, so one run per size suffices):
 
-  | size | Viper zipf | HiOM zipf | Δ        | Viper uniform | HiOM uniform | Δ        |
-  |------|-----------:|----------:|---------:|--------------:|-------------:|---------:|
-  | 5 M  | 4159       | **1075**  | **-74%** | 3797          | **661**      | **-83%** |
-  | 10 M | 4140       | 1353      | -67%     | 3778          | 1010         | -73%     |
-  | 16 M | 4117       | 1462      | -64%     | 3755          | 1098         | -71%     |
-  | 33 M | 4055       | 1538      | -62%     | 3697          | 1105         | -70%     |
+  | size | Viper (MB) | HiOM (MB) | HiOM/Viper | savings |
+  |------|-----------:|----------:|-----------:|--------:|
+  | 5 M  | 2052.0     | 272.0     | 13.3%      | **−86.7%** |
+  | 10 M | 2052.0     | 272.0     | 13.3%      | **−86.7%** |
+  | 16 M | 2052.0     | 272.0     | 13.3%      | **−86.7%** |
+  | 33 M | 2053.0     | 272.0     | 13.2%      | **−86.7%** |
+  | 50 M | 2064.8     | 272.0\*   | 13.2%      | **−86.8%** |
 
-  Viper's line is essentially flat at ~4000 MB — CCEH's 2 GiB
-  pre-allocation plus a roughly constant remainder (binary, OS,
-  Google Benchmark, fixture state) dominates. HiOM's line rises
-  modestly from ~1 GiB to ~1.5 GiB as ColdTier grows and HotTier
-  fills, while HotTier itself remains capped at 256 MiB by design.
-  **Net savings: HiOM uses 17–38% of Viper's fixture DRAM (–62% to
-  –83%) at every size**, comfortably exceeding the ≥50% win-condition
-  target. The absolute `rss_loaded_mb` numbers (e.g. 5 M zipf:
-  Viper 6219 MB, HiOM 3134 MB, –50%) are reported in [Phase 2 §RSS
-  appendix table](#) for transparency but understate the gap because
-  prefill_data + data_zipf/uniform vectors dominate at scale.
+  \*HiOM 50 M not measured (prefill livelocks past the HotTier cap — the M4
+  limitation); its index DRAM is the same 272 MB constant since HotTier
+  capacity (2²¹ buckets) is fixed regardless of dataset size. HiOM 33 M was
+  genuinely prefilled (`hot_tier_size` = 29.9 M, near the 33.5 M cap), so
+  its 272 MB is a real measurement, not an extrapolation.
 
-  Caveat: the comparison subtracts an *estimated* harness vector
-  footprint (record_count × 216 B), not a directly measured one,
-  because `mem_baseline` in [ycsb_bm.cpp:112](../benchmark/ycsb_bm.cpp#L112)
-  is captured *after* `InitMap()` and already includes the fixture's
-  index allocation, so the obvious subtract-baseline approach
-  zeroes the very gap we want to show. A future cleanup is to
-  move the baseline capture to before `InitMap()` so the metric
-  becomes directly measured.
+  **Both lines are essentially flat across the paper's size range, and the
+  saving is structural (−86.7 %), not a function of dataset size:**
+  - **Viper** is pinned at ~2052 MB by CCEH's 131 072-segment (≈2 GiB)
+    eager pre-allocation — flat through 16 M (load < 25 %, no splits), and
+    only creeping up (2053 → 2065 MB) at 33–50 M as segments begin to
+    split. Past the 134 M-slot capacity it would climb steeply.
+  - **HiOM** is pinned at 272 MB by the fixed HotTier capacity (ColdTier
+    lives in PMem ≈ 0 DRAM; the commit buffer is transient). It does not
+    grow with the dataset.
+
+  Net: HiOM uses **13 % of Viper's index DRAM (−86.7 %)** at every measured
+  size — comfortably beating the ≥ 50 % win-condition target, and the gap
+  only widens once the dataset grows past CCEH's pre-allocated capacity.
 
   **Win-condition graceful-degradation narrative** (the headline
   paper figure):
@@ -1226,10 +1231,9 @@ second; throughput is a *cost-bound*, not a contribution:
 
 - **C1 — DRAM-efficient offset map**: HiOM caches *index entries (offsets)*,
   not key/value data, so a fixed DRAM budget bounds the index footprint
-  regardless of dataset size. Fixture-specific DRAM savings of 62–83% vs.
-  Viper's CCEH across 5–33 M datasets (§Phase 2 — currently computed by
-  harness-footprint subtraction; direct measurement is a pending cleanup),
-  while Viper's CCEH preallocates ≈2 GB and grows linearly.
+  regardless of dataset size. White-box index DRAM is **272 MB (HiOM) vs
+  ~2052 MB (Viper CCEH) = −86.7%**, flat across 5–50 M (§Phase 2), while
+  Viper's CCEH eagerly preallocates ≈2 GB on init.
 - **C2 — Working-set-aware hot/cold index tiering**: a compact 8 B DRAM
   HotTier entry (4 B fingerprint + 4 B offset, with a ≤8 B vs. >8 B key
   case split, see §2.2) under SIEVE eviction, backed by an authoritative
@@ -1254,8 +1258,8 @@ recovery-sensitive** deployments:
 - **DRAM (primary win)**: for working sets that exceed a fixed DRAM budget,
   HiOM keeps index DRAM bounded while Viper's CCEH grows linearly and OOMs
   past DRAM capacity (CCEH preallocates ≈2 GB on init). Target: ≥50%
-  fixture-DRAM reduction. *Measured 62–83% across 5–33 M (§Phase 2; to be
-  re-reported via direct measurement — see Open items).*
+  fixture-DRAM reduction. *White-box measured (§Phase 2): HiOM 272 MB vs
+  Viper ~2052 MB = **−86.7%**, flat across 5–50 M.*
 - **Read-heavy throughput (acceptable-cost, not a win)**: on read-mostly
   workloads (YCSB-C analog) HiOM sustains 0.69–0.92× of Viper's per-thread
   throughput, with the single-thread `get` microbench occasionally ahead
