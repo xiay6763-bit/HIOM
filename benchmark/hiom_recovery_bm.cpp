@@ -34,6 +34,7 @@
 #include "viper/hiom/checkpoint.hpp"
 #include "viper/hiom/cold_tier.hpp"
 #include "viper/hiom/hiom.hpp"
+#include "viper/hiom/hot_tier.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -261,14 +262,131 @@ void run_one(std::size_t N, std::uint8_t threads) {
     std::printf("    speedup     = %.1fx\n", speedup);
 }
 
+// ---- M6.5 open-only diagnostic (reuses existing PM state) -------------
+// Does NOT cleanup or prefill. Measures the three open variants against
+// whatever state a prior --full run left on PM (assumed N=100M), with
+// per-phase timing, to isolate which costs (2 GB CCEH alloc / ColdTier
+// mmap / over-sized HotTier alloc) consume the tail-scan savings.
+// Repeated opens are read-only w.r.t. PM data (the only mutator,
+// cleanup_all, is never called here), so the 50-min prefill state is safe.
+
+using clk = std::chrono::steady_clock;
+double ms_between(clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+double g_baseline_ms = 0.0;
+
+// One HiOM open variant with phase breakdown. Returns total ms.
+double measure_hiom_open(const char* tag, std::size_t N,
+                         std::uint8_t threads, std::size_t cceh_cap,
+                         std::size_t hot_buckets) {
+    const auto t0 = clk::now();
+    viper::ViperConfig vcfg;
+    vcfg.skip_recovery = true;
+    vcfg.cceh_init_cap = cceh_cap;
+    auto viper = ViperT::open(kPoolDir, vcfg);
+    const auto t1 = clk::now();
+    auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+    const auto t2 = clk::now();
+    auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+    const auto t3 = clk::now();
+    HiOMT::RecoveryConfig rcfg;
+    rcfg.tail_scan = true;
+    rcfg.recovery_threads = threads;
+    HiOMT hiom(*viper, hot_buckets, cold.get(),
+               HiOMT::FlusherConfig{}, chkpt.get(),
+               HiOMT::CheckpointConfig{}, rcfg);
+    const auto t4 = clk::now();
+    const double total = ms_between(t0, t4);
+
+    std::printf("[%s] cceh_init_cap=%zu  hot_buckets=%zu\n",
+                tag, cceh_cap, hot_buckets);
+    std::printf("    viper_open = %8.1f ms  (CCEH alloc + skip_recovery)\n",
+                ms_between(t0, t1));
+    std::printf("    cold_open  = %8.1f ms  (mmap cold.bin)\n",
+                ms_between(t1, t2));
+    std::printf("    chkpt_open = %8.1f ms\n", ms_between(t2, t3));
+    std::printf("    hiom_ctor  = %8.1f ms  (HotTier alloc + tail scan)\n",
+                ms_between(t3, t4));
+    std::printf("    total      = %8.1f ms\n", total);
+
+    // Sanity: 100 random keys must all hit via HiOM (ColdTier-backed).
+    auto client = hiom.get_client();
+    std::mt19937_64 rng(0xfeed);
+    std::size_t hits = 0;
+    for (std::size_t i = 0; i < 100; ++i) {
+        const std::uint64_t k = (rng() % N) + 1;
+        std::uint64_t got = 0;
+        if (client.get(k, &got)) ++hits;
+    }
+    std::printf("    sanity     = %zu/100\n", hits);
+    if (g_baseline_ms > 0.0) {
+        std::printf("    speedup vs baseline = %.2fx\n",
+                    g_baseline_ms / total);
+    }
+    if (hits != 100) {
+        std::cerr << "  WARN: sanity < 100 for [" << tag
+                  << "]; its speedup is meaningless\n";
+    }
+    return total;
+}
+
+void run_open_only(std::uint8_t threads) {
+    // PM state from a prior --full run is assumed to hold N=100M.
+    constexpr std::size_t N = 100'000'000;
+    constexpr std::size_t kFairHotBuckets = 1ULL << 21;  // 2M buckets ~256 MB
+
+    std::printf("\n=== OPEN-ONLY DIAGNOSTIC (reusing existing PM state) ===\n");
+    std::printf("Assuming N=%zu. NO cleanup/prefill performed.\n", N);
+    std::printf("Pool=%s\n\n", kPoolDir);
+
+    // Baseline: full recover_database.
+    {
+        viper::ViperConfig cfg;
+        cfg.num_recovery_threads = threads;
+        const auto t0 = clk::now();
+        auto viper = ViperT::open(kPoolDir, cfg);
+        const auto t1 = clk::now();
+        g_baseline_ms = ms_between(t0, t1);
+        std::printf("[baseline] recover_database (default config)\n");
+        std::printf("    total      = %8.1f ms\n\n", g_baseline_ms);
+    }
+
+    // HiOM as the --full benchmark runs it today.
+    measure_hiom_open("hiom-current", N, threads,
+                      /*cceh_cap=*/131072, hot_buckets_for(N));
+    std::printf("\n");
+    // HiOM as a real deployment would configure it.
+    measure_hiom_open("hiom-fair", N, threads,
+                      /*cceh_cap=*/1, kFairHotBuckets);
+    std::printf("\n");
+
+    // Reference: standalone empty-HotTier alloc cost (alloc + init only).
+    {
+        const auto a0 = clk::now();
+        { viper::hiom::HotTier ht(hot_buckets_for(N)); }
+        const auto a1 = clk::now();
+        { viper::hiom::HotTier ht(kFairHotBuckets); }
+        const auto a2 = clk::now();
+        std::printf("[ref] standalone HotTier alloc:\n");
+        std::printf("    %zu buckets (current) = %8.1f ms\n",
+                    hot_buckets_for(N), ms_between(a0, a1));
+        std::printf("    %zu buckets (fair)    = %8.1f ms\n",
+                    kFairHotBuckets, ms_between(a1, a2));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     // Default sweep is dev-loop: small N for quick iteration. Pass
     // --full to run the 100M case (takes ~30 min including prefill).
     bool full = false;
+    bool open_only = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--full") full = true;
+        if (std::string(argv[i]) == "--open-only") open_only = true;
     }
 
     std::vector<std::size_t> sizes = {1'000'000, 10'000'000};
@@ -279,6 +397,13 @@ int main(int argc, char** argv) {
     std::printf("HiOM recovery benchmark (M6.5)\n");
     std::printf("Pool=%s  recovery_threads=%u\n",
                 kPoolDir, kThreads);
+
+    if (open_only) {
+        run_open_only(kThreads);
+        std::printf("\nDone.\n");
+        return 0;
+    }
+
     if (!full) {
         std::printf("(dev-loop sweep; pass --full for 100M case)\n");
     }
