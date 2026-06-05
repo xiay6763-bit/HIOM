@@ -256,9 +256,11 @@ def plot_workload(workload, w_data):
 def plot_latency(workload, w_data):
     """Tail-latency plot: read p99/p999 and write p99/p999 vs size.
 
-    Two columns (read | write) × two rows (p99 | p999). Each panel
-    plots Viper and HiOM as separate lines vs dataset size at t=8
-    (the latency-only thread axis we collect in the sweep).
+    For read-only workloads (100r_*) we drop the write panels — they
+    have no data by construction (YCSB-C analog) and the "no data"
+    placeholders looked like a chart bug. Layout becomes 1×2 (Read p99
+    | Read p99.9). For mixed workloads (YCSB-A/B) the 2×2 layout
+    stays so read and write tails sit side-by-side at the same size.
     Workloads where the relevant op type has zero samples (e.g., the
     write panel for 100r_*) simply have no line and a no-data note.
     """
@@ -266,18 +268,32 @@ def plot_latency(workload, w_data):
                     for s in w_data.get(fx, {}).keys()})
     if not sizes:
         return
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    read_only = workload.startswith("100r")
+    if read_only:
+        fig, axes_arr = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
+        panels = [
+            (0, 0, "hdr_read_99",  "Read p99"),
+            (0, 1, "hdr_read_999", "Read p99.9"),
+        ]
+    else:
+        fig, axes_arr = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+        panels = [
+            (0, 0, "hdr_read_99",   "Read p99"),
+            (0, 1, "hdr_write_99",  "Write p99"),
+            (1, 0, "hdr_read_999",  "Read p99.9"),
+            (1, 1, "hdr_write_999", "Write p99.9"),
+        ]
     fig.suptitle(f"Tail latency — {workload} (t=8)",
                  fontsize=14, fontweight="bold")
-    panels = [
-        (0, 0, "hdr_read_99",   "Read p99"),
-        (0, 1, "hdr_write_99",  "Write p99"),
-        (1, 0, "hdr_read_999",  "Read p99.9"),
-        (1, 1, "hdr_write_999", "Write p99.9"),
-    ]
+
+    def get_ax(r, c):
+        # 1×N axes are returned as a flat array, 2×N as a 2-D one.
+        return axes_arr[c] if read_only else axes_arr[r, c]
+
     any_data = False
+    bottom_row = 0 if read_only else 1
     for (r, c, key, title) in panels:
-        ax = axes[r, c]
+        ax = get_ax(r, c)
         hang_xs = set()
         for fixture in FIXTURES:
             xs, ys = [], []
@@ -306,7 +322,7 @@ def plot_latency(workload, w_data):
                     color="gray", fontsize=9)
         for x in sorted(hang_xs):
             _mark_hang(ax, x, label="HANG\n(M4)")
-        if r == 1:
+        if r == bottom_row:
             ax.set_xlabel("Dataset size (M records)")
     if not any_data:
         plt.close()
