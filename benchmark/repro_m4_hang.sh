@@ -34,6 +34,11 @@
 #                            above it.
 #
 # Env overrides:
+#   WORKLOAD         YCSB workload tag (default a_uniform; e.g. a_zipf,
+#                    b_uniform, b_zipf, 100r_uniform, 100r_zipf)
+#   SIZE             dataset size tag (default 16M; e.g. 33M, 50M)
+#   THREADS          thread count for the filter (default 24)
+#   METRIC           tp or lat (default tp)
 #   TIMEOUT_S        wall-clock budget before SIGKILL (default 1200)
 #   SAMPLE_AT_S      first stack/perf snapshot (default 600)
 #   OUT_DIR_BASE     where to put the run directory (default /tmp)
@@ -42,13 +47,18 @@
 set -uo pipefail
 
 YCSB_BM="${YCSB_BM:-/root/viper/build/benchmark/ycsb_bm}"
-PREFILL_FILE="/pmem0/ycsb_data/ycsb_prefill_16M.dat"
-WORKLOAD_FILE="/pmem0/ycsb_data/ycsb_wl_a_uniform_16M.dat"
+WORKLOAD="${WORKLOAD:-a_uniform}"
+SIZE="${SIZE:-16M}"
+THREADS="${THREADS:-24}"
+METRIC="${METRIC:-tp}"
+PREFILL_FILE="/pmem0/ycsb_data/ycsb_prefill_${SIZE}.dat"
+WORKLOAD_FILE="/pmem0/ycsb_data/ycsb_wl_${WORKLOAD}_${SIZE}.dat"
 TIMEOUT_S="${TIMEOUT_S:-1200}"
 SAMPLE_AT_S="${SAMPLE_AT_S:-600}"
 OUT_DIR_BASE="${OUT_DIR_BASE:-/tmp}"
 
-OUT_DIR="${OUT_DIR_BASE}/hiom_m4_repro_$(date +%Y%m%d_%H%M%S)"
+CELL_TAG="${WORKLOAD}_${SIZE}_${METRIC}_t${THREADS}"
+OUT_DIR="${OUT_DIR_BASE}/hiom_m4_repro_${CELL_TAG}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${OUT_DIR}"
 LOG="${OUT_DIR}/bm.log"
 JSON="${OUT_DIR}/bm.json"
@@ -63,18 +73,18 @@ done
 have_gdb=1;  command -v gdb  >/dev/null 2>&1 || { echo "warn: gdb not in PATH — skipping thread stack snapshots";  have_gdb=0; }
 have_perf=1; command -v perf >/dev/null 2>&1 || { echo "warn: perf not in PATH — skipping CPU sampling";          have_perf=0; }
 
-echo "=== Repro: HiOMFixture<KeyType8, ValueType200> a_uniform_tp 16M threads:24 ==="
+echo "=== Repro: HiOMFixture<KeyType8, ValueType200> ${WORKLOAD}_${METRIC} ${SIZE} threads:${THREADS} ==="
 echo "OUT_DIR     : ${OUT_DIR}"
 echo "TIMEOUT_S   : ${TIMEOUT_S}"
 echo "SAMPLE_AT_S : ${SAMPLE_AT_S}"
 echo
 
-# Launch ycsb_bm with a strict filter — only the threads:24 cell
-# of the hung workload. The benchmark itself will internally do the
-# 16M-key prefill via the util thread pool (NUM_UTIL_THREADS=36
-# from benchmark.hpp), then run 3 reps of the timed phase at t=24.
-YCSB_SIZE_TAG=16M "${YCSB_BM}" \
-    --benchmark_filter='HiOMFixture.*a_uniform_tp.*threads:24$' \
+# Launch ycsb_bm with a strict filter — only the chosen workload + thread cell.
+# The benchmark itself will internally do the dataset prefill via the util
+# thread pool (NUM_UTIL_THREADS=36 from benchmark.hpp), then run 3 reps of
+# the timed phase at the chosen thread count.
+YCSB_SIZE_TAG="${SIZE}" "${YCSB_BM}" \
+    --benchmark_filter="HiOMFixture.*${WORKLOAD}_${METRIC}.*threads:${THREADS}\$" \
     --benchmark_out="${JSON}" \
     --benchmark_out_format=json \
     >"${LOG}" 2>&1 &
