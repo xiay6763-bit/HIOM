@@ -36,10 +36,19 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     block).
   - **Next steps (priority order, 2026-06-05)**:
     1. ✅ this repositioning (header + contributions + win condition).
-    2. Direct fixture-DRAM measurement — move `mem_baseline` capture ahead
-       of `InitMap()` ([ycsb_bm.cpp:112](../benchmark/ycsb_bm.cpp#L112)),
-       re-report the Phase 0 / Phase 2 DRAM tables as measured deltas
-       instead of harness-subtraction estimates.
+    2. **Direct fixture-DRAM measurement — white-box landed (88ff547)**.
+       RSS-diff (loaded − baseline) collapses on `repeats:N` (glibc doesn't
+       return freed arenas; `DeInitMap` leaves RSS elevated, so rep>0 reads
+       a polluted baseline). Replaced by a white-box metric: each fixture
+       reports its own index DRAM from `sizeof` of the live structures —
+       CCEH / HotTier / ColdTier / HiOM gained `dram_bytes()`, surfaced as
+       the authoritative `fixture_dram_mb` counter (RSS-diff kept as
+       `fixture_dram_rss_mb` cross-check). 1M `100r_zipf` t=1 smoke:
+       white-box **constant across 3 reps (cv=0%)** — Viper 2052 MB vs
+       HiOM 272 MB = **−86.7%**, matching the ~2 GB CCEH vs 256 MB HotTier
+       design point. **Still TODO**: re-run the Phase 2 grid to replace the
+       harness-subtraction DRAM tables with white-box numbers (DRAM is
+       workload-independent → one t=1 run per dataset size suffices).
     3. Recovery 10M/50M/100M: Viper full-rebuild vs HiOM tail-scan, plus
        checkpoint-cadence / tail-size sensitivity. Use a recovery-only
        oversized HotTier (≥ dataset) or slow single-thread prefill to dodge
