@@ -23,10 +23,9 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   track). Rationale: the current evidence supports a *scoped* claim, not
   an across-the-board win over Viper. Write-heavy throughput is weak
   (YCSB-A/B 0.24–0.45× at t=24), `a_zipf-33M` livelocks (M4 back-pressure),
-  the 40× recovery claim still lacks the 100 M datapoint, and (at the time
-  of this repositioning) the Phase 2 DRAM numbers were computed by
-  subtracting an *estimated* harness footprint rather than measured
-  directly — **since resolved**: DRAM is now directly white-box measured
+  and (at the time of this repositioning) the Phase 2 DRAM numbers were
+  computed by subtracting an *estimated* harness footprint rather than
+  measured directly — **since resolved**: DRAM is now directly white-box measured
   (88ff547 / 7a2be60, see §Phase 2). Narrowed thesis: **"a DRAM-efficient
   tiered offset map for PM KV stores — trading acceptable throughput loss
   for large DRAM savings and bounded recovery, in DRAM-constrained
@@ -53,11 +52,15 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
        per dataset size (DRAM is workload-independent → one run suffices)
        and the harness-subtraction DRAM tables in §Phase 2 are now replaced
        with white-box numbers (−86.7%, flat across 5–50M).
-    3. Recovery 10M/50M/100M: Viper full-rebuild vs HiOM tail-scan, plus
-       checkpoint-cadence / tail-size sensitivity. Use a recovery-only
-       oversized HotTier (≥ dataset) or slow single-thread prefill to dodge
-       the same prefill livelock that blocks `a_zipf-33M` — recovery times
-       `open()`, not steady-state DRAM, so the inflated HotTier is harmless.
+    3. ✅ **Recovery 100M measured (2026-06-05)** — `hiom_recovery_bm`
+       `--full` (single-thread prefill dodges the `a_zipf-33M` livelock),
+       then a new `--open-only` mode for a deployment-fair open comparison
+       reusing the prefilled PM state. **Result: ~25× faster cold-start
+       open** (baseline ~2180 ms vs HiOM fair ~87 ms; ~15× warm-baseline
+       conservative). The naïve `--full` 1.0× at 100M was an artifact of
+       oversized CCEH (~277 ms) + 16 M-bucket HotTier (~1030 ms) init, not
+       recovery work — see §M6.5 recovery wall-clock. Still open:
+       checkpoint-cadence / tail-size sensitivity.
     4. Ablation: HotTier capacity, SIEVE vs LRU/random (needs a pluggable
        eviction interface — currently hard-wired), batch size, flusher
        count, checkpoint cadence.
@@ -675,17 +678,36 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   - M6 recovery shape (10K writes, slow flusher): replayed ≈ 5446
     entries from a 4-block tail (block 3 boundary + blocks 4–6),
     cold goes 5000→10000, all 10K reads succeed post-recovery.
-  - M6.5 recovery wall-clock (`hiom_recovery_bm`,
-    `recovery_threads=32`):
-    | N    | baseline_ms | hiom_ms | speedup | notes |
-    |------|-------------|---------|---------|-------|
-    | 1M   | ~240        | ~260    | 0.9×    | HiOM open dominated by ColdTier mmap + HotTier ctor |
-    | 10M  | 290–910     | ~580    | 0.5×–1.5× | high inter-run variance from `/pmem0` mount sharing |
-    | 100M | TBD (deferred to follow-up run; see *Performance follow-up* below) | | | |
-    Variance is dominated by other tenants on `/pmem0`: across two
-    consecutive runs at 10M the baseline ranged 293–910 ms while
-    HiOM stayed ~580 ms. Asymptotically baseline is O(all VPages)
-    and HiOM is O(tail), so the gap widens at 100M.
+  - M6.5 recovery wall-clock (`hiom_recovery_bm`, `recovery_threads=32`,
+    N=100M). Main result is the **fair open-only** comparison
+    (`--open-only`, reusing one prefilled PM state, 3 cold-start runs,
+    cv < 3%):
+
+    | metric | value |
+    |--------|-------|
+    | baseline cold open (`recover_database`, full CCEH rebuild) | **~2180 ms** |
+    | HiOM fair open (`cceh_init_cap=1` + fixed 256 MB / 2 M-bucket HotTier) | **~87 ms** |
+    | **speedup** | **~25× (cold-start)** |
+
+    Conservative floor: against a *warm* baseline (1302 ms, measured
+    back-to-back right after prefill with caches hot) the win is still
+    ~15×. Cold-start is the honest restart-recovery number, so ~25× is
+    the headline. HiOM fair-open phase split (total ~87 ms): viper_open
+    ~0.8 ms (`skip_recovery`, CCEH cap=1) · cold_open ~0.1 ms (lazy mmap
+    of the 16 G `cold.bin` — not a cost) · hiom_ctor ~84 ms (HotTier
+    alloc ~28 ms + tail replay + counter priming). The tail replay is
+    the sole O(tail) term; everything else is data-size-independent
+    fixed setup, while the baseline's ~2.2 s scales O(N).
+
+    *Artifact note (why an earlier number read break-even):* the naïve
+    end-to-end `--full` run showed only break-even performance (**1.0×
+    at 100M**) because it included oversized CCEH (≈2 GB init, ~277 ms)
+    and HotTier (16 M buckets, ~1030 ms — sized 2×N to suppress prefill
+    eviction) initialization costs. The phase breakdown shows these
+    costs are benchmark artifacts rather than recovery work — a
+    standalone `[ref]` alloc confirms 16 M buckets ~1030 ms vs 2 M
+    buckets ~28 ms. 1M/10M stay ≤1× for the same reason (fixed setup
+    dwarfs the tiny tail at small N).
   - **Resolver post-restart correctness** (Phase D, M6.5 full):
     2000 prefill keys → reopen with skip_recovery=true →
     cl.update(every key) → cl.remove(half) → live VPage records:
@@ -1246,8 +1268,10 @@ second; throughput is a *cost-bound*, not a contribution:
 - **C3 — Crash-consistent group commit + bounded recovery**: pin invariants,
   A/B checkpoints, and a tail-scan recovery. HiOM turns index recovery from
   full VPage reconstruction, O(N), into checkpoint-bounded tail replay,
-  O(tail); the concrete speedup is evaluated separately and the previous
-  40× target remains pending 100 M-scale validation.
+  O(tail). Measured at 100 M (open-only, deployment-fair config):
+  **~25× faster cold-start open** (~87 ms vs ~2.2 s), ~15× against a warm
+  baseline as a conservative floor. The previous 40× target is not reached,
+  but the order-of-magnitude recovery win holds.
 
 Supporting techniques: per-thread commit buffer using existing
 `concurrentqueue`; 32-region linear hashing for parallel cold-tier load;
@@ -1270,7 +1294,8 @@ recovery-sensitive** deployments:
   (1.03–1.06×) because the 8 B HotTier slot bypasses CCEH's segment lookup.
   The story is "comparable reads at a fraction of the DRAM", not "faster".
 - **Recovery (secondary win)**: O(unflushed tail) vs Viper's O(all data)
-  full CCEH rebuild.
+  full CCEH rebuild — **~25× faster cold-start open at 100 M** (~87 ms vs
+  ~2.2 s; ~15× conservative against a warm baseline).
 
 **Explicitly out of scope / known limitations** (demoted from the previous
 win claim, presented as limitations in the paper — not wins):
@@ -2200,7 +2225,8 @@ all 5K reads hit.
 Retiring CCEH from Viper's `put` / `update` / `remove` so
 `recover_database()` can be skipped entirely (the only thing it
 rebuilds is `map_`, which is unused if HiOM is authoritative).
-Required for the paper's "40× faster recovery" claim.
+Required for the paper's order-of-magnitude faster-recovery claim
+(measured ~25× at 100M open-only; see §M6.5 recovery wall-clock).
 
 - [x] Refactor `Viper::Client::put` (existing-key path) to
       consult HiOM (cold or hot) for the previous offset when
@@ -2222,16 +2248,23 @@ Required for the paper's "40× faster recovery" claim.
       refactor (regression surface). All 7 integration tests pass
       including the new Phase D resolver-correctness check.
       (2026-05-04)
-- [ ] Run benchmark with `--full` (100M dataset) once a noise-free
-      PM time slot opens. The asymptotic gap (baseline O(N) vs
-      HiOM O(tail)) is unmistakable at this scale; the goal of the
-      run is to record a clean datapoint, not to validate the
-      design.
+- [x] Run benchmark with `--full` (100M) + `--open-only` fair
+      comparison (2026-06-05). The O(N)-vs-O(tail) gap is real but
+      only visible under a deployment-fair config: naïve `--full` at
+      100M reads 1.0× (artifact — oversized CCEH ~277 ms + 16 M-bucket
+      HotTier ~1030 ms swamp the tail replay). `--open-only` with
+      `cceh_init_cap=1` + a fixed 256 MB HotTier gives **~25×**
+      (baseline ~2180 ms vs HiOM ~87 ms). Added `--open-only` mode
+      (reuses prefilled PM state, per-phase timing). See §M6.5
+      recovery wall-clock.
 
 Exit criteria met: write-path retirement landed, all
 correctness tests pass (including slot-accounting on Phase D).
-The 100M datapoint is a measurement formality; deferring it to a
-follow-up does not block M7.
+The 100M datapoint (2026-06-05) turned out *not* to be a mere
+formality — the naïve end-to-end run read 1.0× and a phase
+breakdown was needed to separate the tail replay from oversized
+CCEH/HotTier setup; fair-config open-only is ~25×. See §M6.5
+recovery wall-clock.
 
 ### M6.5 design notes (2026-05-04)
 
