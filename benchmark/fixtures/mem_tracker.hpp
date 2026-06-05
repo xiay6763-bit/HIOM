@@ -27,6 +27,7 @@ struct MemSnapshot {
     std::uint64_t hot_evictions = 0;
     std::uint64_t hot_hits = 0;
     std::uint64_t cold_hits = 0;
+    std::uint64_t hot_dram_bytes = 0;  // HotTier index struct DRAM (buckets+meta sizeof)
 };
 
 inline std::uint64_t parse_vmrss_kb() {
@@ -118,6 +119,11 @@ inline void report_mem(benchmark::State& state,
     state.counters["hot_tier_size"]  = static_cast<double>(loaded.hot_size);
     state.counters["hot_capacity"]   = static_cast<double>(loaded.hot_capacity);
     state.counters["hot_evictions"]  = static_cast<double>(loaded.hot_evictions);
+    // HotTier index-structure DRAM (buckets+meta sizeof, NOT process RSS).
+    // Authoritative x-axis for the C2 capacity sweep; consistent with C1's
+    // white-box dram_bytes() metric.
+    state.counters["hot_tier_index_dram_mb"] =
+        static_cast<double>(loaded.hot_dram_bytes) * b_to_mb;
     const std::uint64_t total_hits = loaded.hot_hits + loaded.cold_hits;
     if (total_hits > 0) {
         state.counters["hot_hit_rate"] =

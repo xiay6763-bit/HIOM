@@ -61,9 +61,27 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
        oversized CCEH (~277 ms) + 16 M-bucket HotTier (~1030 ms) init, not
        recovery work — see §M6.5 recovery wall-clock. Still open:
        checkpoint-cadence / tail-size sensitivity.
-    4. Ablation: HotTier capacity, SIEVE vs LRU/random (needs a pluggable
-       eviction interface — currently hard-wired), batch size, flusher
-       count, checkpoint cadence.
+    4. ✅ **HotTier capacity ablation (2026-06-05)** — `scan_hot_capacity.sh`
+       sweeps `HIOM_HOT_BUCKETS_LOG2` 16–21 (1 M–33 M slots = 10%–330% of the
+       10 M YCSB-C working set), 3-rep median, white-box
+       `hot_tier_index_dram_mb` as the x-axis. **Hit rate climbs with the DRAM
+       budget and skew pays off at tight budgets**: at 10% budget zipf hits
+       0.62 vs uniform 0.19; at 40%, 0.74 vs 0.70; both saturate to ~1.0 once
+       the budget reaches the working set (uniform overtakes zipf past ~84% as
+       its cumulative coverage outpaces zipf's tail churn). t=8 full-capacity
+       read-heavy ratio (HiOM/Viper): **uniform 0.90× / zipf 0.73×** — inside
+       the 0.69–0.92 Win band, and clarifies the stale 0.27–0.58 from Status
+       05-17 (predated prefill-then-rebuild + M6.6). **Measurement caveat**: at
+       high thread counts the *small* capacities livelock in the read path
+       (concurrent `mirror_into_hot` spinning on each other's PINNED slots
+       during SIEVE eviction — a read-side analogue of `a_zipf-33M`), so the
+       capacity curve is measured at t=1, where hit rate (thread-independent)
+       is clean; see §Win condition limitations. Artifacts:
+       `eval/charts/hot_capacity_{hitrate,throughput}.png`,
+       `results/hot_scan/summary.csv`, `results/hot_scan/readheavy_ratio.txt`.
+       Remaining priority-4 work: SIEVE vs LRU/random (needs a pluggable
+       eviction interface — currently hard-wired), batch size, flusher count,
+       checkpoint cadence.
     5. Baseline expansion: un-comment Dash/CCEH/FASTER from the `ALL_BMS`
        blocks (fixtures already wired per CLAUDE.md), or justify Viper as
        the sole primary baseline.
@@ -1264,7 +1282,11 @@ second; throughput is a *cost-bound*, not a contribution:
   HotTier entry (4 B fingerprint + 4 B offset, with a ≤8 B vs. >8 B key
   case split, see §2.2) under SIEVE eviction, backed by an authoritative
   PMem ColdTier — the first application of working-set-aware index tiering
-  to persistent hash indices in hybrid PM-DRAM KV stores.
+  to persistent hash indices in hybrid PM-DRAM KV stores. The capacity
+  ablation (§Status 06-05, YCSB-C 10 M) quantifies the value of skew at
+  tight DRAM budgets: a HotTier sized for **10% of the working set hits 62%
+  on zipfian reads vs 19% uniform**, both rising to ~1.0 once the budget
+  reaches the working set.
 - **C3 — Crash-consistent group commit + bounded recovery**: pin invariants,
   A/B checkpoints, and a tail-scan recovery. HiOM turns index recovery from
   full VPage reconstruction, O(N), into checkpoint-bounded tail replay,
@@ -1289,10 +1311,15 @@ recovery-sensitive** deployments:
   fixture-DRAM reduction. *White-box measured (§Phase 2): HiOM 272 MB vs
   Viper ~2052 MB = **−86.7%**, flat across 5–50 M.*
 - **Read-heavy throughput (acceptable-cost, not a win)**: on read-mostly
-  workloads (YCSB-C analog) HiOM sustains 0.69–0.92× of Viper's per-thread
-  throughput, with the single-thread `get` microbench occasionally ahead
-  (1.03–1.06×) because the 8 B HotTier slot bypasses CCEH's segment lookup.
-  The story is "comparable reads at a fraction of the DRAM", not "faster".
+  workloads (YCSB-C analog, full HotTier) HiOM sustains 0.69–0.92× of Viper's
+  per-thread throughput — **measured 2026-06-05 at t=8 full-capacity: uniform
+  0.90×, zipf 0.73×** (supersedes the 0.27–0.58 of Status 05-17, which
+  predated prefill-then-rebuild + the M6.6 CCEH write-path retirement that
+  lifted HiOM read throughput ~50%, e.g. zipf t=8 10.15 M → 15.20 M items/s).
+  At t=1 the 8 B HotTier slot bypasses CCEH's segment lookup, so HiOM is
+  occasionally ahead (full-cap zipf 2.99 M vs Viper 2.27 M items/s); Viper's
+  CCEH scales better with threads, hence the sub-1.0 ratio at t=8. The story
+  is "comparable reads at a fraction of the DRAM", not "faster".
 - **Recovery (secondary win)**: O(unflushed tail) vs Viper's O(all data)
   full CCEH rebuild — **~25× faster cold-start open at 100 M** (~87 ms vs
   ~2.2 s; ~15× conservative against a warm baseline).
@@ -1310,6 +1337,15 @@ win claim, presented as limitations in the paper — not wins):
   outside the current scoped win condition, but not outside the system's
   long-term target: the evaluation matrix labels the cell and discusses it
   as a limitation, with a per-region SIEVE clock-pacing fix as future work.
+- **Small HotTier + high read concurrency can livelock**: when the read
+  working set far exceeds HotTier capacity, concurrent `mirror_into_hot`
+  inserts contend on SIEVE eviction and spin on each other's PINNED slots —
+  the read-side analogue of `a_zipf-33M` (discovered 2026-06-05 during the
+  capacity ablation). Reproduced at t=8 for budgets ≤40% of the working set
+  (log2 ≤ 18); t=1 is unaffected (single-threaded eviction always finds an
+  unpinned victim), so the capacity ablation measures hit rate at t=1 —
+  thread-independent, hence no loss of generality. The same per-region SIEVE
+  clock-pacing fix applies as future work.
 
 ---
 
@@ -1708,6 +1744,7 @@ reclamation until the epoch advances past all reader epochs.
 | Hot-tier slot lost (DRAM bit flip) | Lookup misses → falls through to cold tier | Cold tier authoritative |
 | Hot-tier loaded with stale offset (race) | Verify step on PM data catches via key check | Returns MISS, retry |
 | Hot-tier full of PINNED | Insert blocks on commit-buffer flush trigger | Backpressure |
+| Concurrent read mirror into full HotTier (t>1) | SIEVE evict spins on peers' PINNED victims (read-side a_zipf-33M) | Measure hit-rate at t=1; clock-pacing fix future work |
 | Crash | Hot tier entirely volatile, lost | Cold tier + VPage scan rebuild |
 
 The hot tier holds **no authoritative state**. Every entry is either

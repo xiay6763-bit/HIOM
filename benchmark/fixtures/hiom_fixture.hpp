@@ -93,6 +93,7 @@ class HiOMFixture : public BaseFixture {
             snap.hot_size = ht.size();
             snap.hot_capacity = ht.capacity();
             snap.hot_evictions = ht.eviction_count();
+            snap.hot_dram_bytes = ht.dram_bytes();
             const auto& stats = hiom_->stats();
             snap.hot_hits = stats.hot_hits.load(std::memory_order_relaxed);
             snap.cold_hits = stats.cold_hits.load(std::memory_order_relaxed);
@@ -159,6 +160,20 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     }
     cleanup_hiom_artefacts();
 
+    // Optional capacity override for the C2 HotTier-capacity sweep.
+    // HIOM_HOT_BUCKETS_LOG2 = log2(num_buckets); validated to [10,30] so a
+    // typo can't silently pick an absurd capacity or UB the 1ULL<<log2 shift.
+    if (const char* e = std::getenv("HIOM_HOT_BUCKETS_LOG2")) {
+        char* end = nullptr;
+        const unsigned long log2 = std::strtoul(e, &end, 10);
+        if (end == e || *end != '\0' || log2 < 10 || log2 > 30) {
+            std::cerr << "HIOM_HOT_BUCKETS_LOG2 must be an integer in [10,30], got: "
+                      << e << std::endl;
+            std::abort();
+        }
+        hot_buckets_pow2_ = 1ULL << log2;
+    }
+
     // 1. Viper. We use a directory pool (mirrors integration tests), not
     //    the /dev/dax* pool that ViperFixture defaults to — keeps HiOM's
     //    artefacts tidy in one place and avoids fighting ViperFixture
@@ -195,7 +210,17 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     typename HiOMT::CheckpointConfig ccfg;
     ccfg.cadence_entries = checkpoint_cadence_;
     typename HiOMT::RecoveryConfig rcfg;  // tail_scan=false (fresh DB)
-    hiom_ = std::make_unique<HiOMT>(*viper_, hot_buckets_pow2_,
+    // Build HiOM with a LARGE HotTier for prefill so small-capacity sweep
+    // points don't livelock during the 10M put storm (SIEVE evict vs PINNED
+    // slots — same root cause as a_zipf-33M). The read phase then rebuilds
+    // at the target capacity from an EMPTY HotTier, backed by the
+    // authoritative ColdTier; this also yields a cleaner per-capacity steady
+    // state (every point starts cold, not from prefill residue).
+    const std::size_t target_buckets = hot_buckets_pow2_;
+    const std::size_t prefill_buckets =
+        target_buckets > (std::size_t{1} << 21) ? target_buckets
+                                                 : (std::size_t{1} << 21);
+    hiom_ = std::make_unique<HiOMT>(*viper_, prefill_buckets,
                                     cold_.get(), fcfg,
                                     chkpt_.get(), ccfg, rcfg);
 
@@ -205,6 +230,16 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     // for "background catch-up" — every prefill entry is in ColdTier
     // and the HotTier slots are kUnpinned by the time the timer starts.
     hiom_->flush_and_wait();
+
+    if (target_buckets != prefill_buckets) {
+        // Rebuild at the target HotTier capacity. viper_/cold_/chkpt_ persist
+        // (ColdTier holds all N entries, authoritative); the new HotTier
+        // starts empty and warms from ColdTier during the read phase.
+        hiom_.reset();
+        hiom_ = std::make_unique<HiOMT>(*viper_, target_buckets,
+                                        cold_.get(), fcfg,
+                                        chkpt_.get(), ccfg, rcfg);
+    }
     initialized_ = true;
 }
 
