@@ -501,6 +501,14 @@ class ColdTier {
         return total;
     }
 
+    // White-box DRAM footprint. The index (regions/buckets/overflow pool)
+    // lives entirely in the PMem mmap at base_ and is NOT counted as DRAM;
+    // only the control struct + pool path string are DRAM-resident, so this
+    // is ≈0 by design (the point of tiering the cold index onto PMem).
+    std::size_t dram_bytes() const {
+        return sizeof(*this) + pool_file_.capacity();
+    }
+
   private:
     ColdTier(const std::string& pool_file, void* base,
              std::size_t total_size,

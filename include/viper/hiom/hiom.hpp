@@ -728,6 +728,16 @@ class HiOM {
     ColdTier* cold_tier() { return cold_; }
     CommitBuffer* commit_buffer() { return commit_buf_.get(); }
     const Stats& stats() const { return stats_; }
+
+    // White-box DRAM footprint of the HiOM index tiers. HotTier (DRAM hash
+    // table) is the dominant term; ColdTier lives in a PMem mmap (≈0 DRAM);
+    // the commit buffer is transient (drained between flushes) and excluded.
+    // Used by HiOMFixture::fixture_dram_bytes() for the index-DRAM metric.
+    std::size_t dram_bytes() const {
+        std::size_t b = hot_.dram_bytes();
+        if (cold_ != nullptr) b += cold_->dram_bytes();
+        return b;
+    }
     BlockBaseMap& base_map() { return base_map_; }
 
     // M5 introspection. flushed_count is the cumulative number of

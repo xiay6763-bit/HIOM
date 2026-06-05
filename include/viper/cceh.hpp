@@ -336,6 +336,26 @@ class CCEH {
     void Remove(IndexV* offset);
     size_t Capacity(void);
 
+    // White-box DRAM footprint: the directory's pointer array plus every
+    // uniquely-allocated Segment. Extendible hashing shares one Segment
+    // across 2^(global_depth - local_depth) *contiguous* directory entries
+    // after a split, so we dedup by skipping repeated adjacent pointers
+    // (buddies are always contiguous in the directory). Used by the
+    // benchmark fixtures for white-box index-DRAM measurement.
+    size_t dram_bytes() const {
+        if (!dir) return 0;
+        size_t total = sizeof(Directory<KeyType>)
+                     + dir->capacity * sizeof(Segment<KeyType>*);
+        Segment<KeyType>* prev = nullptr;
+        for (size_t i = 0; i < dir->capacity; ++i) {
+            if (dir->_[i] != prev) {
+                total += sizeof(Segment<KeyType>);
+                prev = dir->_[i];
+            }
+        }
+        return total;
+    }
+
   private:
     Directory<KeyType>* dir;
     static constexpr bool using_fp_ = requires_fingerprint(KeyType);

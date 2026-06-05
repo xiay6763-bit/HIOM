@@ -555,6 +555,11 @@ class Viper {
         return hiom_map_skipped_.load(std::memory_order_relaxed);
     }
 
+    // White-box DRAM footprint of the CCEH offset map (directory + unique
+    // segments). Used by the benchmark fixtures to report index DRAM
+    // directly instead of RSS diffing. See cceh::CCEH::dram_bytes().
+    size_t cceh_dram_bytes() const { return map_.dram_bytes(); }
+
     // M4 Phase C: cheap "is this offset still pointing at a live
     // record" predicate. Used by HiOM's apply_batch coalesce path
     // to skip cold-tier writes for offsets whose VPage slot has

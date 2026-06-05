@@ -35,6 +35,11 @@ class ViperFixture : public BaseFixture {
         return viper_.get();
     }
 
+    // White-box index DRAM = the CCEH offset map's directory + segments.
+    size_t fixture_dram_bytes() override {
+        return viper_ ? viper_->cceh_dram_bytes() : 0;
+    }
+
   protected:
     std::unique_ptr<ViperT> viper_;
     bool viper_initialized_ = false;

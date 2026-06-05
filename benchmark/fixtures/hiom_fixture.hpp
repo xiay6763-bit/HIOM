@@ -100,6 +100,15 @@ class HiOMFixture : public BaseFixture {
         return snap;
     }
 
+    // White-box index DRAM = HiOM tiers (HotTier dominant; ColdTier in PMem)
+    // plus the residual single-segment CCEH (cceh_init_cap=1 ⇒ ~16 KB) that
+    // Viper still constructs under HiOM. Reported as fixture_dram_mb.
+    size_t fixture_dram_bytes() override {
+        size_t b = hiom_ ? hiom_->dram_bytes() : 0;
+        if (viper_) b += viper_->cceh_dram_bytes();
+        return b;
+    }
+
     HiOMT* getHiom() { return hiom_.get(); }
     ViperT* getViper() { return viper_.get(); }
 

@@ -78,13 +78,29 @@ inline MemSnapshot capture_mem(std::string_view pmem_prefix = "/pmem0/") {
 }
 
 // Pushes counters into Google Benchmark state. Called from ycsb_run on
-// the init thread after the timed loop. "dram_loaded_mb" subtracts the
-// pool RSS so the value represents DRAM-only allocations (CCEH segments,
-// HiOM HotTier, commit buffer, per-thread state).
+// the init thread after the timed loop.
+//
+// "fixture_dram_mb" (AUTHORITATIVE) is the white-box index DRAM reported by
+// the fixture itself (Viper's CCEH bytes, or HiOM's HotTier+ColdTier bytes)
+// via BaseFixture::fixture_dram_bytes(). It is computed from sizeof of the
+// actual data structures, so it is exact and stable across repeats — unlike
+// the RSS-difference approach, which collapses on repeats:N because glibc
+// does not return freed arenas to the OS (DeInitMap leaves RSS elevated).
+//
+// "fixture_dram_rss_mb" is the OLD RSS-difference estimate (loaded - baseline),
+// kept only as a CROSS-CHECK. It is reliable on a process's FIRST measurement
+// (rep 0 of a fresh process) and unreliable afterwards — do not aggregate it.
+// "dram_loaded_mb" is the absolute DRAM RSS (rss - pool_rss) for reference.
 inline void report_mem(benchmark::State& state,
                        const MemSnapshot& baseline,
-                       const MemSnapshot& loaded) {
+                       const MemSnapshot& loaded,
+                       std::size_t fixture_dram_bytes) {
     constexpr double kb_to_mb = 1.0 / 1024.0;
+    constexpr double b_to_mb  = 1.0 / (1024.0 * 1024.0);
+    // White-box, authoritative.
+    state.counters["fixture_dram_mb"] =
+        static_cast<double>(fixture_dram_bytes) * b_to_mb;
+    // RSS references + cross-check.
     state.counters["rss_baseline_mb"] = baseline.rss_kb * kb_to_mb;
     state.counters["rss_loaded_mb"]   = loaded.rss_kb   * kb_to_mb;
     state.counters["pool_rss_loaded_mb"] = loaded.pool_rss_kb * kb_to_mb;
@@ -92,6 +108,13 @@ inline void report_mem(benchmark::State& state,
         static_cast<std::int64_t>(loaded.rss_kb) -
         static_cast<std::int64_t>(loaded.pool_rss_kb);
     state.counters["dram_loaded_mb"] = (dram_loaded > 0 ? dram_loaded : 0) * kb_to_mb;
+    // RSS-diff cross-check (reliable only on a fresh process's first rep).
+    const std::int64_t base_dram =
+        static_cast<std::int64_t>(baseline.rss_kb) -
+        static_cast<std::int64_t>(baseline.pool_rss_kb);
+    const std::int64_t fixture_dram_rss = dram_loaded - base_dram;
+    state.counters["fixture_dram_rss_mb"] =
+        (fixture_dram_rss > 0 ? fixture_dram_rss : 0) * kb_to_mb;
     state.counters["hot_tier_size"]  = static_cast<double>(loaded.hot_size);
     state.counters["hot_capacity"]   = static_cast<double>(loaded.hot_capacity);
     state.counters["hot_evictions"]  = static_cast<double>(loaded.hot_evictions);

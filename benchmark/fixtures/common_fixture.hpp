@@ -82,6 +82,14 @@ class BaseFixture : public benchmark::Fixture {
     // hiom_->hot_tier() which returns a non-const reference.
     virtual MemSnapshot fixture_telemetry() { return capture_mem(); }
 
+    // White-box DRAM footprint of the fixture's *own* index/data structures
+    // (e.g. Viper's CCEH, or HiOM's HotTier). Default 0 (fixtures that don't
+    // override report no white-box DRAM). Reported by ycsb_run as the
+    // authoritative `fixture_dram_mb` counter — unlike RSS diffing it is
+    // immune to malloc-retention and stable across repeats. Non-const to
+    // mirror fixture_telemetry (overrides reach into non-const accessors).
+    virtual size_t fixture_dram_bytes() { return 0; }
+
     template <typename PrefillFn>
     void prefill_internal(size_t num_prefills, PrefillFn prefill_fn);
 

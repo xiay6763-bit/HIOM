@@ -118,8 +118,16 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
     MemSnapshot mem_loaded{};
 
     if (is_init_thread(state)) {
+        // Capture the process baseline BEFORE InitMap so the fixture's index
+        // allocation (Viper's ~2 GB CCEH, HiOM's HotTier/ColdTier) lands in
+        // (loaded - baseline) as a directly-measured delta rather than being
+        // folded into the baseline. Use capture_mem() (a free function over
+        // /proc) instead of fixture_telemetry(): the latter is overridden by
+        // HiOMFixture to read hiom_->hot_tier(), which is still nullptr here.
+        // The global prefill_data vector is already resident in both snapshots
+        // and cancels out — no more estimated harness-vector subtraction.
+        mem_baseline = capture_mem();
         fixture.InitMap();
-        mem_baseline = fixture.fixture_telemetry();
         fixture.prefill_ycsb(prefill_data);
         // Drain any async post-prefill work (e.g., HiOM commit buffer)
         // before the timed phase starts so steady-state reads don't
@@ -239,7 +247,7 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
         mem_loaded.cold_hits = mem_final.cold_hits;
         mem_loaded.rss_kb = mem_final.rss_kb;
         mem_loaded.pool_rss_kb = mem_final.pool_rss_kb;
-        report_mem(state, mem_baseline, mem_loaded);
+        report_mem(state, mem_baseline, mem_loaded, fixture.fixture_dram_bytes());
 
         fixture.DeInitMap();
     }

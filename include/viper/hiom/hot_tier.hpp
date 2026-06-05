@@ -347,6 +347,12 @@ class HotTier {
 
     std::size_t num_buckets() const { return num_buckets_; }
     std::size_t capacity() const { return num_buckets_ * kSlotsPerBucket; }
+    // White-box DRAM footprint: the 64-byte-aligned bucket array plus the
+    // parallel per-bucket SIEVE metadata array. Both scale with num_buckets;
+    // sizes are compile-time constants (Bucket=128 B, BucketMeta=8 B).
+    std::size_t dram_bytes() const {
+        return num_buckets_ * (sizeof(Bucket) + sizeof(BucketMeta));
+    }
     std::size_t size() const { return size_.load(std::memory_order_relaxed); }
     std::size_t eviction_count() const {
         return eviction_count_.load(std::memory_order_relaxed);
