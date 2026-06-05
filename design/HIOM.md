@@ -1,7 +1,13 @@
 # HiOM: Hierarchical Offset Map for Viper
 
-Design document for a tiered offset-map extension to Viper [VLDB '21],
-targeting ICDE (CCF-A) submission. Backup venue: 计算机研究与发展 / FGCS.
+Design document for a tiered offset-map extension to Viper [VLDB '21].
+**Target venue (revised 2026-06-05): a master's-thesis companion paper**
+(中文核心 / EI / CCF-C or an engineering-systems track) — *not* ICDE/CCF-A.
+Scope is deliberately narrowed (see Win condition below): HiOM is a
+**DRAM-efficient tiered offset map** for persistent-memory KV stores under a
+constrained DRAM budget, trading a bounded throughput loss for large DRAM
+savings and bounded-time recovery — not an across-the-board replacement for
+Viper.
 
 Code references use the form
 `[viper.hpp:101-108](../include/viper/viper.hpp#L101-L108)`. Numbers ending
@@ -9,6 +15,42 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 (see Appendix A).
 
 ---
+
+## Status (2026-06-05)
+
+- **Paper repositioning — narrowed from ICDE/CCF-A to a master's-thesis
+  companion paper** (中文核心 / EI / CCF-C or an engineering-systems
+  track). Rationale: the current evidence supports a *scoped* claim, not
+  an across-the-board win over Viper. Write-heavy throughput is weak
+  (YCSB-A/B 0.24–0.45× at t=24), `a_zipf-33M` livelocks (M4 back-pressure),
+  the 40× recovery claim still lacks the 100 M datapoint, and the Phase 2
+  DRAM numbers are computed by subtracting an *estimated* harness footprint
+  rather than measured directly. Narrowed thesis: **"a DRAM-efficient
+  tiered offset map for PM KV stores — trading acceptable throughput loss
+  for large DRAM savings and bounded recovery, in DRAM-constrained
+  read-heavy deployments."**
+  - Rewrote the doc header, `## Three contributions` (DRAM-efficiency is
+    now C1; recovery stated as O(tail) vs O(N), not a fixed 40×), and
+    `## Win condition` (scoped to DRAM / read-heavy / recovery; write-heavy
+    and `a_zipf-33M` moved to an explicit *out of scope / limitations*
+    block).
+  - **Next steps (priority order, 2026-06-05)**:
+    1. ✅ this repositioning (header + contributions + win condition).
+    2. Direct fixture-DRAM measurement — move `mem_baseline` capture ahead
+       of `InitMap()` ([ycsb_bm.cpp:112](../benchmark/ycsb_bm.cpp#L112)),
+       re-report the Phase 0 / Phase 2 DRAM tables as measured deltas
+       instead of harness-subtraction estimates.
+    3. Recovery 10M/50M/100M: Viper full-rebuild vs HiOM tail-scan, plus
+       checkpoint-cadence / tail-size sensitivity. Use a recovery-only
+       oversized HotTier (≥ dataset) or slow single-thread prefill to dodge
+       the same prefill livelock that blocks `a_zipf-33M` — recovery times
+       `open()`, not steady-state DRAM, so the inflated HotTier is harmless.
+    4. Ablation: HotTier capacity, SIEVE vs LRU/random (needs a pluggable
+       eviction interface — currently hard-wired), batch size, flusher
+       count, checkpoint cadence.
+    5. Baseline expansion: un-comment Dash/CCEH/FASTER from the `ALL_BMS`
+       blocks (fixtures already wired per CLAUDE.md), or justify Viper as
+       the sole primary baseline.
 
 ## Status (2026-05-17)
 
@@ -1170,12 +1212,25 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ## Three contributions
 
-- **C1**: Working-set-aware index tiering with SIEVE eviction, applied for
-  the first time to persistent hash indices in hybrid PM-DRAM KV stores.
-- **C2**: Safe compact hot-tier encoding (4 B fingerprint + 4 B offset)
-  with a case split for keys ≤8 B vs. >8 B (see §2.2).
-- **C3**: Crash-consistent group-commit protocol with pin invariants and
-  A/B checkpoints, achieving ~40× faster recovery vs. Viper.
+Framed for the narrowed scope above — DRAM-efficiency first, recovery
+second; throughput is a *cost-bound*, not a contribution:
+
+- **C1 — DRAM-efficient offset map**: HiOM caches *index entries (offsets)*,
+  not key/value data, so a fixed DRAM budget bounds the index footprint
+  regardless of dataset size. Fixture-specific DRAM savings of 62–83% vs.
+  Viper's CCEH across 5–33 M datasets (§Phase 2 — currently computed by
+  harness-footprint subtraction; direct measurement is a pending cleanup),
+  while Viper's CCEH preallocates ≈2 GB and grows linearly.
+- **C2 — Working-set-aware hot/cold index tiering**: a compact 8 B DRAM
+  HotTier entry (4 B fingerprint + 4 B offset, with a ≤8 B vs. >8 B key
+  case split, see §2.2) under SIEVE eviction, backed by an authoritative
+  PMem ColdTier — the first application of working-set-aware index tiering
+  to persistent hash indices in hybrid PM-DRAM KV stores.
+- **C3 — Crash-consistent group commit + bounded recovery**: pin invariants,
+  A/B checkpoints, and a tail-scan recovery. HiOM turns index recovery from
+  full VPage reconstruction, O(N), into checkpoint-bounded tail replay,
+  O(tail); the concrete speedup is evaluated separately and the previous
+  40× target remains pending 100 M-scale validation.
 
 Supporting techniques: per-thread commit buffer using existing
 `concurrentqueue`; 32-region linear hashing for parallel cold-tier load;
@@ -1183,11 +1238,36 @@ AVX-512 SIMD fingerprint compare.
 
 ## Win condition
 
-For working sets ≥ 1.5× DRAM, HiOM achieves ≥80% of Viper-LARGE throughput
-while reducing DRAM consumption by ≥50%. As working set grows to N× DRAM
-(up to 5×), HiOM degrades gracefully to 60-70% of Viper-LARGE on uniform
-workloads and ≥80% on production-skewed workloads. Viper itself OOMs at
-working sets exceeding DRAM capacity (CCEH preallocates ≈2 GB on init).
+**(revised 2026-06-05 — narrowed to a scoped claim, not a universal
+throughput win.)** HiOM targets **DRAM-constrained, read-heavy,
+recovery-sensitive** deployments:
+
+- **DRAM (primary win)**: for working sets that exceed a fixed DRAM budget,
+  HiOM keeps index DRAM bounded while Viper's CCEH grows linearly and OOMs
+  past DRAM capacity (CCEH preallocates ≈2 GB on init). Target: ≥50%
+  fixture-DRAM reduction. *Measured 62–83% across 5–33 M (§Phase 2; to be
+  re-reported via direct measurement — see Open items).*
+- **Read-heavy throughput (acceptable-cost, not a win)**: on read-mostly
+  workloads (YCSB-C analog) HiOM sustains 0.69–0.92× of Viper's per-thread
+  throughput, with the single-thread `get` microbench occasionally ahead
+  (1.03–1.06×) because the 8 B HotTier slot bypasses CCEH's segment lookup.
+  The story is "comparable reads at a fraction of the DRAM", not "faster".
+- **Recovery (secondary win)**: O(unflushed tail) vs Viper's O(all data)
+  full CCEH rebuild.
+
+**Explicitly out of scope / known limitations** (demoted from the previous
+win claim, presented as limitations in the paper — not wins):
+
+- **Write-heavy throughput is markedly lower**: YCSB-A/B run 0.24–0.45× of
+  Viper at t=24; HiOM maintains a secondary index, so write/delete-heavy
+  workloads pay for it. The paper does not claim write parity.
+- **Skewed writes at HotTier capacity can livelock**: at working set ≥
+  HotTier capacity *with* a skewed write workload (YCSB-A zipfian, e.g.
+  `a_zipf-33M`), the bucket-PINNED back-pressure can starve slow writers
+  (root cause confirmed via gdb thread backtraces, 2026-05-20). This is
+  outside the current scoped win condition, but not outside the system's
+  long-term target: the evaluation matrix labels the cell and discusses it
+  as a limitation, with a per-region SIEVE clock-pacing fix as future work.
 
 ---
 
