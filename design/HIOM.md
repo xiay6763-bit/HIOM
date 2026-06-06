@@ -88,15 +88,33 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
        Remaining priority-4 work: SIEVE vs LRU/random (needs a pluggable
        eviction interface — currently hard-wired), batch size, flusher count,
        checkpoint cadence.
-    5. **Baseline expansion — strategy fixed (§7 Evaluation Plan),
-       implementation pending.** Per the 2026-06-06 literature sweep:
-       integrate baselines via **PiBench** (not the original `ALL_BMS` /
-       Google-Benchmark fixture route) and compare against the open-source
-       PM-index set **Dash / CCEH / Level / Clevel / Halo / Plush**. HiOM is
-       positioned as a three-axis (DRAM × read × recovery) Pareto point, with
-       MetoHash / EEPH+ (2024–26, same-platform but closed-source) cited as
-       related work. Next: build-smoke PiBench + Halo/Plush on this host and
-       confirm the Optane generation (eADR gates MetoHash/Spash).
+    5. **Baseline expansion — two-tier harness; HiOM + Dash + CCEH all run
+       (2026-06-06).** The original "via PiBench" plan was corrected twice:
+       (a) `sfu-dis/pibench` is range-only (`tree_api.hpp`); the *hash* harness is
+       **HNUSystemsLab/Halo's `hash_api.h`**. (b) For CCEH/Dash we do NOT need a
+       custom-PMDK build — **viper's own `benchmark/fixtures/` already has
+       `dash_fixture.hpp` + `cceh_fixture.hpp` on stock PMDK** (CMake sed-patches
+       Dash's `*_addr` → stock `pmemobj_create`). Resulting plan:
+       - **PRIMARY = viper's own `ycsb_bm` / `all_ops_bm`** (K8/V200, the paper's
+         real workload), running **HiOM + Viper + Dash + CCEH in one harness on
+         stock PMDK**. Dash/CCEH were merely commented out of `ALL_BMS`; re-enabled
+         + **verified end-to-end** (all_ops 1M/1t, K16/V200: Dash get 1.87 M/s,
+         CCEH get 1.46 M/s, both `found=1M`). Only fix needed: **`-mavx2`** in
+         `benchmark/CMakeLists.txt:194` (was `-mtune=native`, which doesn't enable
+         the ISA Dash's `epoch_reclaimer` AVX2 intrinsics need). Dash/CCEH value
+         pools cut **80→24 GiB** (shared /pmem0 safety). NB `CcehFixture` is the
+         *DRAM*-CCEH variant (viper's `cceh.hpp`) → DRAM-index camp, like Viper.
+       - **SECONDARY = Halo `hash_api.h` harness** (u64/u64), only for systems
+         viper lacks fixtures for — **CLevel / SOFT / Halo** (and a *PM-resident*
+         CCEH/Dash if a same-harness cross-check is wanted). HiOM wrapper landed
+         there too (`#ifdef HIOMT`; 8.92 vs 6.74 Mops/s read, 10 k/1 t smoke);
+         repro persisted to [benchmark/hash_api/](../benchmark/hash_api/).
+       - **Custom PMDK = dropped** (unneeded on the primary path). **Pending:**
+         real E2/E4 via `ycsb_bm` (K8/V200, sized + thread sweep, flush between
+         phases for write fairness); CLevel/SOFT/Halo via the Halo harness (SOFT
+         needs libvmem); E1/E3 stay on white-box `fixture_dram_bytes()` /
+         `hiom_recovery_bm`. Positioning unchanged: three-axis (DRAM × read ×
+         recovery) Pareto, MetoHash/EEPH+ as related work.
 
 ## Status (2026-05-17)
 
@@ -1831,15 +1849,38 @@ open-source, Optane-runnable PM hash indexes. §3–§6 design detail still TODO
 ## 7.1 Platform & harness
 
 - Real Intel Optane DCPMM, FS-DAX (`/pmem0`) + PMDK, **fixed-size K/V only**
-  (Viper's variable-size recovery is unimplemented, §1.4).
-- **Integrate via PiBench** (`github.com/sfu-dis/pibench`, wrapper model):
-  write one PiBench wrapper for HiOM and inherit the bundled, artifact-quality
-  baseline implementations below — far cheaper than porting each into the
-  Google-Benchmark harness. Halo and Plush already ship PiBench bindings;
-  Dash/CCEH/Level/Clevel come via the Dash and TurboHash repos.
-- ⚠️ **Optane generation matters**: MetoHash / Spash require eADR (Optane 200
-  series only); on a 100-series host they are unbuildable. Confirm the DIMM
-  generation before scoping those in.
+  (Viper's variable-size recovery is unimplemented, §1.4). Baseline repos cloned
+  to `/root/hiom-baselines/` (outside the viper git tree); our wrapper lives in
+  the viper repo.
+- **Harness — use the HNUSystemsLab/Halo `hash_api.h` benchmark, NOT
+  `sfu-dis/pibench` (verified 2026-06-06 by cloning + reading source).**
+  `sfu-dis/pibench` is the *range-index* benchmark (`tree_api.hpp`) — wrong tool
+  for a hash index. The hash equivalent is the **Halo repo's `hash_api.h` +
+  `benchmark.cpp`** driver, and it is turnkey: `third/` already bundles **CCEH,
+  Dash, CLevel, SOFT, CLHT, PCLHT — and Viper** (`#ifdef VIPERT`), each picked by
+  a `-DXXXT` define. So we adopt this one harness instead of porting six repos,
+  getting the whole §7.2 set (minus Plush) behind a single driver + shared
+  workload generator. (Level hashing is via the Dash repo; CLevel covers the
+  level-hashing camp.)
+- **HiOM wrapper = one `#ifdef HIOMT` block** in `hash_api.h`, cloned from the
+  existing `VIPERT` block (HiOM wraps Viper + owns the index, same `Client`
+  API); add a Makefile target; repoint the hardcoded `/mnt/pmem/hash/` pool to
+  `/pmem0/...`. The harness covers **E2 (read tput/scale) + E4 (write/scale)**;
+  **E1 (DRAM) stays on our white-box `fixture_dram_bytes()`, E3 (recovery) on
+  `hiom_recovery_bm`** — both already built; neither is what `hash_api.h`
+  measures.
+- **Build tiers (verified on this host 2026-06-06):** toolchain present —
+  **g++-11 + clang-14** (default `gcc` is 7.5; use g++-11). The HALO target
+  **compiles clean to object under g++-11** (smoke passed). Stock
+  `libpmem`/`libpmemobj` suffice for **HALO / SOFT / CLEVEL / VIPER / HIOM**;
+  **only CCEH + Dash need the customized PMDK fork** (XiangpengHao/pmdk,
+  `MAP_FIXED_NOREPLACE`) + VeryPM epoch mgr — the one finicky build. All targets
+  link `-lPCM` (`make -C pcm`; needs `modprobe msr` at runtime). **Plush** is
+  separate (tum-db/Plush, own bindings) — optional, add last.
+- ✅ **Optane generation confirmed: ADR-only** (`ndctl`: `persistence_domain =
+  memory_controller`, no eADR; DIMM FW 02.02). MetoHash / Spash / SEPH
+  (eADR-gated) are **unbuildable here → cite-only**, exactly as §7.5 assumes;
+  the runnable set (CCEH/Dash/CLevel/SOFT/Halo/Viper/Plush) is all ADR-safe.
 
 ## 7.2 Baselines — and why these
 

@@ -10,6 +10,7 @@
 #include "fixtures/utree_fixture.hpp"
 #include "fixtures/faster_fixture.hpp"
 #include "fixtures/dash_fixture.hpp"
+#include "fixtures/cceh_fixture.hpp"
 #include "fixtures/tbb_fixture.hpp"
 #include "fixtures/crl_fixture.hpp"
 #include "fixtures/pmem_kv_fixture.hpp"
@@ -181,7 +182,8 @@ void bm_delete(benchmark::State& state, BaseFixture& fixture) {
     BaseFixture::log_find_count(state, found_counter, found_counter);
 }
 
-//ALL_BMS(DashFixture);
+ALL_BMS(DashFixture);
+ALL_BMS(CcehFixture);
 ALL_BMS(ViperFixture);
 ALL_BMS(HiOMFixture);
 //ALL_BMS(PmemHybridFasterFixture);

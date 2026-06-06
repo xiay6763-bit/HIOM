@@ -128,7 +128,7 @@ static constexpr size_t CPU_AFFINITY_OFFSET = 0;
 #endif
 
 static constexpr uint64_t ONE_GB = (1024ul*1024*1024) * 1;  // 1GB
-static constexpr uint64_t BM_POOL_SIZE = ONE_GB* 64;
+static constexpr uint64_t BM_POOL_SIZE = ONE_GB* 32;  // 32GB: covers tens-of-millions K8/V200 (~14GB pages for 50M); was 64GB. Shared /pmem0 + smaller crash-orphans. Bump for >50M write-heavy cells.
 
 std::string get_time_string();
 std::string get_output_file(const std::string& bm_name);

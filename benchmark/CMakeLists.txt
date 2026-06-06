@@ -191,7 +191,7 @@ set(PMEM_LIBS ${PMDK_LIBRARIES} ${PMEMOBJ_LIBRARIES} ${PMEMPOOL_LIBRARIES})
 
 if (CMAKE_BUILD_TYPE MATCHES Release)
     message(STATUS "BUILDING BENCHMARKS IN RELEASE")
-    add_compile_options(-O3 -Ofast -mtune=native)
+    add_compile_options(-O3 -Ofast -mtune=native -mavx2)
 else()
     message(WARNING "Building benchmarks in ${CMAKE_BUILD_TYPE}. This may impact performance!")
 endif()

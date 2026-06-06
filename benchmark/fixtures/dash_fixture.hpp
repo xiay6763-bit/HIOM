@@ -83,14 +83,22 @@ void DashFixture<KeyT, ValueT>::InitMap(const uint64_t num_prefill_inserts, cons
     pmem_pool_name_ = random_file(DB_PMEM_DIR);
     int sds_write_value = 0;
     pmemobj_ctl_set(NULL, "sds.at_create", &sds_write_value);
-    pmem_pool_ = pmem::obj::pool<DashPool>::create(pmem_pool_name_, "", 80ul * ONE_GB, S_IRWXU);
+    // Value store (every Entry=(key,value) is make_persistent'd here; Dash
+    // holds only offset pointers). Sized for the thesis's ~tens-of-millions
+    // range: 24 GiB ~= 50M K8/V200 at ~57% fill. Was 80 GiB for the original
+    // 100M-key Viper paper run — too large for /pmem0 (shared, ~134G free;
+    // FS-DAX fully allocates the pool on create, not sparse). Bump per-cell for
+    // a 100M run, coordinating with other /pmem0 tenants.
+    pmem_pool_ = pmem::obj::pool<DashPool>::create(pmem_pool_name_, "", 24ul * ONE_GB, S_IRWXU);
     if (pmem_pool_.handle() == nullptr) {
         throw std::runtime_error("Could not create pool");
     }
 
     size_t segment_number = 64;
     dash_pool_name_ = random_file(DB_PMEM_DIR);
-    Allocator::Initialize(dash_pool_name_.c_str(), 10 * ONE_GB);
+    // Dash's own index pool (segment table). 6 GiB is generous for tens of
+    // millions of keys; was 10 GiB (100M-paper over-provision).
+    Allocator::Initialize(dash_pool_name_.c_str(), 6 * ONE_GB);
     dash_ = reinterpret_cast<Hash<DashKeyT> *>(Allocator::GetRoot(sizeof(extendible::Finger_EH<DashKeyT>)));
     new (dash_) extendible::Finger_EH<DashKeyT>(segment_number, Allocator::Get()->pm_pool_);
 
