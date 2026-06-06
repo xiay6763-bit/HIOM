@@ -88,9 +88,15 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
        Remaining priority-4 work: SIEVE vs LRU/random (needs a pluggable
        eviction interface — currently hard-wired), batch size, flusher count,
        checkpoint cadence.
-    5. Baseline expansion: un-comment Dash/CCEH/FASTER from the `ALL_BMS`
-       blocks (fixtures already wired per CLAUDE.md), or justify Viper as
-       the sole primary baseline.
+    5. **Baseline expansion — strategy fixed (§7 Evaluation Plan),
+       implementation pending.** Per the 2026-06-06 literature sweep:
+       integrate baselines via **PiBench** (not the original `ALL_BMS` /
+       Google-Benchmark fixture route) and compare against the open-source
+       PM-index set **Dash / CCEH / Level / Clevel / Halo / Plush**. HiOM is
+       positioned as a three-axis (DRAM × read × recovery) Pareto point, with
+       MetoHash / EEPH+ (2024–26, same-platform but closed-source) cited as
+       related work. Next: build-smoke PiBench + Halo/Plush on this host and
+       confirm the Optane generation (eADR gates MetoHash/Spash).
 
 ## Status (2026-05-17)
 
@@ -1811,8 +1817,85 @@ The following sections need to be written before implementation starts:
   atomic flip, recovery protocol
 - **§6 State Machine**: PINNED → IN_FLUSH → UNPINNED transitions, per-entry
   latch, update/delete tombstone semantics
-- **§7 Evaluation Plan**: workloads, metrics, baselines, win condition
-  experiments
+- **§7 Evaluation Plan**: ✅ drafted below (baseline strategy + win-condition
+  experiments). §3–§6 design detail is still pending; the evaluation plan is
+  finalized early because the competitive landscape is now clear.
+
+---
+
+# §7 Evaluation Plan
+
+*(Baseline strategy finalized 2026-06-06 from a literature sweep on
+open-source, Optane-runnable PM hash indexes. §3–§6 design detail still TODO.)*
+
+## 7.1 Platform & harness
+
+- Real Intel Optane DCPMM, FS-DAX (`/pmem0`) + PMDK, **fixed-size K/V only**
+  (Viper's variable-size recovery is unimplemented, §1.4).
+- **Integrate via PiBench** (`github.com/sfu-dis/pibench`, wrapper model):
+  write one PiBench wrapper for HiOM and inherit the bundled, artifact-quality
+  baseline implementations below — far cheaper than porting each into the
+  Google-Benchmark harness. Halo and Plush already ship PiBench bindings;
+  Dash/CCEH/Level/Clevel come via the Dash and TurboHash repos.
+- ⚠️ **Optane generation matters**: MetoHash / Spash require eADR (Optane 200
+  series only); on a 100-series host they are unbuildable. Confirm the DIMM
+  generation before scoping those in.
+
+## 7.2 Baselines — and why these
+
+Standard, **open-source, reproducible** PM-index set (the reviewer checklist;
+all have public repos, most have PiBench bindings):
+
+| system | venue | index | DRAM | camp |
+|--------|-------|-------|------|------|
+| **CCEH** | FAST'19 | DRAM *or* PM (configurable) | high / ~0 | both |
+| **Level / Clevel** | OSDI'18 / ATC'20 | PM | ~0 | PM-resident |
+| **Dash** | VLDB'20 | PM | ~0 | PM-resident |
+| **Viper** | VLDB'21 | DRAM (CCEH) | ~2 GB | DRAM-index (primary) |
+| **Halo** | SIGMOD'22 | DRAM | high | DRAM-index, fast recovery |
+| **Plush** | VLDB'22 | mostly PM | tiny | PM-resident, write-opt |
+
+**Why not "newer / lower-tier" baselines** (deliberate, not an oversight): a
+2026-06 sweep found recent (2024–26) PM work either (a) targets CXL /
+memory-semantic SSD / RDMA-disaggregated memory and **cannot run on Optane
+FS-DAX** (BonsaiKV+, TieredHM, NStore, CXL-KVS, Outback…), or (b) is a
+same-platform competitor that is **not open-sourced** (MetoHash SC'25, EEPH+
+TACO'25). Mid-tier hybrid-PM hashing papers (Eukv IEEE-Access'23, HASDH
+ICCD'21, PMEH'23) have **no available source**. Open, reproducible code
+clusters in top venues (artifact-evaluation culture), so chasing an obscure
+weak baseline is a *red flag*, not an advantage.
+
+## 7.3 Positioning: a three-axis Pareto point
+
+HiOM is **not** a uniform winner; it is Pareto-non-dominated on
+{index-DRAM, read throughput, recovery}, with write/scalability as an
+acknowledged cost. Each axis has a baseline HiOM beats:
+
+- **Read throughput** → beats PM-resident designs (Dash, Plush, Level/Clevel,
+  PM-mode CCEH): they pay PM random-read latency per lookup; HiOM's hot offset
+  lives in DRAM.
+- **Index DRAM** → beats the DRAM-index camp (Viper, Halo, DRAM-mode CCEH:
+  ~2 GB vs HiOM's flat 272 MB).
+- **Recovery** → beats Viper (O(N) rebuild). Halo is also sub-linear — state
+  honestly that HiOM matches fast recovery *without* paying for a full DRAM
+  index.
+
+## 7.4 Win-condition experiments (→ C1 / C2 / C3)
+
+| exp | claim | metric | expected result |
+|-----|-------|--------|-----------------|
+| **E1** DRAM vs N | C1 | index DRAM (MB) vs dataset size | HiOM flat 272 MB; Viper / Halo / DRAM-CCEH grow |
+| **E2** iso-DRAM reads | C2 | read tput / hit-rate vs **DRAM budget** | HiOM usable under tight budget; DRAM-index camp OOMs, PM camp slower |
+| **E3** recovery | C3 | open time vs N / tail size | O(tail) vs O(N); already 25× vs Viper, ≈736 K crossover |
+| **E4** write / scale | limitation | YCSB-A/B tput vs threads | honestly 0.24–0.65×; documented as a design cost, not hidden |
+
+## 7.5 Related work to cite (not run)
+
+MetoHash (SC'25), EEPH+ (TACO'25), SEPH (OSDI'23), BonsaiKV+ (TC'24,
+CXL/tiered), ERT (SIGMOD'23). **Differentiation**: HiOM uniquely combines
+SIEVE **working-set-aware** hot/cold tiering, caches **offsets only** (not
+records), and uses **O(tail) checkpoint recovery** — none of the above pairs
+all three on Optane FS-DAX.
 
 ---
 
