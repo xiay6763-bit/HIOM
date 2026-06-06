@@ -59,8 +59,14 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
        open** (baseline ~2180 ms vs HiOM fair ~87 ms; ~15× warm-baseline
        conservative). The naïve `--full` 1.0× at 100M was an artifact of
        oversized CCEH (~277 ms) + 16 M-bucket HotTier (~1030 ms) init, not
-       recovery work — see §M6.5 recovery wall-clock. Still open:
-       checkpoint-cadence / tail-size sensitivity.
+       recovery work — see §M6.5 recovery wall-clock. **Tail-size /
+       checkpoint-cadence sensitivity measured** (`--tail-sweep`,
+       reuse-100M, 2026-06-05): tail-scan is **O(tail) linear**
+       (49.8 µs/entry, t=1, 7 points 0–1 M); crossover with Viper's
+       O(N) rebuild only at ≈736 K entries (~485 blocks), and the
+       default cadence=4096 worst-case tail opens in 750 ms (2.9× vs
+       2.14 s baseline) — a ~180× margin between cadence and crossover.
+       See §M6.5 tail-size sensitivity.
     4. ✅ **HotTier capacity ablation (2026-06-05)** — `scan_hot_capacity.sh`
        sweeps `HIOM_HOT_BUCKETS_LOG2` 16–21 (1 M–33 M slots = 10%–330% of the
        10 M YCSB-C working set), 3-rep median, white-box
@@ -726,6 +732,39 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     standalone `[ref]` alloc confirms 16 M buckets ~1030 ms vs 2 M
     buckets ~28 ms. 1M/10M stay ≤1× for the same reason (fixed setup
     dwarfs the tiny tail at small N).
+  - **M6.5 tail-size sensitivity** (`--tail-sweep`, non-destructive reuse of
+    the same prefilled 100 M PM state; 3-rep median, `cceh_cap=1` + 2 M-bucket
+    HotTier). Sweeps worst-case tail ∈ {0, 1 K, 4 K, 16 K, 64 K, 256 K, 1 M}
+    entries at `recovery_threads` ∈ {1, 32}, anchoring each tail at the real
+    data top (`probe_data_top` walks back past the ~50 empty trailing blocks
+    above the write frontier). Confirms the **O(tail)** mechanism:
+
+    | aspect | result |
+    |--------|--------|
+    | tail-scan replay (t=1) | **linear, 49.8 µs/entry** (7 points, 0–1 M) |
+    | fixed floor (t=1 intercept) | ~500 ms cold-tier first-touch — new open + `cold.bin` mmap page-fault, *not* O(N) |
+    | parallel speedup t1/t32 | ~1× at small tails (≤1 block/thread, PMem latency exposed) → **19× at 1 M** (bandwidth saturated) |
+    | crossover vs O(N) rebuild (t=32 total) | ≈**736 K** replayed entries (~485 blocks) |
+    | default cadence=4096 worst case (t=32) | **750 ms vs 2.14 s baseline = 2.9×**; ~180× margin to crossover |
+
+    So even the worst-case unflushed tail at the default cadence recovers
+    several× faster than Viper's full rebuild; one would need a tail ~180×
+    larger than the cadence bound before tail-scan stops paying off. The
+    headline ~25× (above) is the *best-case* tail≈0 open, this 2.9× is the
+    *cadence-bounded worst case* — both wins, the gap being the ~500 ms
+    cold-tier first-touch floor that dominates small-tail recovery.
+
+    *Honest caveats.* (1) Pure-timing experiment: the swept tail's
+    `cold_->upsert` re-inserts keys already present (prefill wrote all N into
+    ColdTier), so each hits the idempotent "fingerprint exists" branch
+    (1 persist) rather than a first-insert (CAS + 2 persists) — the
+    49.8 µs/entry slope is thus mildly *optimistic* vs a true cold rebuild,
+    though the **linear trend is unaffected**. (2) The per-point 100-key
+    sanity read is consequently always 100/100 (ColdTier is full): a
+    **liveness check, not a correctness proof** — recovery correctness is
+    established by the M4 crash-injection harness (18/18). Artifacts:
+    `results/recovery/{tail_sweep.csv,tail_sweep_meta.json,summary.txt}`,
+    `eval/charts/recovery_{tail_scan,vs_baseline}.png`.
   - **Resolver post-restart correctness** (Phase D, M6.5 full):
     2000 prefill keys → reopen with skip_recovery=true →
     cl.update(every key) → cl.remove(half) → live VPage records:
@@ -1293,7 +1332,11 @@ second; throughput is a *cost-bound*, not a contribution:
   O(tail). Measured at 100 M (open-only, deployment-fair config):
   **~25× faster cold-start open** (~87 ms vs ~2.2 s), ~15× against a warm
   baseline as a conservative floor. The previous 40× target is not reached,
-  but the order-of-magnitude recovery win holds.
+  but the order-of-magnitude recovery win holds. The O(tail) claim is now
+  directly measured (tail-size sweep, §M6.5): replay is linear at
+  49.8 µs/entry (single-thread), and even the default cadence=4096
+  worst-case tail opens ~2.9× faster than the O(N) rebuild — crossover only
+  at ≈736 K replayed entries, ~180× the worst-case tail.
 
 Supporting techniques: per-thread commit buffer using existing
 `concurrentqueue`; 32-region linear hashing for parallel cold-tier load;

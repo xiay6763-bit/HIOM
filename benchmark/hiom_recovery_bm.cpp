@@ -36,12 +36,14 @@
 #include "viper/hiom/hiom.hpp"
 #include "viper/hiom/hot_tier.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
@@ -377,20 +379,321 @@ void run_open_only(std::uint8_t threads) {
     }
 }
 
+// ---- C3 recovery-sensitivity sweep: recovery time vs tail size --------
+// Verifies the O(tail) tail-scan mechanism and maps checkpoint cadence onto
+// the curve. Fresh prefill (default N=10M) writes ALL N into ColdTier (so it
+// is full regardless of tail), then for each target tail size we rewrite the
+// checkpoint frontier and re-open + tail-scan.
+//
+// Two measurement conventions (P1, see design plan):
+//   - threads=1  : wall-clock ∝ scan blocks -> pure O(tail) line through the
+//                  origin (the headline mechanism plot, figure 1).
+//   - threads=32 : deployment config; total open time for the cadence /
+//                  crossover comparison, plus the t1/t32 parallel speedup.
+//
+// NOTE (P2, honesty): the tail-scan upserts hit ColdTier's idempotent
+// "fp already present" branch (offset store + 1 persist), cheaper than a real
+// first-insert (CAS + 2 persists), so the slope is mildly optimistic — the
+// linear TREND is unaffected. The 100-key sanity is a liveness check
+// (ColdTier is full from prefill), NOT a recovery-correctness proof; that is
+// covered by the M4 crash-injection suite (18/18).
+
+constexpr const char* kResultsDir = "/root/viper/results/recovery";
+
+using VPageU = viper::internal::ViperPage<std::uint64_t, std::uint64_t>;
+// Entries per 24 KiB block for <u64,u64>: slots/page * pages/block (~1518).
+constexpr std::size_t kSlotsPerBlock
+    = VPageU::num_slots_per_page * (viper::BLOCK_SIZE / sizeof(VPageU));
+
+std::size_t tail_blocks_for(std::size_t tail_entries) {
+    return (tail_entries + kSlotsPerBlock - 1) / kSlotsPerBlock;
+}
+
+double median_of(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const std::size_t n = v.size();
+    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+struct PointResult {
+    std::size_t tail_target{0};
+    std::size_t tail_blocks{0};
+    std::size_t threads{0};
+    std::size_t replayed{0};
+    double tail_scan_ms{0.0};
+    double ctor_ms{0.0};
+    double viper_open_ms{0.0};
+    double cold_open_ms{0.0};
+    double chkpt_open_ms{0.0};
+    double total_ms{0.0};
+    std::size_t sanity_hits{0};
+};
+
+// Open viper(skip_recovery) once to read the post-prefill write frontier
+// (the next block a client would claim). Closed immediately.
+viper::block_size_t read_current_frontier() {
+    viper::ViperConfig vcfg;
+    vcfg.skip_recovery = true;
+    vcfg.cceh_init_cap = 1;
+    auto viper = ViperT::open(kPoolDir, vcfg);
+    return viper::KeyValueOffset{viper->hiom_vpage_frontier()}.block_number;
+}
+
+// Probe the highest VPage block that actually holds a live record. The write
+// frontier (current_block) can sit ~10 blocks above the real data top (the
+// last blocks are claimed-but-empty / half-full), so anchoring small tails to
+// the frontier makes them replay ~0. Anchoring to data_top instead lets a
+// cadence-sized tail (~3 blocks) replay real records.
+viper::block_size_t probe_data_top(viper::block_size_t current) {
+    viper::ViperConfig vcfg;
+    vcfg.skip_recovery = true;
+    vcfg.cceh_init_cap = 1;
+    auto viper = ViperT::open(kPoolDir, vcfg);
+    viper::block_size_t b = (current > 0) ? current - 1 : 0;
+    for (std::size_t back = 0; back < 128 && b > 0; ++back, --b) {
+        std::size_t cnt = 0;
+        viper->hiom_visit_records(
+            b, b + 1,
+            [&cnt](const std::uint64_t&, const std::uint64_t&,
+                   viper::KeyValueOffset) { ++cnt; });
+        if (cnt > 0) return b;
+    }
+    return b;
+}
+
+// Rewrite the checkpoint so its vpage_frontier points at `block`. The HiOM
+// ctor's tail scan then covers [block-1, current_block). seq stays monotonic
+// so HiOM's reopen-counter invariant holds.
+void write_checkpoint_at_block(viper::block_size_t block,
+                               std::size_t cold_size, std::uint64_t seq) {
+    auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+    viper::hiom::CheckpointRecord rec{};
+    rec.seq = seq;
+    rec.flushed_count = cold_size;
+    // Three-arg ctor (block, page, slot); NOT the single-arg packed-offset
+    // ctor, which would (wrongly) treat `block` as a raw packed offset.
+    rec.vpage_frontier = viper::KeyValueOffset(block, 0, 0).offset;
+    rec.cold_size = cold_size;
+    chkpt->write(rec);
+}
+
+// One open+tail-scan measurement against whatever frontier the checkpoint
+// currently holds. Idempotent w.r.t. PM (re-upsert into the full ColdTier),
+// so it is safe to repeat for reps.
+PointResult run_tail_point(std::size_t N, std::size_t tail_target,
+                           std::size_t threads, std::size_t hot_buckets,
+                           std::size_t cceh_cap) {
+    PointResult r;
+    r.tail_target = tail_target;
+    r.tail_blocks = tail_blocks_for(tail_target);
+    r.threads = threads;
+
+    const auto t0 = clk::now();
+    viper::ViperConfig vcfg;
+    vcfg.skip_recovery = true;
+    vcfg.cceh_init_cap = cceh_cap;
+    auto viper = ViperT::open(kPoolDir, vcfg);
+    const auto t1 = clk::now();
+    auto cold = viper::hiom::ColdTier::open(kColdPoolFile);
+    const auto t2 = clk::now();
+    auto chkpt = viper::hiom::Checkpoint::open(kCheckpointFile);
+    const auto t3 = clk::now();
+    HiOMT::RecoveryConfig rcfg;
+    rcfg.tail_scan = true;
+    rcfg.recovery_threads = threads;
+    HiOMT hiom(*viper, hot_buckets, cold.get(),
+               HiOMT::FlusherConfig{}, chkpt.get(),
+               HiOMT::CheckpointConfig{}, rcfg);
+    const auto t4 = clk::now();
+
+    r.viper_open_ms = ms_between(t0, t1);
+    r.cold_open_ms = ms_between(t1, t2);
+    r.chkpt_open_ms = ms_between(t2, t3);
+    r.ctor_ms = ms_between(t3, t4);
+    r.total_ms = ms_between(t0, t4);
+    r.tail_scan_ms = hiom.recovery_tail_scan_ms();
+    r.replayed
+        = hiom.stats().recovery_replayed.load(std::memory_order_relaxed);
+
+    auto client = hiom.get_client();
+    std::mt19937_64 rng(0xfeed);
+    std::size_t hits = 0;
+    for (std::size_t i = 0; i < 100; ++i) {
+        const std::uint64_t k = (rng() % N) + 1;
+        std::uint64_t got = 0;
+        if (client.get(k, &got)) ++hits;
+    }
+    r.sanity_hits = hits;
+    return r;
+}
+
+void write_sweep_csv(const std::vector<PointResult>& rows) {
+    std::filesystem::create_directories(kResultsDir);
+    const std::string path = std::string(kResultsDir) + "/tail_sweep.csv";
+    std::ofstream f(path);
+    f << "tail_target,tail_blocks,threads,recovery_replayed,tail_scan_ms,"
+         "ctor_ms,viper_open_ms,cold_open_ms,chkpt_open_ms,total_ms,"
+         "sanity_hits\n";
+    for (const auto& r : rows) {
+        f << r.tail_target << ',' << r.tail_blocks << ',' << r.threads << ','
+          << r.replayed << ',' << r.tail_scan_ms << ',' << r.ctor_ms << ','
+          << r.viper_open_ms << ',' << r.cold_open_ms << ',' << r.chkpt_open_ms
+          << ',' << r.total_ms << ',' << r.sanity_hits << '\n';
+    }
+    std::printf("wrote %s (%zu rows)\n", path.c_str(), rows.size());
+}
+
+void write_sweep_meta(std::size_t N, viper::block_size_t current_block,
+                      double baseline_ms, const std::vector<std::size_t>& tails,
+                      const std::vector<std::size_t>& thread_set, int reps,
+                      std::size_t hot_buckets, std::size_t cceh_cap) {
+    std::filesystem::create_directories(kResultsDir);
+    const std::string path
+        = std::string(kResultsDir) + "/tail_sweep_meta.json";
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"N\": " << N << ",\n";
+    f << "  \"current_block\": " << static_cast<std::size_t>(current_block)
+      << ",\n";
+    f << "  \"slots_per_block\": " << kSlotsPerBlock << ",\n";
+    f << "  \"hot_buckets\": " << hot_buckets << ",\n";
+    f << "  \"cceh_init_cap\": " << cceh_cap << ",\n";
+    f << "  \"cadence_entries\": " << HiOMT::CheckpointConfig{}.cadence_entries
+      << ",\n";
+    f << "  \"baseline_ms\": " << baseline_ms << ",\n";
+    f << "  \"baseline_recovery_threads\": 32,\n";
+    f << "  \"reps\": " << reps << ",\n";
+    f << "  \"tail_targets\": [";
+    for (std::size_t i = 0; i < tails.size(); ++i)
+        f << (i ? "," : "") << tails[i];
+    f << "],\n";
+    f << "  \"threads_swept\": [";
+    for (std::size_t i = 0; i < thread_set.size(); ++i)
+        f << (i ? "," : "") << thread_set[i];
+    f << "]\n}\n";
+    std::printf("wrote %s\n", path.c_str());
+}
+
+void run_tail_sweep(std::size_t N, bool fresh) {
+    if (fresh) {
+        std::printf("\n=== C3 TAIL-SWEEP (fresh prefill N=%zu) ===\n", N);
+        std::printf("slots/block=%zu  hot_buckets=2^21  cceh_cap=1\n",
+                    kSlotsPerBlock);
+        cleanup_all();
+        prefill(N, /*seed=*/0xc4ec0700);
+    } else {
+        std::printf("\n=== C3 TAIL-SWEEP (reuse existing PM, assume N=%zu) "
+                    "===\n", N);
+        std::printf("NON-DESTRUCTIVE: no cleanup/prefill; the checkpoint "
+                    "frontier is restored to current at the end.\n");
+        std::printf("slots/block=%zu  hot_buckets=2^21  cceh_cap=1\n",
+                    kSlotsPerBlock);
+    }
+
+    const viper::block_size_t current_block = read_current_frontier();
+    std::printf("current_block (post-prefill) = %zu  (~%zu entries)\n",
+                static_cast<std::size_t>(current_block),
+                static_cast<std::size_t>(current_block) * kSlotsPerBlock);
+
+    const double baseline_ms = time_baseline_open(32);
+    std::printf("baseline (Viper O(N) rebuild, t=32) = %.1f ms\n", baseline_ms);
+
+    const viper::block_size_t data_top = probe_data_top(current_block);
+    std::printf("data_top (highest block with live records) = %zu  "
+                "(frontier - %zu)\n\n",
+                static_cast<std::size_t>(data_top),
+                static_cast<std::size_t>(current_block - data_top));
+
+    constexpr std::size_t kHotBuckets = 1ULL << 21;
+    constexpr std::size_t kCcehCap = 1;
+    const std::vector<std::size_t> tails
+        = {0, 1000, 4096, 16384, 65536, 262144, 1048576};
+    const std::vector<std::size_t> thread_set = {1, 32};
+    constexpr int kReps = 3;
+
+    std::vector<PointResult> all_rows;
+    std::uint64_t seq = 2;  // prefill wrote seq=1
+
+    for (std::size_t tail : tails) {
+        const std::size_t tb = tail_blocks_for(tail);
+        // Anchor the tail to the real data top, not the frontier (which has
+        // ~10 empty trailing blocks). tail=0 stays at the frontier as a true
+        // floor (~0 replay); tail>0 covers ~tb blocks of real records ending
+        // at data_top, so even a cadence-sized tail replays real entries.
+        viper::block_size_t target_block;
+        if (tail == 0) {
+            target_block = current_block;
+        } else {
+            const std::size_t top1 = static_cast<std::size_t>(data_top) + 1;
+            target_block = (top1 > tb)
+                ? static_cast<viper::block_size_t>(top1 - tb)
+                : 0;
+        }
+        write_checkpoint_at_block(target_block, N, seq++);
+
+        for (std::size_t threads : thread_set) {
+            std::vector<double> ts_ms, tot_ms;
+            std::size_t replayed = 0;
+            for (int rep = 0; rep < kReps; ++rep) {
+                PointResult r = run_tail_point(N, tail, threads, kHotBuckets,
+                                               kCcehCap);
+                all_rows.push_back(r);
+                ts_ms.push_back(r.tail_scan_ms);
+                tot_ms.push_back(r.total_ms);
+                replayed = r.replayed;
+                if (r.sanity_hits != 100) {
+                    std::cerr << "  FAIL: sanity " << r.sanity_hits
+                              << "/100 at tail=" << tail
+                              << " threads=" << threads << std::endl;
+                    std::exit(1);
+                }
+            }
+            std::printf("tail=%-8zu blk=%-4zu t=%-2zu  replayed=%-9zu  "
+                        "tail_scan=%8.2f ms  total=%8.2f ms  (median/%d)\n",
+                        tail, tb, threads, replayed, median_of(ts_ms),
+                        median_of(tot_ms), kReps);
+        }
+    }
+
+    // Restore frontier to current so leftover PM has tail≈0 next time.
+    write_checkpoint_at_block(current_block, N, seq++);
+
+    write_sweep_csv(all_rows);
+    write_sweep_meta(N, current_block, baseline_ms, tails, thread_set, kReps,
+                     kHotBuckets, kCcehCap);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Default sweep is dev-loop: small N for quick iteration. Pass
-    // --full to run the 100M case (takes ~30 min including prefill).
+    // Default sweep is dev-loop: small N for quick iteration. Pass --full to
+    // run the 100M case (~30 min including prefill). --open-only reuses
+    // existing PM. --tail-sweep-prefill <N> runs the C3 recovery-sensitivity
+    // sweep: fresh prefill then a tail-size sweep at threads {1, 32}.
     bool full = false;
     bool open_only = false;
+    bool tail_sweep_prefill = false;
+    bool tail_sweep_reuse = false;
+    std::size_t tail_sweep_N = 10'000'000;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--full") full = true;
-        if (std::string(argv[i]) == "--open-only") open_only = true;
+        const std::string a = argv[i];
+        if (a == "--full") full = true;
+        else if (a == "--open-only") open_only = true;
+        else if (a == "--tail-sweep-prefill") {
+            tail_sweep_prefill = true;
+            if (i + 1 < argc)
+                tail_sweep_N = std::strtoull(argv[++i], nullptr, 10);
+        }
+        else if (a == "--tail-sweep") {
+            // Non-destructive: reuse whatever PM state exists (assumed the
+            // 100M from a prior --full unless an N is given).
+            tail_sweep_reuse = true;
+            tail_sweep_N = 100'000'000;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                tail_sweep_N = std::strtoull(argv[++i], nullptr, 10);
+        }
     }
-
-    std::vector<std::size_t> sizes = {1'000'000, 10'000'000};
-    if (full) sizes.push_back(100'000'000);
 
     constexpr std::uint8_t kThreads = 32;
 
@@ -398,11 +701,20 @@ int main(int argc, char** argv) {
     std::printf("Pool=%s  recovery_threads=%u\n",
                 kPoolDir, kThreads);
 
+    if (tail_sweep_prefill || tail_sweep_reuse) {
+        run_tail_sweep(tail_sweep_N, /*fresh=*/tail_sweep_prefill);
+        std::printf("\nDone.\n");
+        return 0;
+    }
+
     if (open_only) {
         run_open_only(kThreads);
         std::printf("\nDone.\n");
         return 0;
     }
+
+    std::vector<std::size_t> sizes = {1'000'000, 10'000'000};
+    if (full) sizes.push_back(100'000'000);
 
     if (!full) {
         std::printf("(dev-loop sweep; pass --full for 100M case)\n");

@@ -181,8 +181,19 @@ class HiOM {
         // frontier. Done before the flusher / commit-buffer come up
         // so no concurrent writes interleave with replay.
         if (rcfg.tail_scan && cold_ != nullptr) {
+            // Time the tail scan in isolation (recovery-sensitivity
+            // benchmark, P1). HotTier alloc happens in the init-list above,
+            // and viper/cold/checkpoint open before the ctor, so this window
+            // is the pure O(tail) replay term. Single-threaded write here
+            // (recover_tail_into_cold joins its workers before returning),
+            // so a plain double suffices — no atomic needed.
+            const auto ts_start = std::chrono::steady_clock::now();
             const std::uint64_t replayed
                 = recover_tail_into_cold(rcfg.recovery_threads);
+            const auto ts_end = std::chrono::steady_clock::now();
+            recovery_tail_scan_ms_
+                = std::chrono::duration<double, std::milli>(
+                      ts_end - ts_start).count();
             stats_.recovery_replayed.fetch_add(
                 replayed, std::memory_order_relaxed);
         }
@@ -728,6 +739,13 @@ class HiOM {
     ColdTier* cold_tier() { return cold_; }
     CommitBuffer* commit_buffer() { return commit_buf_.get(); }
     const Stats& stats() const { return stats_; }
+
+    // Wall-clock of the M6 tail-scan replay (recover_tail_into_cold) in
+    // isolation, set once by the ctor when tail_scan=true (else stays 0).
+    // The recovery-sensitivity benchmark plots this as the pure O(tail) cost,
+    // separate from fixed open overhead (HotTier alloc + viper/cold/chkpt
+    // open, all outside this window).
+    double recovery_tail_scan_ms() const { return recovery_tail_scan_ms_; }
 
     // White-box DRAM footprint of the HiOM index tiers. HotTier (DRAM hash
     // table) is the dominant term; ColdTier lives in a PMem mmap (≈0 DRAM);
@@ -1435,6 +1453,8 @@ class HiOM {
     ColdTier* cold_;
     BlockBaseMap base_map_;
     Stats stats_;
+    // Set once by the ctor's Step 2 tail-scan timing; read-only thereafter.
+    double recovery_tail_scan_ms_{0.0};
     FlusherConfig fcfg_;
 
     std::unique_ptr<CommitBuffer> commit_buf_;
