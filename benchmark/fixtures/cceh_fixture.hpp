@@ -254,6 +254,7 @@ uint64_t CcehFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
     // Single-HDR fallback for non-active fixtures (Viper/HiOM do per-op split).
     hdr_histogram* hdr = hdrs.write ? hdrs.write : hdrs.read;
 
+    const ValueType200 null_value{0ul};
     uint64_t op_count = 0;
     for (int op_num = start_idx; op_num < end_idx; ++op_num) {
         const ycsb::Record& record = data[op_num];
@@ -271,7 +272,11 @@ uint64_t CcehFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
                 if (!offset.is_tombstone()) {
                     block_size_t entry_ptr_pos = offset.block_number;
                     pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
-                    op_count += (entry_ptr->second == record.value);
+                    // YCSB READ records carry no value, so the previous
+                    // `== record.value` check was always false → found=0.
+                    // Match Viper/Dash run_ycsb: a hit is a non-tombstone
+                    // offset whose stored value is non-null.
+                    op_count += (entry_ptr->second != null_value);
                 }
                 break;
             }
