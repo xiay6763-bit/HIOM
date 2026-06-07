@@ -123,8 +123,14 @@ class CommitBuffer {
     // sole atomic on the steady-state push path; the OR on
     // nonempty_mask_ only fires on the rare 0→1 transition (per
     // user's review note).
-    void push(moodycamel::ProducerToken& tok, std::size_t lane_id,
-              const CommitEntry& e) {
+    //
+    // Returns this lane's post-enqueue approximate depth (before+1). The
+    // caller uses it for a PER-LANE flusher-wake watermark, which avoids
+    // walking all kNumLanes approx_size atomics (size_hint()) on every
+    // push — that global walk was a write-path scaling bottleneck since
+    // every producer thread dirties all lanes' approx_size lines.
+    std::size_t push(moodycamel::ProducerToken& tok, std::size_t lane_id,
+                     const CommitEntry& e) {
         Lane& lane = lanes_[lane_id];
         const std::size_t before
             = lane.approx_size.fetch_add(1, std::memory_order_relaxed);
@@ -137,6 +143,7 @@ class CommitBuffer {
             nonempty_mask_.fetch_or(1ull << lane_id,
                                     std::memory_order_release);
         }
+        return before + 1;
     }
 
     // Drain up to `max` entries from a single lane (single-consumer per

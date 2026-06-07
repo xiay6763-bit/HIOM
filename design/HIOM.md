@@ -18,6 +18,98 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ## Status (2026-06-07)
 
+- **Read-scaling wall ROOT-CAUSED and FIXED — supersedes the "t=24 HotTier
+  per-slot lookup contention" diagnosis in the E2 bullet below.** The flat read
+  throughput at ≥8 threads was **not** HotTier lookup contention (slot probes
+  are pure `load`s that stay Shared and scale); it was a single global atomic on
+  the `get()` hot path — `stats_.hot_hits.fetch_add(1, relaxed)` plus 6 sibling
+  read counters, all packed on one `Stats` cache line. Every read RMW'd that one
+  line, serializing all threads at the cache-line handoff rate (~12 Mops/s
+  plateau, independent of thread count).
+  - **Ablation (causal proof, 1M / 100r_uniform, mean M items/s):** compiling
+    the 7 read-path increments out (`-DHIOM_READ_STATS=0`, HotTier lookup
+    otherwise untouched) lifted HiOM t=24 from **12.3 → 36.1**, i.e. **95 % of
+    Viper (37.9)**; the wall vanished and HiOM tracked Viper at every thread
+    count (t8 18.4, t16 30.3). t=1 was unchanged (~2.7 for both) — the counter
+    is free uncontended, so this is purely a many-core coherence effect.
+  - **Fix (shipped):** per-Client telemetry shards. Each `HiOM::Client` bumps a
+    plain (non-atomic) `read_shards_[slot_idx_]` on its own `alignas(64)` cache
+    line — single-writer per the §Concurrency contract, so zero cross-core
+    traffic — and `stats()` folds the shards into the `Stats` aggregate on
+    demand, off the hot path. Exact, always-on hit/miss telemetry retained
+    (`hot_hit_rate` still reported). Sharded HiOM t=24 = **36.6 (96.5 % of
+    Viper)**; all `hiom_integration_test` cases pass (per-tier hit-accounting
+    deltas intact). Code: [hiom.hpp](../include/viper/hiom/hiom.hpp) —
+    `HIOM_RSTAT_INC` macro, `ReadStatShard`, `fold_read_shards_`. See Claude
+    memory `hiom-read-stats-contention`.
+  - **Positioning consequence — REMOVES the claimed limitation (confirmed
+    @10 M).** The E2 table below and its "scope the read-throughput win to
+    low/mid concurrency" conclusion were measured pre-shard. Re-measuring
+    100r_zipf @10 M *with the fix* (mean M items/s): HiOM t8 **21.2** (was
+    15.4), t24 **46.6** (was 17.7) — HiOM now **matches Viper** (44.8) and
+    **re-passes Dash** (31.4) at t=24, hit_rate 0.9996 intact. (HiOM edges Viper
+    because its verify reads key+value in one `hiom_read_at_offset`, vs Viper's
+    separate key-check + value read.) The read-axis Pareto win now holds at ALL
+    concurrencies — **drop the low/mid-only scoping**. Pre-shard E2 numbers kept
+    below, labelled. Raw: `results/ablation/HiOM_sharded_10M_zipf.{json,console.txt}`.
+  - **NOT addressed by this fix (separate, still-open walls):** write/mixed
+    (YCSB-A) and the undersized-HotTier capacity sweep have their own
+    contention — `HotTier::size_`/`eviction_count_` global atomics on
+    insert/evict, and the `mirror_into_hot` re-warm CAS storm. Read-path only
+    here; the t=24 *write* gap vs Viper (E4) is unchanged.
+
+- **Write-path scaling investigated + delete wall FIXED (follow-up to the read
+  fix).** Same measure-then-ablate method on insert/delete/update (all_ops_bm,
+  K16/V200 1M, t=1/8/24; update also via YCSB-A 1M):
+  - **DELETE was contention-walled and is now fixed.** HiOM delete *regressed*
+    8→24 threads (t8 3.0 → t24 2.56 M/s) while Viper scaled to 10.6. Ablation
+    pinned the cause: NOT `HotTier::size_` (gating it barely moved the number)
+    and NOT the commit-buffer `size_hint()` global walk — it was
+    `push_commit`'s **`wake_all_flushers()` storm**. Once the flushers fall
+    behind under a write storm the lane sits above the wake threshold, and the
+    old `size_hint() >= high_watermark` test then fired wake_all_flushers (=
+    kNumLanes wake-slot mutexes + futex wakes) on *every* push. Fix:
+    `CommitBuffer::push()` now returns the lane's post-enqueue depth, and
+    push_commit wakes only on the **rising edge through a per-lane watermark**
+    (`depth == high_watermark/kNumLanes`) — at most once per drain-cycle, never
+    every push, and never the kNumLanes-atomic `size_hint()` walk. (An interim
+    `depth==1` edge-wake fixed t=24 but collapsed t=1 to 0.28 via a futex-wake
+    *per op* when the flusher re-parks between ops — the exact-watermark edge
+    avoids both.) Result: **delete t=24 2.56 → 5.21 M/s (2.03×), scales 8→24
+    again** (≈ the 5.31 ceiling of "don't push to the commit buffer at all", so
+    commit-path contention is essentially gone). t=1 unchanged. Code:
+    [commit_buffer.hpp](../include/viper/hiom/commit_buffer.hpp) `push()`,
+    [hiom.hpp](../include/viper/hiom/hiom.hpp) `push_commit` /
+    `per_lane_high_watermark_`. All `hiom_integration_test` (incl. recovery +
+    crash-injection) pass.
+  - **INSERT — earlier "bandwidth-bound" reading RETRACTED (measurement
+    artifact).** The 1M-op all_ops run showed Viper insert plateauing ~3.2 M/s
+    and HiOM ~0.5×, which I wrongly read as Optane write-bandwidth saturation.
+    But the Viper paper (Fig. 6; **100M prefill + 50M ops**, 16B/200B) reports
+    Viper PUT scaling to **15 M puts/s @ 36 threads** (~12M @ 24). So the 3.2M
+    plateau is a SMALL-SAMPLE artifact: 1M inserts / 24 threads ≈ 42K/thread,
+    iterations:1 — dominated by thread spawn/barrier, never reaching steady
+    state. **Insert scaling is UNRESOLVED pending a paper-scale (≥10–50M ops)
+    re-measure.** Only firm statement: HiOM additionally writes the ColdTier
+    mirror per put (a real extra PM write), but its true scaling cost vs Viper
+    is not yet measured. ⚠ The all_ops `update` cell is likewise untrustworthy
+    (reports 0.4–10 G/s for *both* systems — impossible for real PM updates;
+    use YCSB-A below for update). TODO: re-run insert (+delete, +YCSB-A) at
+    paper scale before any write-throughput claim in the paper; the 1M absolute
+    numbers here are directional only.
+  - **UPDATE: the all_ops `update` cell is a measurement artifact** (keys not in
+    the updated range → no-op fast path, reports 0.4–10 G/s for both systems —
+    ignore it). Real update = YCSB-A (50% update-in-place / 50% read) @1M: HiOM
+    **0.46–0.55× Viper and scaling** (a_zipf t24 12.5 vs 27.4; a_uniform 11.6 vs
+    21.2). That ratio is ~2× the old pre-fix E4 (0.27–0.34× at t8) — the read
+    half no longer hits the stats-counter wall and the write half no longer hits
+    the wake storm. Remaining gap = in-place PM write (= Viper) + resolver
+    key-verify read + a **redundant ColdTier re-write** (in-place update keeps
+    the same offset, so the flushed cold upsert is a no-op write). *Future
+    opt:* skip the commit-buffer push for in-place fixed-size updates (offset
+    unchanged ⇒ ColdTier already correct; use non-pinned `hot_.lookup` for the
+    SIEVE touch). Guard for variable-size V, which can relocate the offset.
+
 - **E2/E4 four-system main table landed (priority-5 baseline expansion)** —
   the §7 evaluation's last open block. `ycsb_bm` now runs HiOM + Viper + Dash +
   CCEH in one harness on stock PMDK (K8/V200, the paper's real workload);
@@ -48,13 +140,22 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
   At t=1/8 HiOM > Dash > CCEH (DRAM offset hit beats PM random read) — the
   Pareto "read beats PM-resident" claim holds. **At t=24 Dash overtakes HiOM**
-  (zipf 31.2 vs 18.4; uniform 22.5 vs 20.3): HotTier's per-slot lookup
-  contention at high fan-in — same root as the get-t=24 0.62×-Viper note
-  (2026-05-16) — now shows up as losing to a PM-resident baseline, not just to
-  Viper. **Positioning consequence**: scope the read-throughput win to low/mid
+  (zipf 31.2 vs 18.4; uniform 22.5 vs 20.3). **⚠ ROOT CAUSE CORRECTED (see the
+  top bullet of this status):** this inversion was **misattributed** here to
+  "HotTier per-slot lookup contention" — it was actually the single contended
+  `stats_.hot_hits.fetch_add` on the read hot path, now fixed via per-Client
+  shards. The HiOM t=24 numbers in the table above are **pre-shard**; with the
+  fix HiOM tracks Viper to t=24 (1M proxy: 96.5 % of Viper) and is expected to
+  re-pass Dash. The "scope the read-throughput win to low/mid concurrency"
+  conclusion below is **now confirmed wrong @10 M** (HiOM t24 zipf 46.6 with the
+  fix: matches Viper, beats Dash) — **drop it**; see the top bullet.
+
+  ~~**Positioning consequence**: scope the read-throughput win to low/mid
   concurrency; label t=24 HotTier contention as a limitation + future work
   (per-slot contention, likely same family as the `mirror_into_hot` spin in the
-  capacity ablation).
+  capacity ablation).~~ *(superseded — the t=24 read wall was the stats counter,
+  not HotTier lookup; `mirror_into_hot` spin remains a real but separate
+  write-path/capacity-sweep concern.)*
 
 - **E4 (write, YCSB-A/B) @10 M** — write is a documented cost vs Viper. HiOM
   beats Dash/CCEH on every write cell, **but with a fixture caveat** (t=8 row,

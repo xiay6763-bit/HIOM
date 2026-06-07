@@ -84,8 +84,10 @@ class HiOMFixture : public BaseFixture {
 
     // Augments the base RSS snapshot with HiOM-specific telemetry from
     // hiom_->hot_tier() and hiom_->stats(). Called by ycsb_run on the
-    // init thread after the timed loop ends. All accessors are O(1)
-    // atomic loads — safe to call at telemetry time.
+    // init thread after the timed loop ends. hot_tier() accessors are
+    // O(1) atomic loads; stats() folds the per-Client read shards into
+    // the aggregate (O(#client slots)) — safe here because the timed
+    // loop has already joined every worker, so no Client is mid-get().
     MemSnapshot fixture_telemetry() override {
         MemSnapshot snap = capture_mem();
         if (hiom_) {

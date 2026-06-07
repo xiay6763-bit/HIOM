@@ -54,6 +54,37 @@
 #include "viper/hiom/hot_tier.hpp"
 #include "viper/hiom/offset_codec.hpp"
 
+// Read-path hit/miss telemetry. Each HiOM::Client increments its OWN
+// per-thread shard (read_shards_[slot_idx_]) — a plain, NON-atomic
+// uint64 on a private 64-byte cache line — so the get() hot path emits
+// ZERO cross-core coherence traffic. stats() folds the shards into the
+// Stats aggregate on demand, off the hot path (fold_read_shards_).
+//
+// History / why this exists: this used to be a single
+// `stats_.<counter>.fetch_add(1, relaxed)` per get(). That one contended
+// atomic serialized every read through a single cache line and flattened
+// read throughput at >=8 threads — a hard wall at ~12 Mops/s vs Viper's
+// ~38 at 24 threads (1M / 100r_uniform). The Step-0 ablation (compiling
+// the increment out entirely) restored scaling to 95% of Viper, proving
+// the counter was the whole wall; this per-Client shard reproduces that
+// win while keeping exact, always-on hit/miss telemetry. See
+// design/HIOM.md §7 and Claude memory `hiom-read-stats-contention`.
+//
+// HIOM_READ_STATS=0 compiles the increment out entirely (no telemetry),
+// for absolute-minimal builds or re-running the ablation.
+#ifndef HIOM_READ_STATS
+#define HIOM_READ_STATS 1
+#endif
+#if HIOM_READ_STATS
+#define HIOM_RSTAT_INC(field)                                  \
+    do {                                                       \
+        if (slot_idx_ != HiOM::kInvalidSlotIdx)                \
+            ++hiom_.read_shards_[slot_idx_].field;             \
+    } while (0)
+#else
+#define HIOM_RSTAT_INC(field) ((void)0)
+#endif
+
 namespace viper::hiom {
 
 // Compute a 4-byte fingerprint from a key. Reuses Viper's routing hash
@@ -159,6 +190,9 @@ class HiOM {
           cold_(cold),
           base_map_{},  // M0/M2: all zero, single region 0
           fcfg_(fcfg),
+          per_lane_high_watermark_(
+              std::max<std::size_t>(
+                  1, fcfg.high_watermark / CommitBuffer::kNumLanes)),
           checkpoint_(checkpoint),
           ccfg_(ccfg)
     {
@@ -395,13 +429,12 @@ class HiOM {
             const std::uint32_t fp = key_fingerprint(key);
             if (auto packed = hiom_.hot_.lookup(fp)) {
                 if (verify_and_read(key, *packed, value)) {
-                    hiom_.stats_.hot_hits.fetch_add(1, std::memory_order_relaxed);
+                    HIOM_RSTAT_INC(hot_hits);
                     return true;
                 }
-                hiom_.stats_.hot_fp_collisions.fetch_add(
-                    1, std::memory_order_relaxed);
+                HIOM_RSTAT_INC(hot_fp_collisions);
             } else {
-                hiom_.stats_.hot_misses.fetch_add(1, std::memory_order_relaxed);
+                HIOM_RSTAT_INC(hot_misses);
             }
 
             if (hiom_.cold_ != nullptr) {
@@ -417,16 +450,13 @@ class HiOM {
                 const std::uint64_t fp64 = key_fingerprint64(key);
                 if (auto cold_off = hiom_.cold_->lookup(fp64)) {
                     if (verify_and_read_offset(key, *cold_off, value)) {
-                        hiom_.stats_.cold_hits.fetch_add(
-                            1, std::memory_order_relaxed);
+                        HIOM_RSTAT_INC(cold_hits);
                         mirror_into_hot_with_offset(key, *cold_off);
                         return true;
                     }
-                    hiom_.stats_.cold_fp_collisions.fetch_add(
-                        1, std::memory_order_relaxed);
+                    HIOM_RSTAT_INC(cold_fp_collisions);
                 } else {
-                    hiom_.stats_.cold_misses.fetch_add(
-                        1, std::memory_order_relaxed);
+                    HIOM_RSTAT_INC(cold_misses);
                 }
                 return false;
             }
@@ -437,8 +467,7 @@ class HiOM {
             if (!viper_.get(key, value)) return false;
             mirror_into_hot_with_offset(key,
                                         viper_.hiom_peek_offset(key));
-            hiom_.stats_.hot_warmups.fetch_add(
-                1, std::memory_order_relaxed);
+            HIOM_RSTAT_INC(hot_warmups);
             return true;
         }
 
@@ -679,10 +708,30 @@ class HiOM {
                     = std::make_unique<moodycamel::ProducerToken>(
                         hiom_.commit_buf_->make_producer_token(lane));
             }
-            hiom_.commit_buf_->push(*prod_toks_[lane], lane, e);
-            // Wake the flusher if we crossed the high watermark, so we
-            // don't always wait the full kFlushIntervalMs of latency.
-            if (hiom_.commit_buf_->size_hint() >= hiom_.fcfg_.high_watermark) {
+            // push() returns this lane's post-enqueue depth. Wake the
+            // flushers on the RISING EDGE through a per-lane watermark
+            // (depth == high_watermark/kNumLanes), and ONLY that edge.
+            // Two failure modes this threads between:
+            //   - depth>=wm (wake on every push once at/over the mark):
+            //     under a write storm the flushers fall behind, the lane
+            //     sits above the mark, and EVERY push then runs
+            //     wake_all_flushers (kNumLanes mutexes) — that 8-mutex
+            //     storm regressed delete throughput 8→24 threads.
+            //   - depth==1 (wake on every empty→nonempty edge): at low
+            //     concurrency the flusher drains each entry and re-parks,
+            //     so the producer's next push re-arms the edge and pays a
+            //     futex wake (syscall) PER op — collapsed delete t=1 to
+            //     ~0.28 M/s.
+            // The exact-watermark edge fires at most once per drain-cycle:
+            // at t=1 the depth stays below wm (flusher keeps up) so we
+            // never wake and the 5 ms flusher timer drains the trickle
+            // (matches the original size_hint() semantics); under load the
+            // depth crosses wm once and we wake once. A missed edge (rare,
+            // concurrent drain) costs at most one fcfg_.interval of latency
+            // — the flusher's timer + predicate re-check is the backstop.
+            const std::size_t lane_depth
+                = hiom_.commit_buf_->push(*prod_toks_[lane], lane, e);
+            if (lane_depth == hiom_.per_lane_high_watermark_) {
                 hiom_.wake_all_flushers();
             }
         }
@@ -738,7 +787,17 @@ class HiOM {
     HotTier& hot_tier() { return hot_; }
     ColdTier* cold_tier() { return cold_; }
     CommitBuffer* commit_buffer() { return commit_buf_.get(); }
-    const Stats& stats() const { return stats_; }
+    // Non-const: folds the per-Client read shards into the aggregate
+    // before returning (see fold_read_shards_), so the read-path
+    // counters (hot/cold hits/misses/fp_collisions, hot_warmups) reflect
+    // every Client's shard. Flusher/recovery counters (commits_flushed,
+    // checkpoints_written, recovery_replayed, debug_*) are written
+    // directly elsewhere and pass through the fold untouched. Call at a
+    // point quiescent w.r.t. the read path (all current callers do).
+    const Stats& stats() {
+        fold_read_shards_();
+        return stats_;
+    }
 
     // Wall-clock of the M6 tail-scan replay (recover_tail_into_cold) in
     // isolation, set once by the ctor when tail_scan=true (else stays 0).
@@ -886,6 +945,64 @@ class HiOM {
         std::atomic<bool> active{false};
     };
     std::array<ClientSlot, kMaxClientSlots> client_slots_{};
+
+    // -- Read-path telemetry shards (per-Client, contention-free) ------
+    //
+    // One shard per Client slot, mirroring client_slots_ above. Each
+    // HiOM::Client increments read_shards_[slot_idx_] on its get() hot
+    // path via the HIOM_RSTAT_INC macro using PLAIN (non-atomic) adds:
+    // the §Concurrency contract is one thread per Client, so each shard
+    // has a single writer and needs no atomic. alignas(64) gives every
+    // shard its own cache line, so two Clients pinned to two cores never
+    // false-share. This replaces the single contended Stats atomic that
+    // used to cap read scaling (see the HIOM_RSTAT_INC comment at file
+    // top for the measured wall + ablation).
+    //
+    // Shards are intentionally NOT reset when a Client releases its slot
+    // (release_client_slot leaves them intact, exactly like ClientSlot's
+    // last_block), so totals survive Client destruction and a later
+    // stats() fold still sees them. reserve_client_slot does not clear
+    // them either — a reused slot keeps accumulating, which is correct
+    // because the per-slot sum over the whole run is all the fold needs.
+    struct alignas(64) ReadStatShard {
+        std::uint64_t hot_hits{0};
+        std::uint64_t hot_misses{0};
+        std::uint64_t hot_fp_collisions{0};
+        std::uint64_t cold_hits{0};
+        std::uint64_t cold_misses{0};
+        std::uint64_t cold_fp_collisions{0};
+        std::uint64_t hot_warmups{0};
+    };
+    static_assert(sizeof(ReadStatShard) == 64,
+                  "ReadStatShard should occupy exactly one cache line");
+    std::array<ReadStatShard, kMaxClientSlots> read_shards_{};
+
+    // Fold the per-Client read shards into the Stats aggregate's read
+    // counters. Called by stats() at telemetry time.
+    //
+    // Thread-safety: MUST be called at a point quiescent w.r.t. the read
+    // path (no Client concurrently inside get()). All current callers
+    // satisfy this — the YCSB fixture reads stats() after the timed loop
+    // joins all worker threads, and the integration tests read it
+    // single-threaded between op batches — so the plain-uint64 loads
+    // race with nothing. O(kMaxClientSlots): negligible, off the hot path.
+    void fold_read_shards_() {
+        std::uint64_t hh = 0, hm = 0, hfc = 0, ch = 0, cm = 0, cfc = 0, hw = 0;
+        for (const auto& s : read_shards_) {
+            hh += s.hot_hits;            hm  += s.hot_misses;
+            hfc += s.hot_fp_collisions;  ch  += s.cold_hits;
+            cm += s.cold_misses;         cfc += s.cold_fp_collisions;
+            hw += s.hot_warmups;
+        }
+        stats_.hot_hits.store(hh, std::memory_order_relaxed);
+        stats_.hot_misses.store(hm, std::memory_order_relaxed);
+        stats_.hot_fp_collisions.store(hfc, std::memory_order_relaxed);
+        stats_.cold_hits.store(ch, std::memory_order_relaxed);
+        stats_.cold_misses.store(cm, std::memory_order_relaxed);
+        stats_.cold_fp_collisions.store(cfc, std::memory_order_relaxed);
+        stats_.hot_warmups.store(hw, std::memory_order_relaxed);
+    }
+    // ------------------------------------------------------------------
 
     // Reserve a slot. Returns the index, or kInvalidSlotIdx if all
     // slots are taken (Client falls back to "no tracking" — its
@@ -1456,6 +1573,11 @@ class HiOM {
     // Set once by the ctor's Step 2 tail-scan timing; read-only thereafter.
     double recovery_tail_scan_ms_{0.0};
     FlusherConfig fcfg_;
+    // Per-lane flusher-wake watermark = high_watermark / kNumLanes.
+    // push_commit wakes on the RISING EDGE through this depth
+    // (lane_depth == this), see push_commit for the rationale. Init
+    // order: must stay after fcfg_, before checkpoint_.
+    std::size_t per_lane_high_watermark_;
 
     std::unique_ptr<CommitBuffer> commit_buf_;
     std::array<std::unique_ptr<moodycamel::ConsumerToken>,
