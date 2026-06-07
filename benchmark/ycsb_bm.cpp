@@ -54,16 +54,24 @@ inline std::string ycsb_workload_path(const char* workload) {
             ->UseRealTime() \
             ->Threads(1)->Threads(4)->Threads(8)->Threads(16)->Threads(24)->Threads(32)->Threads(36)
 
-// Read-only workloads (YCSB-C analog) use a narrower thread sweep: t=24
-// already saturates the read path at ~466 M ops/s aggregate, so 32/36
-// add cache-line ping-pong cost without showing a new story. The
-// 4-op grid in HIOM.md uses the same 1/8/24 axis.
+// Read-only workloads (YCSB-C analog). Dense thread sweep
+// 1/2/4/8/16/24 so the throughput-vs-threads scalability curve
+// (eval/thread_scaling_plot.py, Meto/Viper-paper style) has enough
+// points to show its shape: HiOM leads at low/mid concurrency but is
+// overtaken by Dash at t=24 (HotTier high-fan-in lookup contention,
+// a §7 limitation). 32/36 are dropped — they only add cache-line
+// ping-pong past the read-path knee without a new story; the 4-op
+// HIOM.md main grid still reports the 1/8/24 subset.
+// NB: Google Benchmark's items_per_second here is the AGGREGATE rate
+// (all threads combined), NOT per-thread — real_time is wall÷threads,
+// so items_per_second × real_time = per-thread ops. Plot it directly
+// as Mops/s; do not multiply by the thread count.
 #define READ_ARGS \
             ->Repetitions(3) \
             ->Iterations(1) \
             ->Unit(BM_TIME_UNIT) \
             ->UseRealTime() \
-            ->Threads(1)->Threads(8)->Threads(24)
+            ->Threads(1)->Threads(2)->Threads(4)->Threads(8)->Threads(16)->Threads(24)
 
 #define DEFINE_BM_WITH_ARGS(fixture, workload, data, ARGS) \
             BENCHMARK_TEMPLATE2_DEFINE_F(fixture, workload ## _tp, KeyType8, ValueType200)(benchmark::State& state) { \

@@ -7,7 +7,7 @@ Walks /root/viper/results/scaling/*.json (one JSON per
 groups by (workload, fixture, size, threads), takes the median of the
 3 reps Google Benchmark emits, and produces one PDF per workload with
 a 3-row × 3-col grid:
-  Row 1: throughput (M items/s per thread)  vs dataset size  (3 panels: t=1, t=8, t=24)
+  Row 1: aggregate throughput (Mops/s)      vs dataset size  (3 panels: t=1, t=8, t=24)
   Row 2: dram_loaded_mb                     vs dataset size  (3 panels)
   Row 3: HiOM-only diagnostics              vs dataset size  (hot_size, hot_evictions, hot_hit_rate)
 
@@ -88,7 +88,12 @@ def parse_results():
             metric = n.group("metric")
             cell = data[workload][fixture][size_m][threads]
             if metric == "tp":
-                # Per-thread throughput (Google Benchmark already normalizes).
+                # AGGREGATE throughput (all threads combined): Google
+                # Benchmark's items_per_second is already system-wide, NOT
+                # per-thread (real_time is wall÷threads, so ips × real_time
+                # = per-thread ops). Do not multiply by the thread count.
+                # The key name `ips_per_thr` is legacy/misnamed — it holds
+                # the aggregate rate.
                 cell["ips_per_thr"] = bm.get("items_per_second", 0)
                 cell["dram_mb"] = bm.get("dram_loaded_mb", 0)
                 cell["rss_mb"] = bm.get("rss_loaded_mb", 0)
@@ -187,7 +192,7 @@ def plot_workload(workload, w_data):
                 ax.plot(xs, ys, **{k: v for k, v in STYLES[fixture].items() if k != "label"},
                         label=STYLES[fixture]["label"])
         ax.set_title(f"Throughput — t={t}")
-        ax.set_ylabel("M items/s per thread")
+        ax.set_ylabel("Aggregate throughput (Mops/s)")
         ax.set_xscale("log")
         ax.grid(True, alpha=0.3)
         ax.legend()
@@ -335,8 +340,8 @@ def plot_latency(workload, w_data):
 
 
 def print_summary(data):
-    """Compact tabular summary to stdout — per-thread throughput at t=8
-    for all four systems, with the ratio vs Viper in parentheses."""
+    """Compact tabular summary to stdout — aggregate throughput (Mops/s)
+    at t=8 for all four systems, with the ratio vs Viper in parentheses."""
     print("\n=== Summary (median of 3 reps; threads=8 row) ===")
     fix_order = [("ViperFixture", "Viper"), ("HiOMFixture", "HiOM"),
                  ("DashFixture", "Dash"), ("CcehFixture", "CCEH")]
@@ -348,7 +353,7 @@ def print_summary(data):
         sizes = sorted({s for fx, _ in present for s in w.get(fx, {}).keys()})
         if not sizes:
             continue
-        print(f"\n[{workload}]  M items/s per thread @ t=8  (parens = ratio vs Viper)")
+        print(f"\n[{workload}]  aggregate Mops/s @ t=8  (parens = ratio vs Viper)")
         header = "  ".join(f"{lbl:>14}" for _, lbl in present)
         print(f"  {'size':>5}   {header}")
         print("-" * (10 + len(present) * 16))
