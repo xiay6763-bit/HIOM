@@ -52,7 +52,7 @@ inline std::string ycsb_workload_path(const char* workload) {
             ->Iterations(1) \
             ->Unit(BM_TIME_UNIT) \
             ->UseRealTime() \
-            ->Threads(1)->Threads(4)->Threads(8)->Threads(16)->Threads(24)->Threads(32)->Threads(36)
+            ->Threads(1)->Threads(2)->Threads(4)->Threads(8)->Threads(16)->Threads(24)->Threads(32)->Threads(36)
 
 // Read-only workloads (YCSB-C analog). Dense thread sweep
 // 1/2/4/8/16/24 so the throughput-vs-threads scalability curve

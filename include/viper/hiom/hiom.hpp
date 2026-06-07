@@ -43,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -514,11 +515,33 @@ class HiOM {
         template <typename UpdateFn>
         bool update(const K& key, UpdateFn fn) {
             if (!viper_.update(key, std::move(fn))) return false;
-            // Viper update is in-place; offset unchanged. Still push a
-            // kPut so HotTier's visited bit re-fires (touch keeps the
-            // entry "hot" for SIEVE) and the buffer's PINNED window
-            // re-arms — harmless duplicate cold-tier upsert.
-            mirror_write(key, CommitEntry::Op::kPut);
+            // Viper's fixed-size update is IN-PLACE: the value is
+            // overwritten at the same VPage slot and persisted by
+            // viper_.update, so the key's offset is UNCHANGED. ColdTier
+            // therefore already maps key→offset correctly and needs no
+            // re-write, and there is no new slot to pin — so skip the
+            // commit-buffer push entirely and only refresh the HotTier
+            // SIEVE "visited" bit (plain hot_.lookup: sets it on hit,
+            // no-op on miss; an evicted entry is re-warmed from ColdTier
+            // on the next read either way). This removes update's per-op
+            // write amplification: the old path did upsert_pinned +
+            // push_commit + a redundant flusher ColdTier upsert of the
+            // SAME (fp64, offset). Crash-safe — the new value is durable
+            // on PM at the unchanged offset and ColdTier's offset is
+            // unchanged, so tail-scan recovery resolves the key to the new
+            // value with nothing to replay (no commit entry ⇒ no unflushed
+            // window ⇒ no checkpoint-frontier constraint, so skipping
+            // note_client_block is also safe).
+            //
+            // Guard: fixed-size V only. A variable-size std::string value
+            // can grow and be relocated to a NEW offset by Viper's update,
+            // which WOULD need a ColdTier re-write — those keep the
+            // mirror_write(kPut) path.
+            if constexpr (std::is_same_v<V, std::string>) {
+                mirror_write(key, CommitEntry::Op::kPut);
+            } else {
+                hiom_.hot_.lookup(key_fingerprint(key));  // SIEVE touch only
+            }
             return true;
         }
 

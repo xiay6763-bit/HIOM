@@ -57,7 +57,9 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     (YCSB-A) and the undersized-HotTier capacity sweep have their own
     contention — `HotTier::size_`/`eviction_count_` global atomics on
     insert/evict, and the `mirror_into_hot` re-warm CAS storm. Read-path only
-    here; the t=24 *write* gap vs Viper (E4) is unchanged.
+    here; the write path (delete wall, update redundant ColdTier re-write) was
+    fixed separately afterward — see the next bullet + the refreshed E4 (YCSB-A
+    0.46–0.74×, YCSB-B ≈ Viper).
 
 - **Write-path scaling investigated + delete wall FIXED (follow-up to the read
   fix).** Same measure-then-ablate method on insert/delete/update (all_ops_bm,
@@ -83,33 +85,45 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     [hiom.hpp](../include/viper/hiom/hiom.hpp) `push_commit` /
     `per_lane_high_watermark_`. All `hiom_integration_test` (incl. recovery +
     crash-injection) pass.
-  - **INSERT — earlier "bandwidth-bound" reading RETRACTED (measurement
-    artifact).** The 1M-op all_ops run showed Viper insert plateauing ~3.2 M/s
-    and HiOM ~0.5×, which I wrongly read as Optane write-bandwidth saturation.
-    But the Viper paper (Fig. 6; **100M prefill + 50M ops**, 16B/200B) reports
-    Viper PUT scaling to **15 M puts/s @ 36 threads** (~12M @ 24). So the 3.2M
-    plateau is a SMALL-SAMPLE artifact: 1M inserts / 24 threads ≈ 42K/thread,
-    iterations:1 — dominated by thread spawn/barrier, never reaching steady
-    state. **Insert scaling is UNRESOLVED pending a paper-scale (≥10–50M ops)
-    re-measure.** Only firm statement: HiOM additionally writes the ColdTier
-    mirror per put (a real extra PM write), but its true scaling cost vs Viper
-    is not yet measured. ⚠ The all_ops `update` cell is likewise untrustworthy
-    (reports 0.4–10 G/s for *both* systems — impossible for real PM updates;
-    use YCSB-A below for update). TODO: re-run insert (+delete, +YCSB-A) at
-    paper scale before any write-throughput claim in the paper; the 1M absolute
-    numbers here are directional only.
+  - **INSERT — RESOLVED (2026-06-07 paper-scale re-measure): NOT an op-count
+    artifact; this host's PM write path is the ceiling.** I first called it
+    "bandwidth-bound", then (after the Fig.6 cross-check) suspected the 1M run
+    was a small-sample artifact. Re-measuring at 10M inserts settles it: Viper
+    insert t24 = **2.15** M/s (was 3.16 at 1M — *lower*, not higher), t36 = 2.71;
+    HiOM 1.28–1.54 (≈0.5–0.7× Viper). More ops did NOT approach the paper's 15M
+    PUT @ 36t — so it is **not** small-sample. Root cause is the **environment,
+    not the code**: `/pmem0` is **ext4 + dax=always (FSDAX)** and a **shared
+    mount** (ljw/zzk/roert/test/HGBTree/… all write it). Viper t36 = 2.71 M/s ×
+    216 B = **0.59 GB/s**, below a single Optane DIMM's write BW, and scaling is
+    non-monotonic (t8 1.91 > t16 1.58) — the signature of fsdax overhead +
+    concurrent cross-tenant PM-write contention. The paper's 15M was on a
+    dedicated 6-DIMM devdax machine.
+    - **Consequence:** insert/write **absolute** throughput on this host is
+      **not comparable to the Viper paper** and is noisy run-to-run. Report the
+      host-robust **HiOM/Viper ratio (≈0.5–0.7×)** instead, which isolates
+      HiOM's real algorithmic cost — the extra ColdTier mirror write per put —
+      from the shared-hardware ceiling. Mechanism (PM-write-BW-bound for both
+      systems) holds; only the ceiling is host-specific. See Claude memory
+      [[hiom_bench_numa_topology]].
+    - ⚠ The all_ops `update` cell is separately untrustworthy (reports 0.4–10
+      G/s for *both* systems — impossible for real PM updates); use YCSB-A below
+      for update.
   - **UPDATE: the all_ops `update` cell is a measurement artifact** (keys not in
     the updated range → no-op fast path, reports 0.4–10 G/s for both systems —
-    ignore it). Real update = YCSB-A (50% update-in-place / 50% read) @1M: HiOM
-    **0.46–0.55× Viper and scaling** (a_zipf t24 12.5 vs 27.4; a_uniform 11.6 vs
-    21.2). That ratio is ~2× the old pre-fix E4 (0.27–0.34× at t8) — the read
-    half no longer hits the stats-counter wall and the write half no longer hits
-    the wake storm. Remaining gap = in-place PM write (= Viper) + resolver
-    key-verify read + a **redundant ColdTier re-write** (in-place update keeps
-    the same offset, so the flushed cold upsert is a no-op write). *Future
-    opt:* skip the commit-buffer push for in-place fixed-size updates (offset
-    unchanged ⇒ ColdTier already correct; use non-pinned `hot_.lookup` for the
-    SIEVE touch). Guard for variable-size V, which can relocate the offset.
+    ignore it). Real update = YCSB-A (50% update-in-place / 50% read). Remaining
+    gap vs Viper = in-place PM write (= Viper) + resolver key-verify read. The
+    **redundant ColdTier re-write** that used to sit on this path (in-place
+    update keeps the same offset, so the flushed cold upsert was a no-op write)
+    is now **eliminated — DONE 2026-06-07**: `Client::update` skips the
+    commit-buffer push for in-place *fixed-size* updates (offset unchanged ⇒
+    ColdTier already correct) and only refreshes the SIEVE bit via non-pinned
+    `hot_.lookup`; variable-size `std::string` V (Viper may relocate it to a new
+    offset) keeps the `mirror_write(kPut)` path via an
+    `if constexpr (std::is_same_v<V, std::string>)` guard — crash-safe, since
+    with no commit entry there is no unflushed window to replay. Net effect is
+    the **post-opt @10 M YCSB-A/B E4 tables below** (a_zipf t24 0.46×, a_uni
+    0.74×, b ≈ 0.92–1.05×); the interim @1 M figures (0.46–0.55× pre-opt) are
+    superseded. `hiom_integration_test` (recovery + crash) still pass.
 
 - **E2/E4 four-system main table landed (priority-5 baseline expansion)** —
   the §7 evaluation's last open block. `ycsb_bm` now runs HiOM + Viper + Dash +
@@ -157,25 +171,46 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   > uniform = 16.1/18.8/19.9 — the flat wall this fix removed. Raw kept at
   > results/thread_scaling/HiOMFixture_100r_*_10M_tp.json.preshard.
 
-- **E4 (write, YCSB-A/B) @10 M** — write is a documented cost vs Viper. HiOM
-  beats Dash/CCEH on every write cell, **but with a fixture caveat** (t=8 row,
-  M items/s per thread):
+- **E4 (write, YCSB-A/B) @10 M — RE-MEASURED post-fix (2026-06-07; update
+  in-place skip-commit + rising-edge flusher wake + read-path shards).** Full
+  4-system thread curves (1/2/4/8/16/24, same format as the 100r read figure)
+  at eval/charts/thread_scaling_ycsb_{a,b}.pdf. Aggregate Mops/s (median):
 
-  | sys   | a_zipf | a_uni | b_zipf | b_uni |
-  |-------|-------:|------:|-------:|------:|
-  | Viper | 17.31 | 12.82 | 16.61 | 14.58 |
-  | HiOM  | 4.64 (0.27×) | 4.30 (0.34×) | 13.28 (0.80×) | 11.75 (0.81×) |
-  | Dash  | 1.58 | 2.04 | 7.43 | 6.72 |
-  | CCEH  | 1.64 | 1.45 | 5.04 | 4.01 |
+  **YCSB-B (read-mostly, 95 % read / 5 % update):**
 
-  YCSB-A (50% update): HiOM 0.27–0.34× Viper (consistent with the 0.24–0.45×
-  already documented) but ~3× Dash/CCEH. YCSB-B (5% update, read-mostly): HiOM
-  0.80–0.83× Viper at t=1/8. **Caveat — must state in the paper:** the
-  Dash/CCEH *fixtures* store every value via a per-op `pmem::obj::transaction`
-  make_persistent into a side PM pool (the index holds only an offset), so their
-  write throughput is **transaction-bound, not pure-index**. HiOM's write win
-  over Dash is therefore partly a fixture artifact. Frame E4 as "HiOM write <
-  Viper (limitation)"; do **not** claim a clean write win over Dash.
+  | sys   | zipf t1 | t8 | t24 | uni t1 | t8 | t24 |
+  |-------|--------:|---:|----:|-------:|---:|----:|
+  | Viper | 2.8 | 18.0 | 45.1 | 2.3 | 17.3 | 32.9 |
+  | HiOM  | 2.8 | **19.0** | 42.8 | 2.5 | 16.0 | 30.3 |
+  | Dash  | 1.3 | 8.9 | 16.7 | 1.1 | 7.6 | 16.2 |
+  | CCEH  | 0.9 | 6.8 | 17.0 | 0.7 | 5.3 | 13.8 |
+
+  **YCSB-A (write-heavy, 50 % read / 50 % update):**
+
+  | sys   | zipf t1 | t8 | t24 | uni t1 | t8 | t24 |
+  |-------|--------:|---:|----:|-------:|---:|----:|
+  | Viper | 2.9 | 17.5 | 25.5 | 2.6 | 14.3 | 19.1 |
+  | HiOM  | 2.5 | 10.3 | 11.7 | 2.0 | 10.1 | 14.1 |
+  | Dash  | 0.4 | 2.5 | 2.3 | 0.3 | 2.0 | 2.6 |
+  | CCEH  | 0.3 | 2.0 | 2.1 | 0.3 | 1.9 | 2.4 |
+
+  **YCSB-B (read-mostly): HiOM 0.92–1.05× Viper** — parity, and it even *edges*
+  Viper at zipf t8 (19.0 vs 18.0); **~2.5× Dash/CCEH** at t24. Read-mostly is
+  HiOM's comfort zone: the 5 % updates are nearly free now that the read half
+  rides the per-Client shards and the update half skips the redundant commit
+  push. **YCSB-A (write-heavy): HiOM 0.46× (zipf t24) – 0.74× (uniform t24)
+  Viper** — the documented write cost (ColdTier durability mirror on the 50 %
+  puts), but **up from the old 0.27–0.34× at t8** thanks to the update-opt +
+  wake fix, and still ~5× Dash/CCEH. (zipf is the harder case: θ=0.99 piles the
+  50 % writes onto a few hot keys → HotTier-slot + ColdTier-region contention;
+  uniform spreads them, so a_uniform holds 0.74×.) **Caveat — state in the
+  paper:** the Dash/CCEH *fixtures* persist every value via a per-op
+  `pmem::obj::transaction` make_persistent into a side PM pool, so their write
+  throughput is transaction-bound, not pure-index — HiOM's write lead over Dash
+  is partly a fixture artifact. Frame E4 as "HiOM write < Viper (a documented
+  design cost), read-mostly ≈ Viper"; do **not** claim a clean write win over
+  Dash. Pre-fix t=8 snapshot kept for reference: a_zipf 4.64 (0.27×), a_uni 4.30
+  (0.34×), b_zipf 13.28 (0.80×), b_uni 11.75 (0.81×).
 
 - **Scoped out (2026-06-07 decision — not a gap)**: Dash/CCEH at 5/16/33 M was
   considered and *deliberately dropped*. vs-N's information value sits on the
@@ -1586,16 +1621,19 @@ recovery-sensitive** deployments:
   past DRAM capacity (CCEH preallocates ≈2 GB on init). Target: ≥50%
   fixture-DRAM reduction. *White-box measured (§Phase 2): HiOM 272 MB vs
   Viper ~2052 MB = **−86.7%**, flat across 5–50 M.*
-- **Read-heavy throughput (acceptable-cost, not a win)**: on read-mostly
-  workloads (YCSB-C analog, full HotTier) HiOM sustains 0.69–0.92× of Viper's
-  per-thread throughput — **measured 2026-06-05 at t=8 full-capacity: uniform
-  0.90×, zipf 0.73×** (supersedes the 0.27–0.58 of Status 05-17, which
-  predated prefill-then-rebuild + the M6.6 CCEH write-path retirement that
-  lifted HiOM read throughput ~50%, e.g. zipf t=8 10.15 M → 15.20 M items/s).
-  At t=1 the 8 B HotTier slot bypasses CCEH's segment lookup, so HiOM is
-  occasionally ahead (full-cap zipf 2.99 M vs Viper 2.27 M items/s); Viper's
-  CCEH scales better with threads, hence the sub-1.0 ratio at t=8. The story
-  is "comparable reads at a fraction of the DRAM", not "faster".
+- **Read-heavy throughput (now a genuine win, not just acceptable-cost)**: on
+  read-mostly workloads (YCSB-C analog, full HotTier) HiOM **matches or exceeds
+  Viper at every thread count and beats both PM-resident baselines** —
+  **re-measured 2026-06-07 @10 M, dense t=1..24**: 100r zipf t24 **46.8 vs Viper
+  43.2 / Dash 31.3 / CCEH 23.8**; uniform t24 35.5 vs 35.9 (within noise). The
+  earlier "0.69–0.92×, acceptable-cost not a win" (t=8, 2026-06-05) was a
+  **measurement artifact** — a single contended stats `fetch_add` on the read
+  hot path capped HiOM's scaling; per-Client shards removed it (Status top +
+  Claude memory `hiom-read-stats-contention`). HiOM even edges Viper on zipf
+  because its verify reads key+value in one `hiom_read_at_offset` vs Viper's
+  separate key-check + value read. Net: **Viper-class (or better) reads at a
+  fraction of the DRAM, and a clean win over PM-resident Dash/CCEH** — the "读多"
+  pillar now stands on throughput, not just DRAM.
 - **Recovery (secondary win)**: O(unflushed tail) vs Viper's O(all data)
   full CCEH rebuild — **~25× faster cold-start open at 100 M** (~87 ms vs
   ~2.2 s; ~15× conservative against a warm baseline).
@@ -1603,9 +1641,14 @@ recovery-sensitive** deployments:
 **Explicitly out of scope / known limitations** (demoted from the previous
 win claim, presented as limitations in the paper — not wins):
 
-- **Write-heavy throughput is markedly lower**: YCSB-A/B run 0.24–0.45× of
-  Viper at t=24; HiOM maintains a secondary index, so write/delete-heavy
-  workloads pay for it. The paper does not claim write parity.
+- **Write-heavy throughput is lower (a documented cost, not parity)**: YCSB-A
+  (50 % update) runs **0.46× (zipf t24) – 0.74× (uniform t24) of Viper**
+  (re-measured 2026-06-07 @10 M; up from the old 0.24–0.45× after the update
+  in-place skip-commit + rising-edge wake fix) — HiOM maintains a secondary
+  durability index (ColdTier mirror), so update/delete-heavy workloads pay for
+  it. The paper does not claim write parity. **Read-mostly (YCSB-B, 5 % update)
+  is NO LONGER a limitation** — there HiOM ≈ Viper (0.92–1.05×) and ~2.5×
+  Dash/CCEH; the cost is confined to write-dominated mixes.
 - **Skewed writes at HotTier capacity can livelock**: at working set ≥
   HotTier capacity *with* a skewed write workload (YCSB-A zipfian, e.g.
   `a_zipf-33M`), the bucket-PINNED back-pressure can starve slow writers
@@ -2137,16 +2180,20 @@ acknowledged cost. Each axis has a baseline HiOM beats:
 | **E1** DRAM vs N | C1 | index DRAM (MB) vs dataset size | HiOM flat 272 MB; Viper / Halo / DRAM-CCEH grow |
 | **E2** iso-DRAM reads | C2 | read tput / hit-rate vs **DRAM budget** | HiOM usable under tight budget; DRAM-index camp OOMs, PM camp slower |
 | **E3** recovery | C3 | open time vs N / tail size | O(tail) vs O(N); already 25× vs Viper, ≈736 K crossover |
-| **E4** write / scale | limitation | YCSB-A/B tput vs threads | honestly 0.24–0.65×; documented as a design cost, not hidden |
+| **E4** write / scale | limitation | YCSB-A/B tput vs threads | YCSB-B (read-mostly) ≈ Viper (0.92–1.05×); YCSB-A (write-heavy) 0.46–0.74×; a documented cost, not hidden |
 
-**Measured (2026-06-07, 10 M, four-system K8/V200)** — full E2/E4 tables in
-Status (2026-06-07) above. Headlines: **E2 reads** — HiOM > Dash > CCEH at
-t=1/8 (DRAM-offset hit beats PM random read); Dash overtakes HiOM at t=24
-(HotTier high-fan-in lookup contention) → scope the read win to low/mid
-concurrency. **E4 writes** — HiOM 0.27–0.34× Viper on YCSB-A, 0.80–0.83× on
-YCSB-B (t=1/8), ahead of Dash/CCEH but with a fixture caveat (the Dash/CCEH
-value store is per-op transaction-bound, not pure-index — do not claim a clean
-write win over Dash). E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
+**Measured (2026-06-07, 10 M, four-system K8/V200, dense t=1..24)** — full E2/E4
+tables in Status (2026-06-07) above. Headlines: **E2 reads** — HiOM
+matches/exceeds Viper and beats Dash > CCEH at **every** thread count (zipf t24
+46.8 vs Viper 43.2); the earlier "Dash overtakes at t=24 → scope the read win to
+low/mid concurrency" was the single contended stats `fetch_add`, fixed via
+per-Client shards and now **RETRACTED**. **E4 writes** — **YCSB-B (read-mostly)
+≈ Viper (0.92–1.05×, even edges it at zipf t8) and ~2.5× Dash/CCEH**; **YCSB-A
+(write-heavy) 0.46× (zipf t24) – 0.74× (uniform t24) Viper** — up from the old
+0.27–0.34× after the update in-place skip-commit + rising-edge wake fix — still
+~5× Dash/CCEH but with a fixture caveat (the Dash/CCEH value store is per-op
+transaction-bound, not pure-index — do not claim a clean write win over Dash).
+E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
 Pending: CLevel/SOFT/Halo via the Halo harness; four-system `lat`. Dash/CCEH
 vs-N scaling deliberately scoped out (vs-N value is on the DRAM axis, covered by
 E1; throughput is near-flat in N — a single 10 M point suffices as the
