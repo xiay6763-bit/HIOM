@@ -43,15 +43,16 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     `HIOM_RSTAT_INC` macro, `ReadStatShard`, `fold_read_shards_`. See Claude
     memory `hiom-read-stats-contention`.
   - **Positioning consequence — REMOVES the claimed limitation (confirmed
-    @10 M).** The E2 table below and its "scope the read-throughput win to
-    low/mid concurrency" conclusion were measured pre-shard. Re-measuring
-    100r_zipf @10 M *with the fix* (mean M items/s): HiOM t8 **21.2** (was
-    15.4), t24 **46.6** (was 17.7) — HiOM now **matches Viper** (44.8) and
-    **re-passes Dash** (31.4) at t=24, hit_rate 0.9996 intact. (HiOM edges Viper
-    because its verify reads key+value in one `hiom_read_at_offset`, vs Viper's
-    separate key-check + value read.) The read-axis Pareto win now holds at ALL
-    concurrencies — **drop the low/mid-only scoping**. Pre-shard E2 numbers kept
-    below, labelled. Raw: `results/ablation/HiOM_sharded_10M_zipf.{json,console.txt}`.
+    @10 M, full 4-system re-measure).** The full 100r thread-scaling was re-run
+    post-fix (zipf+uniform, t=1..24) — see the **E2 table below** and
+    eval/charts/thread_scaling_100r.pdf. HiOM now **matches/exceeds Viper and
+    beats Dash/CCEH at every thread count** (zipf t24 17.7→**46.8**, uniform
+    19.9→**35.5**; hit_rate 0.9996 intact). (HiOM edges Viper on zipf because its
+    verify reads key+value in one `hiom_read_at_offset`, vs Viper's separate
+    key-check + value read.) **The read-axis Pareto win now holds at ALL
+    concurrencies — the "scope to low/mid concurrency" limitation is RETRACTED.**
+    Pre-shard HiOM curves preserved at
+    results/thread_scaling/HiOMFixture_100r_*_10M_tp.json.preshard.
   - **NOT addressed by this fix (separate, still-open walls):** write/mixed
     (YCSB-A) and the undersized-HotTier capacity sweep have their own
     contention — `HotTier::size_`/`eviction_count_` global atomics on
@@ -127,35 +128,34 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     [cceh_fixture.hpp:269-279](../benchmark/fixtures/cceh_fixture.hpp#L269-L279).
     Smoke then clean for all four systems.
 
-- **E2 (read, YCSB-C) @10 M** — HiOM wins the read axis vs the PM-resident camp
-  *at low/mid concurrency*; the advantage **inverts at t=24** (median, M items/s
-  per thread):
+- **E2 (read, YCSB-C / 100r) @10 M — RE-MEASURED post-shard-fix (2026-06-07);
+  HiOM now wins the read axis at ALL concurrencies.** Aggregate Mops/s (median,
+  t=1/8/24), from results/thread_scaling/ via `thread_scaling_plot.py`
+  (→ eval/charts/thread_scaling_100r.pdf). HiOM rows are post-shard;
+  Viper/Dash/CCEH are unchanged by the fix (re-confirmed within run-to-run
+  variance):
 
   | sys   | zipf t1 | t8 | t24 | uni t1 | t8 | t24 |
   |-------|--------:|---:|----:|-------:|---:|----:|
-  | Viper | 2.91 | 22.63 | 43.35 | 2.55 | 18.03 | 36.05 |
-  | HiOM  | 2.53 | 15.44 | 18.44 | 2.27 | 15.67 | 20.33 |
-  | Dash  | 1.73 | 13.47 | **31.21** | 1.72 | 12.16 | **22.52** |
-  | CCEH  | 1.13 | 7.61 | 22.48 | 0.89 | 6.90 | 19.60 |
+  | Viper | 2.6 | 22.6 | 43.2 | 2.6 | 18.1 | 35.9 |
+  | HiOM  | 2.9 | 21.0 | **46.8** | 2.3 | 18.4 | **35.5** |
+  | Dash  | 1.6 | 13.4 | 31.3 | 1.7 | 12.0 | 22.5 |
+  | CCEH  | 1.2 | 8.2 | 23.8 | 0.9 | 7.1 | 19.9 |
 
-  At t=1/8 HiOM > Dash > CCEH (DRAM offset hit beats PM random read) — the
-  Pareto "read beats PM-resident" claim holds. **At t=24 Dash overtakes HiOM**
-  (zipf 31.2 vs 18.4; uniform 22.5 vs 20.3). **⚠ ROOT CAUSE CORRECTED (see the
-  top bullet of this status):** this inversion was **misattributed** here to
-  "HotTier per-slot lookup contention" — it was actually the single contended
-  `stats_.hot_hits.fetch_add` on the read hot path, now fixed via per-Client
-  shards. The HiOM t=24 numbers in the table above are **pre-shard**; with the
-  fix HiOM tracks Viper to t=24 (1M proxy: 96.5 % of Viper) and is expected to
-  re-pass Dash. The "scope the read-throughput win to low/mid concurrency"
-  conclusion below is **now confirmed wrong @10 M** (HiOM t24 zipf 46.6 with the
-  fix: matches Viper, beats Dash) — **drop it**; see the top bullet.
+  HiOM > Dash > CCEH at every thread count, and HiOM **matches/exceeds Viper at
+  t=24** (zipf 46.8 vs 43.2; uniform 35.5 vs 35.9 — within noise; HiOM edges out
+  on zipf because its verify reads key+value in one `hiom_read_at_offset`, vs
+  Viper's separate key-check + value read). **The read-axis Pareto win holds at
+  all concurrency — the earlier "inverts at t=24 / scope to low-mid concurrency"
+  limitation is RETRACTED.** Pre-shard HiOM was flat 15→17→17.6 from t=8 (shown
+  for the record below); that wall was the single contended
+  `stats_.hot_hits.fetch_add`, NOT "HotTier per-slot lookup contention" as first
+  guessed — fixed via per-Client stat shards (see top bullet). hot_hit_rate
+  stays 0.9996.
 
-  ~~**Positioning consequence**: scope the read-throughput win to low/mid
-  concurrency; label t=24 HotTier contention as a limitation + future work
-  (per-slot contention, likely same family as the `mirror_into_hot` spin in the
-  capacity ablation).~~ *(superseded — the t=24 read wall was the stats counter,
-  not HotTier lookup; `mirror_into_hot` spin remains a real but separate
-  write-path/capacity-sweep concern.)*
+  > Pre-shard (buggy) HiOM 100r for reference: zipf t8/16/24 = 15.1/17.0/**17.6**,
+  > uniform = 16.1/18.8/19.9 — the flat wall this fix removed. Raw kept at
+  > results/thread_scaling/HiOMFixture_100r_*_10M_tp.json.preshard.
 
 - **E4 (write, YCSB-A/B) @10 M** — write is a documented cost vs Viper. HiOM
   beats Dash/CCEH on every write cell, **but with a fixture caveat** (t=8 row,
