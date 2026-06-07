@@ -85,12 +85,42 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   curve would only restate "all four decline gently" — no Pareto consequence.
   Charts thus show Viper/HiOM as 5–33 M curves and Dash/CCEH as a 10 M reference
   point (`eval/charts/scaling_*.pdf`).
-- **Genuinely remaining (this line of work)**: (a) **E1 white-box DRAM for CCEH**
-  — `CcehFixture::fixture_dram_bytes()` is unimplemented (reports 0) and its
-  `CCEH(1000000)` ctor over-provisions ~8.6 GB RSS regardless of N (fixed cost,
-  doesn't affect throughput, but would inflate a DRAM comparison if used as-is);
-  (b) `lat` metric for the four-system set (only `tp` run so far); (c) SECONDARY
-  Halo harness systems (CLevel/SOFT/Halo).
+- **E1 white-box DRAM for CCEH — DONE (2026-06-07)**: `CcehFixture` now
+  implements `fixture_dram_bytes()` (returns `dram_map_->dram_bytes()`) and the
+  ctor capacity was corrected `1000000 → 131072`. The arg is `initCap` with
+  directory depth = `log2(initCap)`, so `1000000` silently meant depth 19
+  (524288 segments × 16 KiB ≈ 8 GB); `131072` = depth 17 = Viper's exact
+  `cceh_init_cap`. Result: CCEH RSS **8.6 GB → 2.4 GB**, white-box index DRAM
+  now **2052 MB = identical to Viper** (same cceh, same init cap). Read tput
+  unaffected (smoke 1.13 → 1.57 M/s — slightly *faster* with the smaller,
+  cache-friendlier directory). **E1 memory footprint — four-system stacked bar (Viper-paper Fig.9 style)**.
+  Each bar stacks PMem (data + PM index) then DRAM (index) on top; chart at
+  `eval/charts/footprint.pdf` (`eval/footprint_plot.py`). DRAM is white-box
+  measured; PMem is analytical (data = N×216 B with VPage ≈ raw and per-entry
+  PMDK alloc +~10% per Viper Fig.9; PM index from struct params). @10 M:
+
+  | system | DRAM (index) | PMem (data + index) | total | DRAM:PMem |
+  |--------|-------------:|--------------------:|------:|----------:|
+  | Viper  | 2052 MB | 2.07 GB | **4.07 GB** | 1:1 |
+  | CCEH   | 2052 MB | 2.32 GB | 4.33 GB | 1:1 |
+  | HiOM   | **272 MB** | 2.16 GB (incl. 96 MB ColdTier) | **2.43 GB** | 1:8 |
+  | Dash   | ~0 | 2.53 GB (incl. ~210 MB index) | 2.53 GB | 1:1295 |
+
+  Story (Viper Fig.9's argument: **DRAM is scarce** — ~1/8 the capacity, ~9× the
+  $/GB): HiOM cuts the scarce-DRAM footprint to **272 MB vs 2052 MB = −87%** vs
+  the DRAM-index camp (Viper/CCEH), and total memory **2.43 vs ~4.1 GB = −40%**
+  at 10 M, by moving the authoritative index to PMem (ColdTier) behind a small,
+  *fixed-size* DRAM hot tier — HiOM's DRAM is constant in N while Viper's CCEH
+  grows. The stacked bar lets Dash sit naturally at the PM-resident extreme
+  (DRAM ≈ 0): that 0 is not free — it is paid back in read throughput (E2,
+  Dash is the slowest reader), i.e. the opposite end of the DRAM×read Pareto.
+  (At 10 M, Viper's DRAM:PMem is ~1:1 because CCEH's 2 GB is *pre-allocated*
+  against ~2 GB of data; the Viper paper's 1:9 is at 100 M. HiOM's hot tier is
+  likewise pre-allocated, so the comparison stays apples-to-apples.)
+
+- **Genuinely remaining (this line of work)**: (a) `lat` metric for the
+  four-system set (only `tp` run so far); (b) SECONDARY Halo harness systems
+  (CLevel/SOFT/Halo).
 
 ---
 

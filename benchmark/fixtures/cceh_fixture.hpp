@@ -31,6 +31,14 @@ class CcehFixture : public BaseFixture {
     uint64_t insert(uint64_t start_idx, uint64_t end_idx) final;
     void prefill_ycsb(const std::vector<ycsb::Record>& data) override;
 
+    // White-box index DRAM for E1: the DRAM-resident CCEH directory + unique
+    // segments (the value store lives in PM, ~0 DRAM). Mirrors ViperFixture's
+    // cceh_dram_bytes() so DRAM-CCEH appears in the E1 DRAM comparison instead
+    // of reporting 0.
+    size_t fixture_dram_bytes() override {
+        return dram_map_ ? dram_map_->dram_bytes() : 0;
+    }
+
   protected:
     std::unique_ptr<cceh::CCEH<KeyT>> dram_map_;
     pmem::obj::pool<CcehPool> pmem_pool_;
@@ -65,7 +73,12 @@ void CcehFixture<KeyT, ValueT>::InitMap(const uint64_t num_prefill_inserts, cons
     });
 
     pool_vector_pos_ = 0;
-    dram_map_ = std::make_unique<cceh::CCEH<KeyT>>(1000000);
+    // Match Viper's CCEH init capacity (ViperConfig::cceh_init_cap = 131072 =
+    // 2^17 segments x 16 KiB ~= 2 GiB) so DRAM-CCEH is a fair DRAM-index peer to
+    // Viper, not an over-provisioned 2^19 (~8 GiB) outlier. The ctor arg is
+    // initCap with directory depth = log2(initCap), so 1000000 silently became
+    // depth 19 (524288 segments); 131072 gives depth 17, identical to Viper.
+    dram_map_ = std::make_unique<cceh::CCEH<KeyT>>(131072);
     prefill(num_prefill_inserts);
     map_initialized_ = true;
 }
