@@ -37,11 +37,13 @@ WORKLOADS = (
     "b_zipf", "b_uniform",
 )
 THREAD_AXES = (1, 8, 24)
-FIXTURES = ("ViperFixture", "HiOMFixture")
+FIXTURES = ("ViperFixture", "HiOMFixture", "DashFixture", "CcehFixture")
 MAX_SIZE_M = 33
 STYLES = {
     "ViperFixture": {"color": "#1f77b4", "marker": "o", "ms": 8, "label": "Viper"},
     "HiOMFixture":  {"color": "#d62728", "marker": "s", "ms": 8, "label": "HiOM"},
+    "DashFixture":  {"color": "#2ca02c", "marker": "^", "ms": 8, "label": "Dash (PM-resident)"},
+    "CcehFixture":  {"color": "#9467bd", "marker": "D", "ms": 7, "label": "CCEH (DRAM-idx)"},
 }
 
 # Parses a Google Benchmark "name" field like
@@ -160,9 +162,7 @@ def _mark_hang(ax, x, y_frac=0.5, label="HANG\n(M4)"):
 
 def plot_workload(workload, w_data):
     """Builds one PDF for the given workload."""
-    sizes_v = sorted(w_data.get("ViperFixture", {}).keys())
-    sizes_h = sorted(w_data.get("HiOMFixture", {}).keys())
-    sizes = sorted(set(sizes_v) | set(sizes_h))
+    sizes = sorted({s for fx in FIXTURES for s in w_data.get(fx, {}).keys()})
     if not sizes:
         print(f"  skip {workload} — no data")
         return
@@ -335,36 +335,37 @@ def plot_latency(workload, w_data):
 
 
 def print_summary(data):
-    """Compact tabular summary to stdout."""
+    """Compact tabular summary to stdout — per-thread throughput at t=8
+    for all four systems, with the ratio vs Viper in parentheses."""
     print("\n=== Summary (median of 3 reps; threads=8 row) ===")
+    fix_order = [("ViperFixture", "Viper"), ("HiOMFixture", "HiOM"),
+                 ("DashFixture", "Dash"), ("CcehFixture", "CCEH")]
     for workload in WORKLOADS:
         w = data.get(workload, {})
         if not w:
             continue
-        sizes = sorted({s for fx in FIXTURES for s in w.get(fx, {}).keys()})
+        present = [(fx, lbl) for fx, lbl in fix_order if w.get(fx)]
+        sizes = sorted({s for fx, _ in present for s in w.get(fx, {}).keys()})
         if not sizes:
             continue
-        print(f"\n[{workload}]  size →  Viper M/thr   HiOM M/thr   H/V ratio   Viper DRAM(MB)   HiOM DRAM(MB)   HotTier size   evictions   hit_rate")
-        print("-" * 130)
+        print(f"\n[{workload}]  M items/s per thread @ t=8  (parens = ratio vs Viper)")
+        header = "  ".join(f"{lbl:>14}" for _, lbl in present)
+        print(f"  {'size':>5}   {header}")
+        print("-" * (10 + len(present) * 16))
         for s in sizes:
-            v = w.get("ViperFixture", {}).get(s, {}).get(8, {})
-            h = w.get("HiOMFixture", {}).get(s, {}).get(8, {})
-            v_ips = v.get("ips_per_thr", 0) / 1e6
-            h_ips = h.get("ips_per_thr", 0) / 1e6
-            ratio = h_ips / v_ips if v_ips else 0
-            v_dram = v.get("fixture_dram_mb", 0)
-            h_dram = h.get("fixture_dram_mb", 0)
-            h_size = h.get("hot_size", 0)
-            h_evict = h.get("hot_evictions", 0)
-            h_hr = h.get("hot_hit_rate", None)
-            hr_str = f"{h_hr:.3f}" if h_hr else "n/a"
-            # Annotate HANG cells so the table parallels the chart.
-            v_hung = "tp" in v.get("hang_metrics", set())
-            h_hung = "tp" in h.get("hang_metrics", set())
-            v_str = "  HANG  " if v_hung else f"{v_ips:7.2f}M"
-            h_str = "  HANG  " if h_hung else f"{h_ips:7.2f}M"
-            r_str = "  n/a " if (v_hung or h_hung or not v_ips) else f"{ratio:6.3f}"
-            print(f"  {s:3d}M     {v_str}     {h_str}     {r_str}    {v_dram:10.0f}      {h_dram:10.0f}    {h_size:11.0f}    {h_evict:8.0f}    {hr_str}")
+            v_ips = w.get("ViperFixture", {}).get(s, {}).get(8, {}).get("ips_per_thr", 0) / 1e6
+            cols = []
+            for fx, _ in present:
+                cell = w.get(fx, {}).get(s, {}).get(8, {})
+                if "tp" in cell.get("hang_metrics", set()):
+                    cols.append(f"{'HANG':>14}")
+                    continue
+                ips = cell.get("ips_per_thr", 0) / 1e6
+                if fx == "ViperFixture" or not v_ips:
+                    cols.append(f"{ips:13.2f}M")
+                else:
+                    cols.append(f"{ips:7.2f}({ips / v_ips:5.2f})")
+            print(f"  {s:4d}M   " + "  ".join(cols))
 
 
 def main():

@@ -262,8 +262,8 @@ ALL_BMS(HiOMFixture);
 //ALL_BMS(PmemKVFixture);
 //ALL_BMS(UTreeFixture);
 //ALL_BMS(CrlFixture);
-//ALL_BMS(DashFixture);
-//ALL_BMS(CcehFixture);
+ALL_BMS(DashFixture);
+ALL_BMS(CcehFixture);
 
 //ALL_BMS(RocksDbFixture);
 //ALL_BMS(PmemHybridFasterFixture);

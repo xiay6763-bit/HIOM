@@ -16,6 +16,78 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
+## Status (2026-06-07)
+
+- **E2/E4 four-system main table landed (priority-5 baseline expansion)** —
+  the §7 evaluation's last open block. `ycsb_bm` now runs HiOM + Viper + Dash +
+  CCEH in one harness on stock PMDK (K8/V200, the paper's real workload);
+  Dash/CCEH were re-enabled in `ALL_BMS`
+  ([ycsb_bm.cpp:265-266](../benchmark/ycsb_bm.cpp#L265-L266)). A 10 M
+  four-system sweep (6 workloads × t=1/8/24 × 3 reps, via
+  [run_scaling_sweep.sh](../benchmark/run_scaling_sweep.sh) with new
+  env-overridable `SWEEP_{FIXTURES,SIZES,WORKLOADS,METRICS}` axes) completed
+  **12/12 cells clean, no timeouts**. Dash 10 M per-op-transaction prefill ≈90 s,
+  so cells are 2–10 min each.
+  - **Bug fixed en route**: `CcehFixture`'s YCSB GET counted a hit via
+    `entry_ptr->second == record.value`, but YCSB READ records carry no value
+    → **found=0 (all reads silently "missed")**. Fixed to match Viper/Dash
+    (`!= null_value`),
+    [cceh_fixture.hpp:269-279](../benchmark/fixtures/cceh_fixture.hpp#L269-L279).
+    Smoke then clean for all four systems.
+
+- **E2 (read, YCSB-C) @10 M** — HiOM wins the read axis vs the PM-resident camp
+  *at low/mid concurrency*; the advantage **inverts at t=24** (median, M items/s
+  per thread):
+
+  | sys   | zipf t1 | t8 | t24 | uni t1 | t8 | t24 |
+  |-------|--------:|---:|----:|-------:|---:|----:|
+  | Viper | 2.91 | 22.63 | 43.35 | 2.55 | 18.03 | 36.05 |
+  | HiOM  | 2.53 | 15.44 | 18.44 | 2.27 | 15.67 | 20.33 |
+  | Dash  | 1.73 | 13.47 | **31.21** | 1.72 | 12.16 | **22.52** |
+  | CCEH  | 1.13 | 7.61 | 22.48 | 0.89 | 6.90 | 19.60 |
+
+  At t=1/8 HiOM > Dash > CCEH (DRAM offset hit beats PM random read) — the
+  Pareto "read beats PM-resident" claim holds. **At t=24 Dash overtakes HiOM**
+  (zipf 31.2 vs 18.4; uniform 22.5 vs 20.3): HotTier's per-slot lookup
+  contention at high fan-in — same root as the get-t=24 0.62×-Viper note
+  (2026-05-16) — now shows up as losing to a PM-resident baseline, not just to
+  Viper. **Positioning consequence**: scope the read-throughput win to low/mid
+  concurrency; label t=24 HotTier contention as a limitation + future work
+  (per-slot contention, likely same family as the `mirror_into_hot` spin in the
+  capacity ablation).
+
+- **E4 (write, YCSB-A/B) @10 M** — write is a documented cost vs Viper. HiOM
+  beats Dash/CCEH on every write cell, **but with a fixture caveat** (t=8 row,
+  M items/s per thread):
+
+  | sys   | a_zipf | a_uni | b_zipf | b_uni |
+  |-------|-------:|------:|-------:|------:|
+  | Viper | 17.31 | 12.82 | 16.61 | 14.58 |
+  | HiOM  | 4.64 (0.27×) | 4.30 (0.34×) | 13.28 (0.80×) | 11.75 (0.81×) |
+  | Dash  | 1.58 | 2.04 | 7.43 | 6.72 |
+  | CCEH  | 1.64 | 1.45 | 5.04 | 4.01 |
+
+  YCSB-A (50% update): HiOM 0.27–0.34× Viper (consistent with the 0.24–0.45×
+  already documented) but ~3× Dash/CCEH. YCSB-B (5% update, read-mostly): HiOM
+  0.80–0.83× Viper at t=1/8. **Caveat — must state in the paper:** the
+  Dash/CCEH *fixtures* store every value via a per-op `pmem::obj::transaction`
+  make_persistent into a side PM pool (the index holds only an offset), so their
+  write throughput is **transaction-bound, not pure-index**. HiOM's write win
+  over Dash is therefore partly a fixture artifact. Frame E4 as "HiOM write <
+  Viper (limitation)"; do **not** claim a clean write win over Dash.
+
+- **Remaining (this line of work)**: (a) Dash/CCEH at 5/16/33 M to turn the
+  scaling charts' single-point baselines into curves (Viper/HiOM already span
+  5–33 M); (b) **E1 white-box DRAM for CCEH** — `CcehFixture::fixture_dram_bytes()`
+  is unimplemented (reports 0) and its `CCEH(1000000)` ctor over-provisions
+  ~8.6 GB RSS regardless of N (fixed cost, doesn't affect throughput, but would
+  inflate a DRAM comparison if used as-is); (c) `lat` metric for the four-system
+  set (only `tp` run so far); (d) SECONDARY Halo harness systems (CLevel/SOFT/
+  Halo). Charts: `eval/charts/scaling_*.pdf` (4-line throughput; Dash/CCEH at
+  10 M only so far).
+
+---
+
 ## Status (2026-06-05)
 
 - **Paper repositioning — narrowed from ICDE/CCF-A to a master's-thesis
@@ -1929,6 +2001,16 @@ acknowledged cost. Each axis has a baseline HiOM beats:
 | **E2** iso-DRAM reads | C2 | read tput / hit-rate vs **DRAM budget** | HiOM usable under tight budget; DRAM-index camp OOMs, PM camp slower |
 | **E3** recovery | C3 | open time vs N / tail size | O(tail) vs O(N); already 25× vs Viper, ≈736 K crossover |
 | **E4** write / scale | limitation | YCSB-A/B tput vs threads | honestly 0.24–0.65×; documented as a design cost, not hidden |
+
+**Measured (2026-06-07, 10 M, four-system K8/V200)** — full E2/E4 tables in
+Status (2026-06-07) above. Headlines: **E2 reads** — HiOM > Dash > CCEH at
+t=1/8 (DRAM-offset hit beats PM random read); Dash overtakes HiOM at t=24
+(HotTier high-fan-in lookup contention) → scope the read win to low/mid
+concurrency. **E4 writes** — HiOM 0.27–0.34× Viper on YCSB-A, 0.80–0.83× on
+YCSB-B (t=1/8), ahead of Dash/CCEH but with a fixture caveat (the Dash/CCEH
+value store is per-op transaction-bound, not pure-index — do not claim a clean
+write win over Dash). E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
+Pending: Dash/CCEH at 5/16/33 M; CLevel/SOFT/Halo via the Halo harness.
 
 ## 7.5 Related work to cite (not run)
 

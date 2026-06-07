@@ -53,10 +53,17 @@ TIMEOUT_LOG="${OUT_DIR}/.sweep_timeouts.log"
 
 # Datasets: 0.15× → 1× of HotTier capacity (33 M slots).
 # 50 M cell intentionally omitted (M4 back-pressure issue, paper future work).
-SIZES=(5 10 16 33)
-WORKLOADS=(100r_zipf 100r_uniform a_zipf a_uniform b_zipf b_uniform)
-FIXTURES=(ViperFixture HiOMFixture)
-METRICS=(tp lat)
+#
+# All four axes are env-overridable so a subset can be run without editing
+# the script. Baseline back-fill example (Dash/CCEH at 10M, throughput only):
+#   SWEEP_FIXTURES="DashFixture CcehFixture" SWEEP_SIZES=10 SWEEP_METRICS=tp ./run_scaling_sweep.sh
+# Default fixtures are now all four §7 systems; the skip-if-exists gate below
+# means a bare re-run only fills the missing (Dash/CCEH) cells, not the
+# Viper/HiOM cells already on disk.
+IFS=' ' read -ra SIZES     <<< "${SWEEP_SIZES:-5 10 16 33}"
+IFS=' ' read -ra WORKLOADS <<< "${SWEEP_WORKLOADS:-100r_zipf 100r_uniform a_zipf a_uniform b_zipf b_uniform}"
+IFS=' ' read -ra FIXTURES  <<< "${SWEEP_FIXTURES:-ViperFixture HiOMFixture DashFixture CcehFixture}"
+IFS=' ' read -ra METRICS   <<< "${SWEEP_METRICS:-tp lat}"
 FILTER_THREADS_TP='threads:(1|8|24)$'
 FILTER_THREADS_LAT='threads:8$'   # latency cells only at t=8 by default
 
