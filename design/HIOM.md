@@ -76,15 +76,21 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   over Dash is therefore partly a fixture artifact. Frame E4 as "HiOM write <
   Viper (limitation)"; do **not** claim a clean write win over Dash.
 
-- **Remaining (this line of work)**: (a) Dash/CCEH at 5/16/33 M to turn the
-  scaling charts' single-point baselines into curves (Viper/HiOM already span
-  5–33 M); (b) **E1 white-box DRAM for CCEH** — `CcehFixture::fixture_dram_bytes()`
-  is unimplemented (reports 0) and its `CCEH(1000000)` ctor over-provisions
-  ~8.6 GB RSS regardless of N (fixed cost, doesn't affect throughput, but would
-  inflate a DRAM comparison if used as-is); (c) `lat` metric for the four-system
-  set (only `tp` run so far); (d) SECONDARY Halo harness systems (CLevel/SOFT/
-  Halo). Charts: `eval/charts/scaling_*.pdf` (4-line throughput; Dash/CCEH at
-  10 M only so far).
+- **Scoped out (2026-06-07 decision — not a gap)**: Dash/CCEH at 5/16/33 M was
+  considered and *deliberately dropped*. vs-N's information value sits on the
+  DRAM axis (E1 white-box, done) and the graceful-degradation story (Viper/HiOM
+  already span 5–33 M); read/write throughput is near-flat in N (Viper/HiOM only
+  gently decline 5→33 M), so PM-resident baselines at a single representative
+  10 M point suffice as the read-throughput *control*. A full four-line vs-N
+  curve would only restate "all four decline gently" — no Pareto consequence.
+  Charts thus show Viper/HiOM as 5–33 M curves and Dash/CCEH as a 10 M reference
+  point (`eval/charts/scaling_*.pdf`).
+- **Genuinely remaining (this line of work)**: (a) **E1 white-box DRAM for CCEH**
+  — `CcehFixture::fixture_dram_bytes()` is unimplemented (reports 0) and its
+  `CCEH(1000000)` ctor over-provisions ~8.6 GB RSS regardless of N (fixed cost,
+  doesn't affect throughput, but would inflate a DRAM comparison if used as-is);
+  (b) `lat` metric for the four-system set (only `tp` run so far); (c) SECONDARY
+  Halo harness systems (CLevel/SOFT/Halo).
 
 ---
 
@@ -2010,7 +2016,10 @@ concurrency. **E4 writes** — HiOM 0.27–0.34× Viper on YCSB-A, 0.80–0.83×
 YCSB-B (t=1/8), ahead of Dash/CCEH but with a fixture caveat (the Dash/CCEH
 value store is per-op transaction-bound, not pure-index — do not claim a clean
 write win over Dash). E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
-Pending: Dash/CCEH at 5/16/33 M; CLevel/SOFT/Halo via the Halo harness.
+Pending: CLevel/SOFT/Halo via the Halo harness; four-system `lat`. Dash/CCEH
+vs-N scaling deliberately scoped out (vs-N value is on the DRAM axis, covered by
+E1; throughput is near-flat in N — a single 10 M point suffices as the
+PM-resident read control).
 
 ## 7.5 Related work to cite (not run)
 
