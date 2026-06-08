@@ -55,6 +55,17 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     confirmed in latency (≈ Viper, ≪ Dash/CCEH, gap widening under writes),
     write a documented cost (t=24 tail inflation). No new short-coming surfaced.
 
+- **Chart set cleaned (2026-06-08)**: retired the superseded Phase-2 vs-N
+  figures — deleted `eval/charts/{scaling,latency}_*.pdf` (12) and removed their
+  plotting code from [scaling_plot.py](../eval/scaling_plot.py) (so they won't
+  regenerate); it now emits only the unique survivor `hot_scaling.pdf` (HiOM
+  HotTier occupancy / evictions / hit-rate vs N — the C2 working-set graceful
+  degradation: at 33 M ≈ capacity, SIEVE evictions engage yet hit-rate holds
+  0.973 zipf / 0.978 uniform). Final chart set: footprint · hot_capacity_* ·
+  hot_scaling · recovery_* · thread_scaling_*{,_lat}. (Baseline run set also
+  frozen to Viper + Dash + CCEH this session — CLevel/SOFT/Level/SEPH/Halo
+  cite-only, committed 17ffc93.)
+
 ---
 
 ## Status (2026-06-07)
@@ -260,8 +271,11 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   gently decline 5→33 M), so PM-resident baselines at a single representative
   10 M point suffice as the read-throughput *control*. A full four-line vs-N
   curve would only restate "all four decline gently" — no Pareto consequence.
-  Charts thus show Viper/HiOM as 5–33 M curves and Dash/CCEH as a 10 M reference
-  point (`eval/charts/scaling_*.pdf`).
+  The vs-N throughput / DRAM / latency figures were therefore **retired
+  (2026-06-08, see Status 2026-06-08)** — throughput → `thread_scaling_*.pdf`,
+  DRAM → `footprint.pdf` + the §Phase-2 table, latency → `thread_scaling_*_lat.pdf`;
+  the sole surviving vs-N artifact is HiOM's HotTier diagnostic
+  (`eval/charts/hot_scaling.pdf`).
 - **E1 white-box DRAM for CCEH — DONE (2026-06-07)**: `CcehFixture` now
   implements `fixture_dram_bytes()` (returns `dram_map_->dram_bytes()`) and the
   ctor capacity was corrected `1000000 → 131072`. The arg is `initCap` with
@@ -611,7 +625,8 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   fixture) combination, t=1/8/24 sweep, 3 reps each. Driver:
   [run_scaling_sweep.sh](../benchmark/run_scaling_sweep.sh).
   Plotter: [eval/scaling_plot.py](../eval/scaling_plot.py) →
-  `eval/charts/scaling_<workload>.pdf`.
+  `eval/charts/scaling_<workload>.pdf` *(figure retired 2026-06-08; see Status
+  2026-06-08 — scaling_plot.py now emits only `hot_scaling.pdf`)*.
 
   **Results at t=8, median of 3 reps** (`H/V` is HiOM/Viper throughput
   ratio per thread; eviction counts are *during* the timed-read phase
