@@ -295,10 +295,13 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   against ~2 GB of data; the Viper paper's 1:9 is at 100 M. HiOM's hot tier is
   likewise pre-allocated, so the comparison stays apples-to-apples.)
 
-- **Genuinely remaining (this line of work)**: SECONDARY Halo harness systems
-  (CLevel/SOFT/Halo). [(a) four-system `lat` metric — **DONE 2026-06-08**, see
-  the Status (2026-06-08) block at top: read latency ≈ Viper / ≪ Dash-CCEH,
-  write t=24 tail inflation mirrors YCSB-A.]
+- **Genuinely remaining (this line of work)**: nothing blocking. **Baselines
+  frozen (2026-06-08, thesis scope)**: run set = **Viper + Dash + CCEH (+ HiOM)**;
+  **Halo optional** (the one DRAM+recovery opponent worth a time-boxed build —
+  cite-acceptable otherwise). [(a) four-system `lat` metric — **DONE 2026-06-08**,
+  see the Status (2026-06-08) block at top: read latency ≈ Viper / ≪ Dash-CCEH,
+  write t=24 tail inflation mirrors YCSB-A. (b) secondary Halo-harness systems —
+  **resolved: Halo optional, others dropped**, see §7.2 / §7.4.]
 
 ---
 
@@ -2154,8 +2157,7 @@ open-source, Optane-runnable PM hash indexes. §3–§6 design detail still TODO
   Dash, CLevel, SOFT, CLHT, PCLHT — and Viper** (`#ifdef VIPERT`), each picked by
   a `-DXXXT` define. So we adopt this one harness instead of porting six repos,
   getting the whole §7.2 set (minus Plush) behind a single driver + shared
-  workload generator. (Level hashing is via the Dash repo; CLevel covers the
-  level-hashing camp.)
+  workload generator.
 - **HiOM wrapper = one `#ifdef HIOMT` block** in `hash_api.h`, cloned from the
   existing `VIPERT` block (HiOM wraps Viper + owns the index, same `Client`
   API); add a Makefile target; repoint the hardcoded `/mnt/pmem/hash/` pool to
@@ -2184,7 +2186,6 @@ all have public repos, most have PiBench bindings):
 | system | venue | index | DRAM | camp |
 |--------|-------|-------|------|------|
 | **CCEH** | FAST'19 | DRAM *or* PM (configurable) | high / ~0 | both |
-| **Level / Clevel** | OSDI'18 / ATC'20 | PM | ~0 | PM-resident |
 | **Dash** | VLDB'20 | PM | ~0 | PM-resident |
 | **Viper** | VLDB'21 | DRAM (CCEH) | ~2 GB | DRAM-index (primary) |
 | **Halo** | SIGMOD'22 | DRAM | high | DRAM-index, fast recovery |
@@ -2200,14 +2201,25 @@ ICCD'21, PMEH'23) have **no available source**. Open, reproducible code
 clusters in top venues (artifact-evaluation culture), so chasing an obscure
 weak baseline is a *red flag*, not an advantage.
 
+**Run vs cite (thesis scope, 2026-06-08).** *Run* set = **Viper + Dash + CCEH
+(+ HiOM)** (primary `ycsb_bm` / `all_ops_bm`, E1–E4 + latency @10 M) — sufficient
+and balanced; each Pareto axis already has a clear baseline HiOM beats
+(Viper/CCEH = DRAM-index ⇒ DRAM; Dash = strongest PM-resident hash, VLDB'20 ⇒
+read tput/latency; Viper = O(N) ⇒ recovery). **Halo** is the one optional add
+(modern DRAM-index + fast-recovery — contests HiOM's DRAM *and* recovery axes
+head-on), run only if a time-boxed build succeeds; cite-acceptable otherwise. A
+second PM-resident *read* point, if ever wanted (the camp claim currently rests
+on Dash alone, since `CcehFixture` is DRAM-mode), is cheapest as **CCEH in
+PM-mode** (same code, configurable), not a new system.
+
 ## 7.3 Positioning: a three-axis Pareto point
 
 HiOM is **not** a uniform winner; it is Pareto-non-dominated on
 {index-DRAM, read throughput, recovery}, with write/scalability as an
 acknowledged cost. Each axis has a baseline HiOM beats:
 
-- **Read throughput** → beats PM-resident designs (Dash, Plush, Level/Clevel,
-  PM-mode CCEH): they pay PM random-read latency per lookup; HiOM's hot offset
+- **Read throughput** → beats PM-resident designs (Dash, Plush, PM-mode CCEH):
+  they pay PM random-read latency per lookup; HiOM's hot offset
   lives in DRAM.
 - **Index DRAM** → beats the DRAM-index camp (Viper, Halo, DRAM-mode CCEH:
   ~2 GB vs HiOM's flat 272 MB).
@@ -2236,7 +2248,9 @@ per-Client shards and now **RETRACTED**. **E4 writes** — **YCSB-B (read-mostly
 ~5× Dash/CCEH but with a fixture caveat (the Dash/CCEH value store is per-op
 transaction-bound, not pure-index — do not claim a clean write win over Dash).
 E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
-Pending: CLevel/SOFT/Halo via the Halo harness. (Four-system `lat` — DONE
+Scoped (2026-06-08, thesis): baseline set frozen to **Viper + Dash + CCEH
+(+ HiOM)**; **Halo optional** (the one DRAM+recovery opponent worth a time-boxed
+build, cite-acceptable otherwise). (Four-system `lat` — DONE
 2026-06-08, see Status (2026-06-08): read latency ≈ Viper / ≪ Dash-CCEH,
 write t=24 tail inflation mirrors YCSB-A.) Dash/CCEH
 vs-N scaling deliberately scoped out (vs-N value is on the DRAM axis, covered by
