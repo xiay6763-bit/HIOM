@@ -16,6 +16,47 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
+## Status (2026-06-08)
+
+- **Four-system read/write LATENCY measured (E2/E4 latency axis) — closes
+  "Genuinely remaining (a)".** Dense t=1..24, 100r + YCSB-A/B, K8/V200 @10 M,
+  3-rep median HDR percentiles, via a new `TS_METRICS=lat` axis in
+  [run_thread_scaling.sh](../benchmark/run_thread_scaling.sh) (default `tp`
+  byte-unchanged) + a latency branch in
+  [thread_scaling_plot.py](../eval/thread_scaling_plot.py) (p99 solid + p50
+  dashed, log-y). Figures: eval/charts/thread_scaling_{100r,ycsb_a,ycsb_b}_lat.pdf.
+  NB lat-mode tput is lower (per-op HDR cost) — latency is read from `_lat`
+  runs, throughput from `_tp`, never mixed.
+  - **Read latency = the throughput win's mirror (strengthens C2).** HiOM read
+    **p50 ≈ Viper across every workload and thread count (~0.72–0.97 µs)**, both
+    far below the PM-resident camp. The gap vs PM-resident *widens* under write
+    load: Dash/CCEH store each value via a per-op PMDK transaction that blocks
+    reads, so their read **p99 explodes** — 100r ~1.5–2.8 µs, YCSB-B (5 % wr)
+    3.8–7.9 µs, YCSB-A (50 % wr) **49–298 µs** at t=24 — while HiOM read p99
+    stays **~1.3–3.2 µs** throughout. ⚠ That Dash/CCEH read-tail blow-up is
+    amplified by the SAME fixture artifact as the E4 write caveat (per-op txn
+    value store), so frame as "HiOM read latency ≪ PM-resident, partly
+    fixture-amplified under writes," not a clean pure-index claim.
+  - **vs Viper, the only read penalty is the single-thread 100r tail**: p99
+    +~48 % (1.74 vs 1.18 µs), deep p9999 ~4× (14 vs 3.5 µs). Cause is the
+    constant **~0.04 % HotTier→ColdTier miss** (hit 0.9996) landing past p99.96
+    — workload-independent (zipf ≈ uniform, because the 2²¹-bucket HotTier
+    covers the whole 10 M set in both). At **t ≥ 8 the read tail is
+    parity-or-better** (shared PM queueing dominates; e.g. b_zipf t8 HiOM 1374
+    < Viper 1546 ns). p50 is identical everywhere.
+  - **Write/update latency mirrors the YCSB-A throughput cost (documented
+    limitation, now also in latency).** HiOM update p50/p99 ≈ Viper at t ≤ 8
+    (the in-place fixed-size skip-commit, d613cf9), but **inflates at t=24
+    write-heavy** — a_zipf t24 HiOM **2139/6172 ns vs Viper 830/2891** (~2× p99)
+    — the ColdTier durability-mirror cost under high write fan-in. YCSB-B
+    (5 % wr) write latency ≈ Viper throughout. Consistent with E4 (YCSB-A
+    0.46–0.74× tput).
+  - **Net: latency corroborates the three-axis positioning** — read-axis win
+    confirmed in latency (≈ Viper, ≪ Dash/CCEH, gap widening under writes),
+    write a documented cost (t=24 tail inflation). No new short-coming surfaced.
+
+---
+
 ## Status (2026-06-07)
 
 - **Read-scaling wall ROOT-CAUSED and FIXED — supersedes the "t=24 HotTier
@@ -254,9 +295,10 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   against ~2 GB of data; the Viper paper's 1:9 is at 100 M. HiOM's hot tier is
   likewise pre-allocated, so the comparison stays apples-to-apples.)
 
-- **Genuinely remaining (this line of work)**: (a) `lat` metric for the
-  four-system set (only `tp` run so far); (b) SECONDARY Halo harness systems
-  (CLevel/SOFT/Halo).
+- **Genuinely remaining (this line of work)**: SECONDARY Halo harness systems
+  (CLevel/SOFT/Halo). [(a) four-system `lat` metric — **DONE 2026-06-08**, see
+  the Status (2026-06-08) block at top: read latency ≈ Viper / ≪ Dash-CCEH,
+  write t=24 tail inflation mirrors YCSB-A.]
 
 ---
 
@@ -2194,7 +2236,9 @@ per-Client shards and now **RETRACTED**. **E4 writes** — **YCSB-B (read-mostly
 ~5× Dash/CCEH but with a fixture caveat (the Dash/CCEH value store is per-op
 transaction-bound, not pure-index — do not claim a clean write win over Dash).
 E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
-Pending: CLevel/SOFT/Halo via the Halo harness; four-system `lat`. Dash/CCEH
+Pending: CLevel/SOFT/Halo via the Halo harness. (Four-system `lat` — DONE
+2026-06-08, see Status (2026-06-08): read latency ≈ Viper / ≪ Dash-CCEH,
+write t=24 tail inflation mirrors YCSB-A.) Dash/CCEH
 vs-N scaling deliberately scoped out (vs-N value is on the DRAM axis, covered by
 E1; throughput is near-flat in N — a single 10 M point suffices as the
 PM-resident read control).
