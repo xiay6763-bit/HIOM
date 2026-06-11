@@ -16,6 +16,89 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
+## Status (2026-06-11)
+
+- **§4 Invariants and Correctness — WRITTEN.** The system + experiments were done but
+  the *written correctness argument* — the intellectual core of C3 — did not
+  exist; the doc only had a one-line `§4 Six Invariants (TODO)` bullet. Now
+  drafted as a full section (below §3-TODO block, before §7), extracted from
+  the **shipped, frozen code** (not invented): the six load-bearing invariants
+  I1–I6, each with its enforcing code site, plus maintenance proofs by case
+  analysis on insert / update / delete / evict / flush and on crash-recovery.
+  - **Foundational finding that anchors the whole section**: PM is the single
+    ground truth — specifically the VPage **`free_slots` occupancy bit +
+    `version_lock`**, not any index tier. Every HiOM read
+    ([`hiom_read_at_offset`](../include/viper/viper.hpp#L1902-L1920)) and every
+    flush winner-pick key-read
+    ([`hiom_get_slot_key`](../include/viper/viper.hpp#L588-L595)) gates on
+    `free_slots[slot]==false` *before* touching data, so HotTier / ColdTier /
+    commit-buffer are **hints that are always PM-verified**. This is why a
+    removed-or-superseded key is immediately invisible even while a stale
+    ColdTier offset still points at its (now-freed) slot — the read
+    self-invalidates. (Confirmed read-after-remove correctness in the commit
+    window; matches `hiom_integration_test` Phase-D + the "read-after-remove
+    returns false" assertion.)
+  - **Honest boundaries written into §4.4**, not hidden: I3 back-pressure is
+    safety-but-not-liveness under skewed writes at HotTier capacity
+    (`a_zipf-33M`); the Option-L VPage slot leak is a *space* leak, not an I-
+    violation; the offset codec's single-region 48 GiB encodable range; and
+    variable-size recovery is out of scope (Viper itself throws "not
+    implemented").
+- **§5 Group Commit + Checkpoint A/B and §6 State Machine — ALSO WRITTEN (same
+  session).** §5: commit buffer + rising-edge flusher wake + multi-flusher
+  drain, A/B `valid_pointer` flip + torn-write safety, cadence +
+  multi-writer-aware frontier, O(tail) recovery protocol. §6: the
+  `UNPINNED → PINNED → IN_FLUSH → UNPINNED` lifecycle, lock-free per-slot CAS,
+  SIEVE-eviction coupling, update/delete semantics — and it **corrects a stale
+  doc claim**: §2.9 / §A.5 said delete marks a "DRAM hot-tier TOMBSTONE", but
+  the shipped code clears the HotTier slot to empty; the tombstone is
+  ColdTier-side (`kTombstoneOffset`). With §4 + §5 + §6 done, **3 of the 4
+  `§3–§6` paper-prose gaps are closed.**
+- **§3 Cold Tier — ALSO WRITTEN; all four `§3–§6` paper-prose gaps now closed.**
+  §3 covers the on-PM layout (32 regions / 128 B chained buckets / overflow
+  pool), per-op persistence rules (entry-before-occupancy-bit), the
+  linear-hashing growth model with its honest shipped status (split worker
+  deferred to Phase B-2 — fixed-capacity + overflow chains, pre-sized for eval),
+  a design-alternatives table (vs CCEH-reuse / open-probing / cuckoo / flat /
+  B-tree), and region-parallel load. The obsolete "§3–§6 (TODO)" roadmap block
+  was replaced by the real §3, so the design block §1–§6 is now continuous.
+  **Remaining work is evaluation-validity / baselines (priorities #3–#5: run
+  Halo + PM-mode CCEH; C1 OOM/iso-DRAM growth figure + SIEVE-vs-LRU ablation;
+  livelock). Priority #2 (de-artifact Dash/CCEH fixture) is DONE — next bullet.**
+- **Priority #2 — Dash/CCEH value-store artifact ELIMINATED (unified PM value
+  slab).** The biggest eval-credibility threat, now closed. The Dash/CCEH
+  fixtures used to persist every 200 B value via a per-op
+  `pmem::obj::transaction::run` + `make_persistent<Entry>` (PMDK undo log +
+  allocator lock + commit fences), while Viper/HiOM append the value into a
+  pre-allocated VPage slot with a plain `clwb+sfence`. That asymmetry was a
+  *value-store* cost masquerading as an *index* result — it inflated HiOM's write
+  lead and blew up Dash/CCEH read tails under write load. Fix: a shared
+  `PmemValueSlab<Entry>`
+  ([pmem_value_slab.hpp](../benchmark/fixtures/pmem_value_slab.hpp)) — a
+  pre-mmap'd FS-DAX region, bump-allocated, written once with the SAME
+  `viper::internal::pmem_persist` Viper uses; the index stores the slot
+  index/pointer. Deletes leave the slot (Viper doesn't reclaim on delete either);
+  updates are in-place + 8 B persist. Now the only thing E2/E4 measure that
+  differs across the four systems is the index itself.
+  - **Full dense re-sweep (2026-06-11): Dash + CCEH, 6 workloads × t=1..24 ×
+    {tp,lat} × 3 reps = 24 cells, zero failures/timeouts.** Viper/HiOM reused
+    (unchanged — always VPage). Tables E2/E4 + the latency block below were
+    rewritten with the clean numbers; every "~5× Dash", "~2.5× Dash/CCEH", "p99
+    explodes to 49–298 µs", and every "fixture-artifact / partly-fixture-amplified"
+    hedge is **deleted**.
+  - **Headline — the expected positioning reversal, and it strengthens the
+    paper's honesty.** (1) **Reads unchanged-to-better**: Dash read ≈ same; CCEH
+    read *rose* (the contiguous slab beats scattered `make_persistent` objects —
+    100r zipf t24 23.8→31.8, uniform 19.9→27.5); HiOM still leads the read axis by
+    ~1.5× (zipf t24 46.8 vs ~31). (2) **Write-heavy YCSB-A: Dash/CCEH now OVERTAKE
+    HiOM** (a_zipf t24 HiOM 11.7 vs Dash 24.9 / CCEH 30.0 / Viper 25.5 — HiOM
+    0.39–0.47× of the other three). This is the real three-axis trade-off stated
+    cleanly: HiOM trades write throughput for the DRAM + read + recovery wins. The
+    indefensible "beats Dash on writes too" reading is gone — the eval is now
+    defensible against a reviewer who knows Dash's own paper. Pre-slab Dash/CCEH
+    (transaction-bound) for the record: a_zipf t24 Dash 2.3 / CCEH 2.1 — ~10×
+    slower than the slab numbers, which is the size of the artifact.
+
 ## Status (2026-06-08)
 
 - **Four-system read/write LATENCY measured (E2/E4 latency axis) — closes
@@ -27,16 +110,24 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   dashed, log-y). Figures: eval/charts/thread_scaling_{100r,ycsb_a,ycsb_b}_lat.pdf.
   NB lat-mode tput is lower (per-op HDR cost) — latency is read from `_lat`
   runs, throughput from `_tp`, never mixed.
-  - **Read latency = the throughput win's mirror (strengthens C2).** HiOM read
-    **p50 ≈ Viper across every workload and thread count (~0.72–0.97 µs)**, both
-    far below the PM-resident camp. The gap vs PM-resident *widens* under write
-    load: Dash/CCEH store each value via a per-op PMDK transaction that blocks
-    reads, so their read **p99 explodes** — 100r ~1.5–2.8 µs, YCSB-B (5 % wr)
-    3.8–7.9 µs, YCSB-A (50 % wr) **49–298 µs** at t=24 — while HiOM read p99
-    stays **~1.3–3.2 µs** throughout. ⚠ That Dash/CCEH read-tail blow-up is
-    amplified by the SAME fixture artifact as the E4 write caveat (per-op txn
-    value store), so frame as "HiOM read latency ≪ PM-resident, partly
-    fixture-amplified under writes," not a clean pure-index claim.
+  - **Read latency mirrors index residency (strengthens C2).** HiOM read
+    **p50 ≈ Viper across every workload and thread count (~0.72–1.13 µs)**. The
+    DRAM-indexed systems cluster: HiOM ≈ Viper ≈ **CCEH** (DRAM directory) all sit
+    ~0.77–1.13 µs p50 / ~1.5–3.3 µs p99 at t=24, with CCEH often the *lowest*
+    (a_zipf 769/2096, a_uniform 920/2048 ns). **Dash is the lone outlier** — its
+    index is PM-resident, so every lookup pays a PM random read: p50 ~1.3–1.5 µs,
+    p99 ~2.6–4.4 µs throughout. So the read-latency win is specifically **over
+    PM-resident indexes (Dash), not over the DRAM-index camp** — exactly C2's
+    thesis (HiOM keeps DRAM-index *latency* at a fraction of the DRAM-index
+    *footprint*). ⚠ **Correction (2026-06-11, slab):** the earlier reading —
+    "Dash/CCEH read p99 explodes to 49–298 µs under YCSB-A" — was **entirely the
+    per-op PMDK-transaction fixture artifact**. With the unified value slab, all
+    four systems' read p99 ≤ ~4.4 µs even at 50 % writes (a_zipf t24: HiOM 3098,
+    Dash 3818, CCEH 2096, Viper 3216 ns). The "explosion" and the
+    "fixture-amplified" hedge are **retracted**. Dash/CCEH latency was re-measured
+    under the slab; Viper/HiOM unchanged (always VPage). (NB: Dash/CCEH record one
+    mixed HDR, no per-op read/write split — so on YCSB-A their "read" tail is the
+    50/50 mix, a mild over-statement; Viper/HiOM report pure-read percentiles.)
   - **vs Viper, the only read penalty is the single-thread 100r tail**: p99
     +~48 % (1.74 vs 1.18 µs), deep p9999 ~4× (14 vs 3.5 µs). Cause is the
     constant **~0.04 % HotTier→ColdTier miss** (hit 0.9996) landing past p99.96
@@ -52,8 +143,11 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     (5 % wr) write latency ≈ Viper throughout. Consistent with E4 (YCSB-A
     0.46–0.74× tput).
   - **Net: latency corroborates the three-axis positioning** — read-axis win
-    confirmed in latency (≈ Viper, ≪ Dash/CCEH, gap widening under writes),
-    write a documented cost (t=24 tail inflation). No new short-coming surfaced.
+    confirmed in latency (HiOM ≈ Viper ≈ CCEH, all DRAM-indexed; ≪ Dash, the lone
+    PM-resident index). Write is a documented cost: at t=24 write-heavy HiOM's
+    update tail inflates (a_zipf 2139/6172 ns) and — once the artifact is gone —
+    Dash/CCEH actually beat it on the write tail too (CCEH a_zipf 769/2096 ns),
+    mirroring the YCSB-A throughput reversal. No new short-coming surfaced.
 
 - **Chart set cleaned (2026-06-08)**: retired the superseded Phase-2 vs-N
   figures — deleted `eval/charts/{scaling,latency}_*.pdf` (12) and removed their
@@ -194,26 +288,30 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
     [cceh_fixture.hpp:269-279](../benchmark/fixtures/cceh_fixture.hpp#L269-L279).
     Smoke then clean for all four systems.
 
-- **E2 (read, YCSB-C / 100r) @10 M — RE-MEASURED post-shard-fix (2026-06-07);
-  HiOM now wins the read axis at ALL concurrencies.** Aggregate Mops/s (median,
-  t=1/8/24), from results/thread_scaling/ via `thread_scaling_plot.py`
-  (→ eval/charts/thread_scaling_100r.pdf). HiOM rows are post-shard;
-  Viper/Dash/CCEH are unchanged by the fix (re-confirmed within run-to-run
-  variance):
+- **E2 (read, YCSB-C / 100r) @10 M — HiOM wins the read axis at ALL
+  concurrencies.** Aggregate Mops/s (median, t=1/8/24), from
+  results/thread_scaling/ via `thread_scaling_plot.py`
+  (→ eval/charts/thread_scaling_100r.pdf). HiOM rows are post-shard-fix
+  (2026-06-07); **Dash/CCEH re-measured 2026-06-11 under the unified PM value
+  slab** (no per-op PMDK transaction — same value-store discipline as Viper's
+  VPage; see Status 2026-06-11); Viper/HiOM unchanged (always VPage):
 
   | sys   | zipf t1 | t8 | t24 | uni t1 | t8 | t24 |
   |-------|--------:|---:|----:|-------:|---:|----:|
   | Viper | 2.6 | 22.6 | 43.2 | 2.6 | 18.1 | 35.9 |
   | HiOM  | 2.9 | 21.0 | **46.8** | 2.3 | 18.4 | **35.5** |
-  | Dash  | 1.6 | 13.4 | 31.3 | 1.7 | 12.0 | 22.5 |
-  | CCEH  | 1.2 | 8.2 | 23.8 | 0.9 | 7.1 | 19.9 |
+  | Dash  | 1.5 | 12.4 | 31.4 | 1.7 | 11.9 | 22.8 |
+  | CCEH  | 1.6 | 11.9 | 31.8 | 1.5 | 10.0 | 27.5 |
 
-  HiOM > Dash > CCEH at every thread count, and HiOM **matches/exceeds Viper at
-  t=24** (zipf 46.8 vs 43.2; uniform 35.5 vs 35.9 — within noise; HiOM edges out
-  on zipf because its verify reads key+value in one `hiom_read_at_offset`, vs
-  Viper's separate key-check + value read). **The read-axis Pareto win holds at
-  all concurrency — the earlier "inverts at t=24 / scope to low-mid concurrency"
-  limitation is RETRACTED.** Pre-shard HiOM was flat 15→17→17.6 from t=8 (shown
+  **HiOM ≈ Viper ≫ CCEH ≈ Dash at every thread count**, and HiOM
+  **matches/exceeds Viper at t=24** (zipf 46.8 vs 43.2; uniform 35.5 vs 35.9 —
+  within noise; HiOM edges out on zipf because its verify reads key+value in one
+  `hiom_read_at_offset`, vs Viper's separate key-check + value read). Post-slab,
+  CCEH reads *rose* (zipf t24 23.8→31.8, uniform 19.9→27.5 — the contiguous slab
+  has better locality than the old scattered `make_persistent` objects) and now
+  sit level with Dash; HiOM still leads both by ~1.5× at t24. **The read-axis
+  Pareto win holds at all concurrency — the earlier "inverts at t=24 / scope to
+  low-mid concurrency" limitation is RETRACTED.** Pre-shard HiOM was flat 15→17→17.6 from t=8 (shown
   for the record below); that wall was the single contended
   `stats_.hot_hits.fetch_add`, NOT "HotTier per-slot lookup contention" as first
   guessed — fixed via per-Client stat shards (see top bullet). hot_hit_rate
@@ -223,10 +321,11 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   > uniform = 16.1/18.8/19.9 — the flat wall this fix removed. Raw kept at
   > results/thread_scaling/HiOMFixture_100r_*_10M_tp.json.preshard.
 
-- **E4 (write, YCSB-A/B) @10 M — RE-MEASURED post-fix (2026-06-07; update
-  in-place skip-commit + rising-edge flusher wake + read-path shards).** Full
-  4-system thread curves (1/2/4/8/16/24, same format as the 100r read figure)
-  at eval/charts/thread_scaling_ycsb_{a,b}.pdf. Aggregate Mops/s (median):
+- **E4 (write, YCSB-A/B) @10 M — HiOM update path post-fix (2026-06-07; update
+  in-place skip-commit + rising-edge flusher wake + read-path shards); Dash/CCEH
+  re-measured 2026-06-11 under the unified PM value slab.** Full 4-system thread
+  curves (1/2/4/8/16/24, same format as the 100r read figure) at
+  eval/charts/thread_scaling_ycsb_{a,b}.pdf. Aggregate Mops/s (median):
 
   **YCSB-B (read-mostly, 95 % read / 5 % update):**
 
@@ -234,8 +333,8 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   |-------|--------:|---:|----:|-------:|---:|----:|
   | Viper | 2.8 | 18.0 | 45.1 | 2.3 | 17.3 | 32.9 |
   | HiOM  | 2.8 | **19.0** | 42.8 | 2.5 | 16.0 | 30.3 |
-  | Dash  | 1.3 | 8.9 | 16.7 | 1.1 | 7.6 | 16.2 |
-  | CCEH  | 0.9 | 6.8 | 17.0 | 0.7 | 5.3 | 13.8 |
+  | Dash  | 1.6 | 11.5 | 29.7 | 1.6 | 10.2 | 21.7 |
+  | CCEH  | 1.4 | 11.9 | 32.1 | 1.1 | 8.7 | 25.0 |
 
   **YCSB-A (write-heavy, 50 % read / 50 % update):**
 
@@ -243,26 +342,30 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   |-------|--------:|---:|----:|-------:|---:|----:|
   | Viper | 2.9 | 17.5 | 25.5 | 2.6 | 14.3 | 19.1 |
   | HiOM  | 2.5 | 10.3 | 11.7 | 2.0 | 10.1 | 14.1 |
-  | Dash  | 0.4 | 2.5 | 2.3 | 0.3 | 2.0 | 2.6 |
-  | CCEH  | 0.3 | 2.0 | 2.1 | 0.3 | 1.9 | 2.4 |
+  | Dash  | 1.5 | 11.0 | 24.9 | 1.3 | 9.7 | 19.1 |
+  | CCEH  | 1.4 | 11.6 | 30.0 | 1.1 | 9.6 | 24.5 |
 
   **YCSB-B (read-mostly): HiOM 0.92–1.05× Viper** — parity, and it even *edges*
-  Viper at zipf t8 (19.0 vs 18.0); **~2.5× Dash/CCEH** at t24. Read-mostly is
-  HiOM's comfort zone: the 5 % updates are nearly free now that the read half
-  rides the per-Client shards and the update half skips the redundant commit
-  push. **YCSB-A (write-heavy): HiOM 0.46× (zipf t24) – 0.74× (uniform t24)
-  Viper** — the documented write cost (ColdTier durability mirror on the 50 %
-  puts), but **up from the old 0.27–0.34× at t8** thanks to the update-opt +
-  wake fix, and still ~5× Dash/CCEH. (zipf is the harder case: θ=0.99 piles the
-  50 % writes onto a few hot keys → HotTier-slot + ColdTier-region contention;
-  uniform spreads them, so a_uniform holds 0.74×.) **Caveat — state in the
-  paper:** the Dash/CCEH *fixtures* persist every value via a per-op
-  `pmem::obj::transaction` make_persistent into a side PM pool, so their write
-  throughput is transaction-bound, not pure-index — HiOM's write lead over Dash
-  is partly a fixture artifact. Frame E4 as "HiOM write < Viper (a documented
-  design cost), read-mostly ≈ Viper"; do **not** claim a clean write win over
-  Dash. Pre-fix t=8 snapshot kept for reference: a_zipf 4.64 (0.27×), a_uni 4.30
-  (0.34×), b_zipf 13.28 (0.80×), b_uni 11.75 (0.81×).
+  Viper at zipf t8 (19.0 vs 18.0); **~1.2–1.4× Dash/CCEH** at t24 (zipf 42.8 vs
+  Dash 29.7 / CCEH 32.1). Read-mostly is HiOM's comfort zone: the 5 % updates
+  are nearly free now that the read half rides the per-Client shards and the
+  update half skips the redundant commit push. **YCSB-A (write-heavy): HiOM
+  0.46× (zipf t24) – 0.74× (uniform t24) Viper** — the documented write cost
+  (ColdTier durability mirror on the 50 % puts), up from the old 0.27–0.34× at
+  t8 thanks to the update-opt + wake fix. **With the value-store artifact removed
+  (2026-06-11 slab), Dash and CCEH now *overtake* HiOM on write-heavy:** a_zipf
+  t24 HiOM 11.7 vs Dash 24.9, CCEH 30.0, Viper 25.5 — HiOM is **0.39–0.47×** of
+  the other three. This is the honest face of the three-axis trade-off: HiOM
+  spends write throughput to buy the DRAM + read + recovery wins; on a
+  write-heavy mix the PM-resident hash indexes (one in-place PM write per op, no
+  durability mirror) win. The old "~5× Dash/CCEH" reading was **entirely the
+  per-op-transaction fixture artifact and is retracted**; E4 is now framed as
+  "HiOM write < Viper *and* < Dash/CCEH — a documented design cost," with **no
+  fixture caveat**. (zipf is the harder case: θ=0.99 piles the 50 % writes onto a
+  few hot keys → HotTier-slot + ColdTier-region contention; uniform spreads them,
+  so a_uniform holds 0.74× Viper.) Pre-slab Dash/CCEH (transaction-bound) for the
+  record: a_zipf t24 Dash 2.3 / CCEH 2.1 — ~10× slower than the slab numbers,
+  which is the magnitude of the artifact.
 
 - **Scoped out (2026-06-07 decision — not a gap)**: Dash/CCEH at 5/16/33 M was
   considered and *deliberately dropped*. vs-N's information value sits on the
@@ -1683,16 +1786,17 @@ recovery-sensitive** deployments:
   Viper ~2052 MB = **−86.7%**, flat across 5–50 M.*
 - **Read-heavy throughput (now a genuine win, not just acceptable-cost)**: on
   read-mostly workloads (YCSB-C analog, full HotTier) HiOM **matches or exceeds
-  Viper at every thread count and beats both PM-resident baselines** —
-  **re-measured 2026-06-07 @10 M, dense t=1..24**: 100r zipf t24 **46.8 vs Viper
-  43.2 / Dash 31.3 / CCEH 23.8**; uniform t24 35.5 vs 35.9 (within noise). The
+  Viper at every thread count and beats both hash-index baselines** —
+  **re-measured 2026-06-07 @10 M, dense t=1..24; Dash/CCEH refreshed 2026-06-11
+  under the unified PM value slab**: 100r zipf t24 **46.8 vs Viper 43.2 / Dash
+  31.4 / CCEH 31.8**; uniform t24 35.5 vs 35.9 (within noise). The
   earlier "0.69–0.92×, acceptable-cost not a win" (t=8, 2026-06-05) was a
   **measurement artifact** — a single contended stats `fetch_add` on the read
   hot path capped HiOM's scaling; per-Client shards removed it (Status top +
   Claude memory `hiom-read-stats-contention`). HiOM even edges Viper on zipf
   because its verify reads key+value in one `hiom_read_at_offset` vs Viper's
   separate key-check + value read. Net: **Viper-class (or better) reads at a
-  fraction of the DRAM, and a clean win over PM-resident Dash/CCEH** — the "读多"
+  fraction of the DRAM, and a clean win (~1.5×) over both Dash/CCEH** — the "读多"
   pillar now stands on throughput, not just DRAM.
 - **Recovery (secondary win)**: O(unflushed tail) vs Viper's O(all data)
   full CCEH rebuild — **~25× faster cold-start open at 100 M** (~87 ms vs
@@ -1706,8 +1810,10 @@ win claim, presented as limitations in the paper — not wins):
   (re-measured 2026-06-07 @10 M; up from the old 0.24–0.45× after the update
   in-place skip-commit + rising-edge wake fix) — HiOM maintains a secondary
   durability index (ColdTier mirror), so update/delete-heavy workloads pay for
-  it. The paper does not claim write parity. **Read-mostly (YCSB-B, 5 % update)
-  is NO LONGER a limitation** — there HiOM ≈ Viper (0.92–1.05×) and ~2.5×
+  it. The paper does not claim write parity; **post-slab (2026-06-11) Dash/CCEH
+  also overtake HiOM here** (a_zipf t24 HiOM 0.39–0.47× of Dash/CCEH/Viper) — the
+  honest cost of the three-axis trade. **Read-mostly (YCSB-B, 5 % update) is NO
+  LONGER a limitation** — there HiOM ≈ Viper (0.92–1.05×) and ~1.2–1.4×
   Dash/CCEH; the cost is confined to write-dominated mixes.
 - **Skewed writes at HotTier capacity can livelock**: at working set ≥
   HotTier capacity *with* a skewed write workload (YCSB-A zipfian, e.g.
@@ -2135,21 +2241,762 @@ Losing the hot tier is always recoverable — the basis for keeping it volatile.
 
 ---
 
-# §3 Cold Tier, Invariants, Protocols (TODO)
+# §3 Cold Tier
 
-The following sections need to be written before implementation starts:
+*(Written 2026-06-11 from the shipped code, completing the §3–§6 prose. The cold
+tier is the **authoritative, PM-resident** offset index — the structure that
+lets C1 hold index DRAM flat: HotTier is a bounded DRAM cache, but the complete
+`key → offset` map lives here, on PM, at ≈0 DRAM. This section specifies its
+on-PM layout, per-operation persistence rules, the linear-hashing growth model
+and its honest shipped status, the design alternatives rejected, and the
+region-parallel load used for recovery. Cross-refs: the crash-consistency
+*invariant* is §4.1-I2; the *batched* write path is §5.3/§5.5.)*
 
-- **§3 Cold Tier**: linear hashing, 32 fixed regions, design alternatives
-  table (rejecting static-probing, cuckoo, CCEH), parallel load
-- **§4 Six Invariants** (I1–I6): formal list + maintenance proofs by case
-  analysis on each operation (insert, update, delete, evict, flush)
-- **§5 Group Commit + Checkpoint A/B**: PM checkpoint slots, valid_pointer
-  atomic flip, recovery protocol
-- **§6 State Machine**: PINNED → IN_FLUSH → UNPINNED transitions, per-entry
-  latch, update/delete tombstone semantics
-- **§7 Evaluation Plan**: ✅ drafted below (baseline strategy + win-condition
-  experiments). §3–§6 design detail is still pending; the evaluation plan is
-  finalized early because the competitive landscape is now clear.
+## 3.1 Role and requirements
+
+ColdTier ([cold_tier.hpp](../include/viper/hiom/cold_tier.hpp)) maps
+`fp64(key) → KVOffset`. It is what makes HiOM's index DRAM constant in N (C1):
+the HotTier caches a working-set-sized slice in DRAM, but the complete map is
+here, on PM, costing ≈0 DRAM (`dram_bytes()` returns only the control struct +
+path string, [:504-510](../include/viper/hiom/cold_tier.hpp#L504-L510)). Four
+requirements shape every choice below:
+
+1. **PM-resident, ≈0 DRAM** — the whole point; rules out any DRAM directory.
+2. **Crash-consistent per operation** — it is the durable index of record, and
+   recovery (§5.6) replays into it, so a torn write must never surface (§4.1-I2).
+3. **Region-parallel** — recovery/warm-up must scan it with many threads (§3.6),
+   and the steady-state flusher must write disjoint shards without cross-shard
+   locks (§5.3).
+4. **Graceful at high load** — inserts must not fail or probe unboundedly as the
+   table fills; the structure must absorb overflow and (eventually) grow.
+
+## 3.2 Structure: 32 regions, chained buckets
+
+**PM layout** ([cold_tier.hpp:31-52](../include/viper/hiom/cold_tier.hpp#L31-L52)):
+
+```
+[0, 4096)     GlobalHeader  (magic, version, num_regions, geometry, total_size)
+[4096, …)     Region[0..31], each = RegionHeader + main_buckets + overflow_pool + 1 sentinel
+
+Region          = [16 B RegionHeader] [M × Bucket] [O × Bucket]   (M main, O overflow)
+RegionHeader    = { num_entries, next_overflow_alloc }            (atomic; best-effort / 1-based)
+Bucket (128 B)  = { header(8 B), Entry[7] (=112 B), pad(8 B) }
+  header bits   :  [0..6] occupancy bitmap · [7] has_overflow · [8..63] next_overflow_idx (1-based)
+Entry (16 B)    = { fp64 (8 B), offset (8 B) }                    (both atomic)
+```
+
+- **Region routing** — `region_id = fp64 >> 59` (top 5 bits → 32 regions,
+  [:529-531](../include/viper/hiom/cold_tier.hpp#L529-L531)). 32 is chosen to
+  satisfy three constraints at once: recovery parallelism (§3.6); the
+  commit-buffer lane mapping (`lane_of_fp64` groups 4 regions per lane, §5.2 — so
+  same `fp64` → same region → same lane → same flusher, and a flusher owns whole
+  regions, never sharing one); and a split-isolation unit for the linear-hash
+  growth model (§3.4 — a split touches one region only).
+- **Bucket routing** — within a region, `bucket_id = mix(fp64) & (M − 1)`, M a
+  power of two ([:532-538](../include/viper/hiom/cold_tier.hpp#L532-L538)).
+- **Overflow chains** — when a bucket fills with 7 distinct fingerprints, a fresh
+  bucket is claimed from the region's overflow pool (`next_overflow_alloc`,
+  1-based; index 0 is the "no chain" sentinel) and linked via the chain head's
+  `next_overflow_idx`; lookup / insert / scan follow the chain to its end. This
+  is the "graceful at high load" mechanism (requirement 4): an insert never fails
+  until the *region's whole overflow pool* is exhausted — unlike open addressing,
+  which degrades sharply near 100 % load.
+- **Defaults** — `M = 8192` main, `O = 16384` overflow (2× main) per region
+  ([:86-87](../include/viper/hiom/cold_tier.hpp#L86-L87)); 32 × 8192 × 7 ≈ 1.83 M
+  main slots before any chaining, sized up at construction for the target N.
+
+## 3.3 Per-operation persistence rules
+
+All PM writes go through `viper::internal::pmem_persist` (or the
+flush-range / drain split for batches), per design constraint 3. The
+crash-consistency *invariant* is §4.1-I2; the mechanics that maintain it:
+
+- **Insert** ([:246-272](../include/viper/hiom/cold_tier.hpp#L246-L272)): claim an
+  empty slot via `CAS(fp, 0 → fp)`, write the offset, **persist the entry**, then
+  `fetch_or` the occupancy bit and **persist the header**. The order is
+  load-bearing — a crash between the two persists leaves the bit unset, and
+  `lookup`/`scan` skip slots whose bit is 0, so the half-written entry is
+  invisible (the same write-then-bitset pattern as Viper's VPage, §A.3).
+- **Update** ([:229-234](../include/viper/hiom/cold_tier.hpp#L229-L234)): on a
+  fingerprint match, store the new offset into the existing entry and persist the
+  8 B offset word — atomically durable on ADR, so no occupancy dance (the bit is
+  already 1).
+- **Delete / tombstone** ([:426-448](../include/viper/hiom/cold_tier.hpp#L426-L448)):
+  store `kTombstoneOffset` (all-ones) and persist; the **fingerprint is retained**
+  so a re-insert finds the slot by match and updates in place, while `lookup`
+  returns `nullopt` on a tombstone. This is *the* authoritative tombstone (§6.6:
+  HotTier has none — it just clears its slot).
+- **Chain extend** ([:274-330](../include/viper/hiom/cold_tier.hpp#L274-L330)):
+  write+persist the new overflow bucket's entry and header **first**, then CAS the
+  tail's `next_overflow_idx` to link it and persist the tail header. A crash
+  mid-extend orphans a fully-written but unreferenced (hence invisible) bucket —
+  never a dangling link.
+- **Batched path** — the flusher applies many entries per bucket-group with two
+  fences total (all entry data, then all occupancy bits), preserving the same
+  entry-before-bit ordering; see `bulk_upsert`
+  ([:370-399](../include/viper/hiom/cold_tier.hpp#L370-L399)) and §5.3/§5.5.
+
+**Concurrency.** The steady-state writer is the per-region flusher under its own
+mutex (§5.3); since regions never share a flusher, no two writers touch one chain
+concurrently. Recovery's parallel upserts (§3.6) are region-disjoint and run
+before any flusher starts (§5.6). The CAS-based empty-slot claim and chain-attach
+additionally tolerate a concurrent legacy `upsert` (a recovery worker) safely.
+
+## 3.4 Linear hashing: growth model and shipped status
+
+The 32-region design is built **for per-region linear hashing**: each region
+would carry a `split_ptr` / level and a background worker that splits one bucket
+at a time as load rises, rehashing its entries — bounded, incremental growth
+without the stop-the-world doubling of a classic open-hash resize, and without
+CCEH's PM-resident directory.
+
+**Shipped status (honest boundary, as in §4.4).** The split worker is **deferred
+(Phase B-2)**: the shipped ColdTier has **fixed capacity set at construction**
+plus overflow chains
+([cold_tier.hpp:10-16](../include/viper/hiom/cold_tier.hpp#L10-L16)). There is no
+`split_ptr` and no online rehash; a region grows only by extending overflow
+chains until its pool is exhausted, at which point `upsert` returns false and a
+bulk group aborts ([:278-283](../include/viper/hiom/cold_tier.hpp#L278-L283)).
+This suffices for the evaluation because every win-condition dataset is
+**pre-sized** — the cold pool is provisioned for the target N at construction
+(the "pre-size, revisit later" decision in §Open-questions), so no online split
+is exercised, and at 2× overflow provisioning chains stay short. Online
+linear-hash splitting is the natural next step for unbounded-growth deployments;
+it affects no published number, exactly as the single-region offset codec (§4.4)
+does not.
+
+## 3.5 Design alternatives (and why rejected)
+
+| Alternative | Why not |
+|-------------|---------|
+| **Re-use Viper's CCEH** (extendible) | CCEH's extendible **directory is the very DRAM cost C1 removes**, and in Viper it runs DRAM-mode by default (§1.3–1.4). A PM-mode CCEH puts directory + segments on PM, but segment splits are PM-write-heavy doubling events and the directory still wants DRAM to be fast — re-using it defeats the purpose. |
+| **Static open addressing / linear probing** | No graceful overflow: as load → 100 % probe sequences blow up and inserts eventually fail. Requirement 4 wants bounded insert cost and absorb-then-grow; chained buckets + an overflow pool give that, probing does not. |
+| **Cuckoo hashing** | Kick-out chains mean **multiple PM writes + fences per insert** under load, and a relocation cascade is hard to keep crash-consistent (an entry must never be momentarily absent from *both* candidate buckets on PM). On PM-write-bound hardware (§E4) that write amplification is exactly what we avoid. |
+| **One flat region** (no 32-way split) | Loses recovery parallelism (§3.6), the clean commit-lane / flusher-ownership mapping (§5.2–5.3, no cross-flusher region sharing), and the per-region split isolation the growth model wants. 32 regions cost only 32 × 16 B of headers. |
+| **B-tree / sorted index** | HiOM needs point `fp64 → offset` only (no range scans in the workload); a hash index is faster and smaller. Range-capable PM indexes are a different benchmark (`tree_api.hpp`, §7.1). |
+
+## 3.6 Parallel load
+
+`parallel_load(num_threads, visitor)`
+([cold_tier.hpp:454-476](../include/viper/hiom/cold_tier.hpp#L454-L476)) assigns
+each worker a **strided subset of the 32 regions** (`r = t; r < 32; r += nthreads`)
+and walks every chain via `scan_chain`, invoking `visitor(fp64, offset)` on each
+**live** entry — `scan_chain` gates on the occupancy bit, skips `fp == 0`, and
+skips `kTombstoneOffset` ([:804-823](../include/viper/hiom/cold_tier.hpp#L804-L823)),
+so torn or deleted entries are never visited (the read side of §4.1-I2). Regions
+are disjoint, so the scan needs no locks. This complements the bounded tail-scan
+recovery (§5.6): the bulk of the index is simply re-mmap'd (it was always on PM),
+tail-scan rebuilds only the *recent* slice from VPages, and where a full warm is
+wanted the index is read back through this region-parallel path. Idempotency —
+re-`upsert` of an already-present `(fp64, same offset)` is a no-op on
+`num_entries` — is what lets §5.6 over-scan the tail harmlessly.
+
+---
+
+# §4 Invariants and Correctness
+
+*(Written 2026-06-11, the first of the §3–§6 prose sections. The invariants are
+the load-bearing correctness contract of C3, and the code that maintains them is
+frozen, so this section is descriptive of working, tested code — not a forward
+design. Every invariant is extracted from and cited to the shipped header-only
+implementation. §3 / §5 / §6 are also written (this session); §4
+cross-references them.)*
+
+## 4.0 Model and terminology
+
+**Ground truth is on PM, and it is not any index.** HiOM keeps three index
+structures, and *all three are hints*:
+
+- **HotTier** — a fixed-capacity DRAM hash table of 8 B slots
+  (`fp32 | compact_offset32`) under SIEVE eviction
+  ([hot_tier.hpp](../include/viper/hiom/hot_tier.hpp)).
+- **ColdTier** — a PM-resident 32-region linear-hash table mapping
+  `fp64 → KVOffset` ([cold_tier.hpp](../include/viper/hiom/cold_tier.hpp)).
+- **CommitBuffer** — a volatile, 8-lane DRAM queue of pending
+  `(op, fp64, offset, hot_slot, seq)` entries the flusher drains into ColdTier
+  ([commit_buffer.hpp](../include/viper/hiom/commit_buffer.hpp)).
+
+The authoritative state of a key is the Viper **VPage slot** that holds its
+(K,V): a slot is *live* iff its `free_slots` occupancy bit is 0, and a read of
+it is *consistent* iff the page `version_lock` is unlocked and unchanged across
+the read (Viper's optimistic protocol, §A.4). Every value HiOM ever returns,
+and every winner it ever picks at flush time, is read straight from a VPage
+slot and **verified against the looked-up key** —
+[`hiom_read_at_offset`](../include/viper/viper.hpp#L1902-L1920) and
+[`hiom_get_slot_key`](../include/viper/viper.hpp#L588-L595) both test
+`free_slots[slot]==false` *before* touching the data, then re-check the version
+lock. An index entry that points at a freed or version-torn slot therefore
+fails the read and is treated as a miss. This single fact — *PM occupancy bit +
+version lock are the truth; the tiers are verified hints* — is what makes the
+rest of the design safe, and is the reason CCEH could be retired from the write
+path (P0) without a correctness regression.
+
+**Per-slot state machine** (HotTier, [hot_tier.hpp:77-90](../include/viper/hiom/hot_tier.hpp#L77-L90)).
+Each HotTier slot carries a 2-bit state:
+
+```
+            upsert_pinned (writer)          flusher CAS            flusher CAS
+  UNPINNED ───────────────────────▶ PINNED ───────────▶ IN_FLUSH ───────────▶ UNPINNED
+     ▲   (slot durable in ColdTier,        (commit entry      (ColdTier write   (ColdTier
+     │    or a verified cache copy)         buffered)          in progress)      durable)
+     └────────────────────────── SIEVE may evict only here ──────────────────────────┘
+```
+
+SIEVE eviction
+([hot_tier.hpp:427-460](../include/viper/hiom/hot_tier.hpp#L427-L460)) skips any
+slot that is not `UNPINNED`. The handoff `IN_FLUSH → UNPINNED` is performed by
+the flusher **after** the corresponding ColdTier write is durable
+([hiom.hpp:1342-1366](../include/viper/hiom/hiom.hpp#L1342-L1366)).
+
+**Checkpoint frontier** (§5, [checkpoint.hpp](../include/viper/hiom/checkpoint.hpp)).
+A 4 KB A/B PM record persists `(seq, flushed_count, vpage_frontier, cold_size)`
+behind an atomic `valid_pointer` + FNV-1a `summary_hash`; `read_valid()` returns
+only a hash-consistent record (or `nullopt`), never a torn one. `vpage_frontier`
+is a VPage block number that lower-bounds every block which may still hold an
+unflushed commit-buffer entry.
+
+## 4.1 The six invariants
+
+| | Invariant (one-line) | Enforced by |
+|---|---|---|
+| **I1** | **PM-before-index / verified hints.** A key's (K,V) and its `free_slots` bit are persisted before any index tier references its offset; conversely no value is returned / no winner chosen without re-verifying the PM slot (live bit + version + key). | put persist order [viper.hpp:1023-1069](../include/viper/viper.hpp#L1023-L1069) (§A.3); mirror happens *after* `viper_.put` returns [hiom.hpp:415-425](../include/viper/hiom/hiom.hpp#L415-L425); verified reads [viper.hpp:1902-1920](../include/viper/viper.hpp#L1902-L1920), [:588-595](../include/viper/viper.hpp#L588-L595) |
+| **I2** | **ColdTier is authoritative and crash-consistent.** Once the buffer drains, ColdTier maps `fp64(key) → latest offset` for every live key (tombstone for deleted); a torn insert (entry written, occupancy bit not yet flipped) is invisible to both lookup and scan, so a crash never exposes a half-written entry. | write-then-occupancy-bit ordering [cold_tier.hpp:246-272](../include/viper/hiom/cold_tier.hpp#L246-L272), bulk two-phase [:782-801](../include/viper/hiom/cold_tier.hpp#L782-L801); lookup/scan gate on tombstone + occupancy [:402-424](../include/viper/hiom/cold_tier.hpp#L402-L424),[:804-823](../include/viper/hiom/cold_tier.hpp#L804-L823); authoritative read path [hiom.hpp:441-463](../include/viper/hiom/hiom.hpp#L441-L463) |
+| **I3** | **Pin safety — no visibility gap.** From the moment a put/delete is acknowledged until its commit entry reaches ColdTier, the key stays resolvable: its HotTier slot is `PINNED` (and SIEVE cannot evict it), or — if it could not be pinned — the writer blocked until the entry reached ColdTier. | `upsert_pinned` [hot_tier.hpp:189-252](../include/viper/hiom/hot_tier.hpp#L189-L252); eviction skips non-`UNPINNED` [:431-432](../include/viper/hiom/hot_tier.hpp#L431-L432); back-pressure block [hiom.hpp:641-700](../include/viper/hiom/hiom.hpp#L641-L700) |
+| **I4** | **Durable handoff.** A slot becomes `UNPINNED` (evictable) only after its offset is durable in ColdTier; only the flusher that wins the `PINNED→IN_FLUSH` CAS performs the unpin. | cold write (Stage 1) precedes the CAS dance (Stage 2) [hiom.hpp:1342-1366](../include/viper/hiom/hiom.hpp#L1342-L1366); `cas_slot_state` [hot_tier.hpp:495-517](../include/viper/hiom/hot_tier.hpp#L495-L517) |
+| **I5** | **Winner determinism / no regression.** For each `fp64` run in a drained batch, exactly one ColdTier op is applied, corresponding to the *latest* write; ColdTier never regresses to an older offset and never points at a different key's slot. | same `fp64`→same lane→same batch [commit_buffer.hpp:92-104](../include/viper/hiom/commit_buffer.hpp#L92-L104); `(fp64,seq)` stable-sort + HotTier-truth winner + key-verify fallback [hiom.hpp:1140-1145](../include/viper/hiom/hiom.hpp#L1140-L1145),[:1251-1335](../include/viper/hiom/hiom.hpp#L1251-L1335); delete always pushes `kRemove` [:475-513](../include/viper/hiom/hiom.hpp#L475-L513) |
+| **I6** | **Bounded recovery soundness.** Replaying VPage records in `[vpage_frontier−1, current_block)` into ColdTier re-establishes I2, and that range provably contains every block with an unflushed entry; replay is idempotent so over-scan costs only time. | frontier = `min(min_active_writer_block, viper_next)` [hiom.hpp:1407-1432](../include/viper/hiom/hiom.hpp#L1407-L1432); replay [:1446-1504](../include/viper/hiom/hiom.hpp#L1446-L1504); crash-atomic checkpoint [checkpoint.hpp:139-179](../include/viper/hiom/checkpoint.hpp#L139-L179); ctor order prime→replay→flusher [hiom.hpp:200-326](../include/viper/hiom/hiom.hpp#L200-L326) |
+
+**How they compose.** I1 makes every tier a *verifiable* hint, so a stale or
+lost hint is never a correctness problem, only a performance one. I2 is the
+steady-state target (the authoritative index). I3 + I4 bridge the gap between
+"write acknowledged" and "durable in ColdTier" with no reader-visible hole
+(I3) and make eviction safe by ordering the unpin after durability (I4). I5
+ensures concurrent writers to one key converge ColdTier to the latest offset.
+I6 re-establishes I2 after a crash, using PM ground truth (I1) and the
+checkpoint frontier. The reader-facing safety claim — *a `get` returns the
+value of the latest committed write for a key, or `false` if none* — follows
+from I1 (verified read) + I2 (authoritative when drained) + I3 (still
+resolvable before drained).
+
+## 4.2 Maintenance proofs (case analysis by operation)
+
+For each operation we show which invariants it touches and why none is
+violated. "Acknowledged" means the client call returned.
+
+### Insert — `Client::put`, new key ([hiom.hpp:404-427](../include/viper/hiom/hiom.hpp#L404-L427))
+
+1. `viper_.put` writes the (K,V) and resets the `free_slots` bit, **persisting
+   both** before returning (steps 4 + 6 of §A.3). Only then does HiOM read
+   `last_put_offset()` and mirror. **⇒ I1**: the offset HiOM is about to
+   publish already addresses a durable, live slot holding *this* key.
+2. `mirror_write_with_offset` records the block in the client's frontier slot
+   (`note_client_block`, **⇒ I6**), `upsert_pinned`s the HotTier slot, and
+   pushes a `kPut` commit entry. If `upsert_pinned` fails (bucket full of
+   pinned slots), the writer drains synchronously and re-tries, and if the slot
+   still cannot be pinned it blocks until the buffer is empty
+   ([hiom.hpp:691-699](../include/viper/hiom/hiom.hpp#L691-L699)). **⇒ I3**:
+   between return and ColdTier durability the key is either PINNED in HotTier or
+   already in ColdTier — never invisible.
+3. The slot enters `PINNED` (**⇒ I4** sets up the handoff). The flusher will
+   apply the entry and unpin (see *Flush*).
+
+*Edge — offset not encodable.* If `encode()` returns `nullopt` (block number
+beyond the single-region 48 GiB codec range, §4.4), HiOM skips the HotTier pin
+but still pushes the `kPut`; the put already landed on PM (I1) and reads fall
+through HotTier-miss → ColdTier (I2). Correctness holds; only the DRAM cache
+hit is forgone. (The historical bug here was mis-treating encode-failure as
+back-pressure and blocking every put — fixed; see Status 2026-05-16.)
+
+### Update — `Client::update` ([hiom.hpp:515-546](../include/viper/hiom/hiom.hpp#L515-L546))
+
+- **Fixed-size V (in-place).** `viper_.update` overwrites the value at the
+  **same** VPage slot and persists it under the page lock (bumping
+  `version_lock`). The offset is unchanged, so ColdTier already maps
+  `key → offset` correctly. **⇒ I2 holds with no ColdTier work**; there is no
+  new un-drained offset, so **I3 is trivially satisfied** and no commit entry is
+  pushed (hence no I6 frontier constraint — there is no unflushed window). HiOM
+  only refreshes the SIEVE `visited` bit. A reader sees the new value because it
+  reads the (unchanged-offset) slot, which now holds the new value (I1).
+- **Variable-size V (`std::string`).** Viper may relocate the value to a *new*
+  offset and free the old slot. HiOM re-runs the full `kPut` mirror
+  ([hiom.hpp:540-541](../include/viper/hiom/hiom.hpp#L540-L541)) → this reduces
+  to the *Insert* case for the new offset; the old slot's `free_slots` bit is
+  set by Viper, so any stale hint to it self-invalidates (I1). *(Recovery for
+  the string case is out of scope — §4.4.)*
+
+### Delete — `Client::remove` ([hiom.hpp:475-513](../include/viper/hiom/hiom.hpp#L475-L513))
+
+1. `viper_.remove` → `free_occupied_slot` → `invalidate_record` **sets the
+   `free_slots` bit** on the key's VPage slot, under the page lock, synchronously
+   ([viper.hpp:1654](../include/viper/viper.hpp#L1654),[:1618](../include/viper/viper.hpp#L1618)).
+   **⇒ I1**: from this point the slot is dead ground-truth.
+2. HiOM clears the HotTier fp slot and **always** pushes a `kRemove` when
+   ColdTier is attached (even if `viper_.remove` reported not-found — the P0
+   fallback). **⇒ I5**: `kRemove` is the highest-`seq` entry in its `fp64` run,
+   wins the descending walk, and tombstones ColdTier.
+3. *Visibility window before the `kRemove` drains*: a concurrent `get` misses
+   HotTier (slot cleared), reaches ColdTier which still maps `fp64 → old
+   offset`, and calls `hiom_read_at_offset` — which sees `free_slots==true` and
+   **returns false** ([viper.hpp:1913](../include/viper/viper.hpp#L1913)). So the
+   removed key is immediately invisible despite the stale ColdTier offset. **⇒
+   read-after-remove is correct in the commit window** (matches the §259
+   "read-after-remove returns false" test contract and Phase-D).
+
+*Known leak (space, not correctness).* If an `fp32` collision *and* an
+update→remove race on the same key leave an in-flight `kPut` whose VPage slot
+HiOM can no longer locate, that slot is left live on PM with no index pointing
+at it ([hiom.hpp:483-490](../include/viper/hiom/hiom.hpp#L483-L490)). No I-
+invariant is violated — the index is correct and the key reads as absent — but
+the orphaned slot is reclaimable only by a future compaction pass (§4.4).
+
+### Evict — SIEVE in HotTier ([hot_tier.hpp:427-460](../include/viper/hiom/hot_tier.hpp#L427-L460))
+
+Eviction only ever clears an `UNPINNED` slot (PINNED/IN_FLUSH are skipped,
+[:431-432](../include/viper/hiom/hot_tier.hpp#L431-L432)). By **I4** an
+`UNPINNED` slot's offset is already durable in ColdTier (or the slot is a
+verified cache copy of a ColdTier entry). **⇒ evicting it loses no
+authoritative state** (I2 untouched): the next read of that key misses HotTier,
+hits ColdTier, verifies against PM (I1), and re-warms HotTier
+(`mirror_into_hot_with_offset`). PINNED entries — exactly those whose ColdTier
+write is *not* yet durable — are never dropped, so **I3 is preserved**.
+
+### Flush — `apply_batch` ([hiom.hpp:1192-1398](../include/viper/hiom/hiom.hpp#L1192-L1398))
+
+The flusher drains a lane to empty, stable-sorts by `(fp64, seq)`, and for each
+`fp64` run:
+
+1. **Winner pick.** *HotTier-truth fast path*: the slot's current
+   `packed_off` is the last `upsert_pinned` CAS-winner = the canonical offset;
+   pick the batch entry whose offset matches, after verifying the PM slot's key
+   re-hashes to this `fp64` (`hiom_get_slot_key`, gated on `free_slots`).
+   *Fallback* (slot evicted post-pin / `fp32` collision / canonical offset in a
+   future batch): descending-`seq` alive-and-`fp`-match walk, first `kRemove` or
+   alive `kPut` wins. **⇒ I5**: an offset whose slot was freed (because a newer
+   put superseded it) fails the key-verify and is never picked, so ColdTier
+   cannot regress; if no entry qualifies, ColdTier is left untouched and the
+   later batch carrying the canonical (still-PINNED, by I4) entry applies it —
+   convergence.
+2. **Apply (Stage 1).** `kPut` winners are coalesced and dispatched via
+   `cold_->bulk_upsert` (entry data durable, then occupancy bits durable —
+   I2); `kRemove` winners tombstone immediately.
+3. **Handoff (Stage 2).** *After* the ColdTier writes are durable, walk every
+   entry's slot ref and CAS `PINNED→IN_FLUSH→UNPINNED`. **⇒ I4**: the unpin is
+   strictly ordered after durability, so I3's guarantee is handed to I2 without
+   a gap. CAS failures are benign (a newer same-`fp` `upsert_pinned` re-pinned
+   the slot, or a prior pass already advanced it).
+4. **Checkpoint hook.** For each `cadence_entries` boundary the cumulative
+   `flushed_count` crosses, `try_write_checkpoint` persists a fresh A/B record
+   whose `vpage_frontier = min(min_active_writer_block, viper_next)`
+   ([hiom.hpp:1422-1428](../include/viper/hiom/hiom.hpp#L1422-L1428)). **⇒ I6**:
+   the persisted frontier lower-bounds every block that could still hold an
+   unflushed entry, *including* a slow writer lagging behind the global block
+   cursor (the multi-writer fix — capturing only `viper_next` would drop that
+   writer's tail).
+
+### Crash + recovery — constructor with `tail_scan` ([hiom.hpp:200-326](../include/viper/hiom/hiom.hpp#L200-L326), [:1446-1504](../include/viper/hiom/hiom.hpp#L1446-L1504))
+
+On reopen, before any flusher or client runs (so no write interleaves with
+replay):
+
+1. **Prime** `flushed_count_` / `seq_` from `checkpoint_->read_valid()` — which
+   is `nullopt` or a hash-consistent record, never torn (I6, checkpoint
+   atomicity). A crash mid-checkpoint leaves the *previous* slot valid.
+2. **Replay** VPage records in `[vpage_frontier−1, current_block)` into ColdTier
+   via idempotent `upsert`. *Soundness*: any commit entry not yet in ColdTier at
+   crash time targeted a block `≥ vpage_frontier` (I6 frontier definition);
+   starting one block earlier covers the boundary block that straddles
+   drained/undrained entries. Entries already in ColdTier re-upsert to the same
+   `(fp64, offset)` — a no-op-equivalent, so over-scan is harmless. After
+   replay **I2 is re-established** for every live key. (Volatile HotTier +
+   CommitBuffer are simply gone, which is safe by I1/I3: their content was
+   either already durable in ColdTier or recovered by replay.)
+3. **Spin up** flushers; steady state resumes.
+
+This is the contract the M4 crash-injection harness validates (18/18
+iterations, fast + slow flusher, early/mid/late crash points) and the M6
+Phase-A/B/C tests exercise (`replayed≈tail`, `cold_after_recovery == total`).
+
+## 4.3 What the invariants do **not** claim
+
+To keep the correctness claim defensible, the following are explicitly *out* of
+the I1–I6 guarantee and are argued separately or scoped out:
+
+- **Linearizability / isolation across distinct keys.** HiOM inherits Viper's
+  per-key, page-latched, last-writer-wins semantics; it provides no multi-key
+  atomicity or snapshot isolation. The I-set is about *index consistency and
+  durability of single-key state*, not transactional isolation.
+- **Liveness of I3 back-pressure under skewed writes at capacity.** I3 is a
+  *safety* property (no visibility gap). Its back-pressure *liveness* — that the
+  blocking-drain loop always makes progress — does **not** hold for the
+  `a_zipf-33M` corner (working set ≥ HotTier capacity *and* zipfian writes): a
+  handful of hot `fp32` buckets fill with PINNED slots and slow writers can
+  starve (gdb-confirmed, Status 2026-05-20). Safety is intact (no wrong/lost
+  reads); only progress fails, and the cell is excluded from the win-condition
+  matrix. Fix (future): per-region SIEVE clock-pacing or a wait-free drain.
+- **Reclamation of the Option-L orphan slot.** §4.2-Delete's leak is a bounded
+  space overhead, not a correctness defect; it awaits a compaction pass.
+
+## 4.4 Scope limits inherited by the invariants
+
+- **Single-region offset codec.** The 4 B compact offset encodes one region's
+  ≤ 2²¹ blocks ≈ 48 GiB of PMem
+  ([offset_codec.hpp:49-100](../include/viper/hiom/offset_codec.hpp#L49-L100)).
+  Past that, `encode()` returns `nullopt` and the key is ColdTier-only (still
+  correct, no HotTier cache). Multi-region routing is future work; sufficient
+  for every planned dataset (≤ 100 M × 208 B ≈ 20.8 GiB).
+- **Fixed-size K/V only.** Variable-size (`std::string`) recovery is
+  unimplemented in Viper itself
+  ([viper.hpp:849-853](../include/viper/viper.hpp#L849-L853) throws), so I6
+  is stated for fixed-size records; the string update path (§4.2) is
+  steady-state-correct but not recovery-covered. All evaluation uses K8/V200.
+- **Reclamation off (default).** I1's "freed slot self-invalidates on read"
+  relies on Viper reclaim being off so a freed slot's bytes are not overwritten
+  by an unrelated key before the stale hint is re-verified; with reclaim on, the
+  `free_slots` bit + version-lock recheck still guard correctness, but the
+  analysis above assumes the default (reclaim disabled).
+
+---
+
+# §5 Group Commit and Checkpoint A/B
+
+*(Written 2026-06-11 from the shipped code, like §4. Covers the write-deferral
+path — commit buffer, multi-flusher drain, batched ColdTier apply — and the A/B
+checkpoint that bounds recovery to O(tail). The per-slot state transitions the
+flusher drives are specified in §6; this section treats them as a black box
+"pin → durable → unpin" handoff and focuses on the buffering, batching, and
+checkpoint protocols. Forward ref: the cold-tier on-PM layout is §3.2.)*
+
+## 5.1 Why defer the cold-tier write
+
+A naive design would upsert ColdTier on every client write. Each upsert is a
+small (~16 B) PM store plus an ADR `sfence`; across N concurrent clients those
+per-op fences serialize on the Optane write-buffer queue and cap aggregate
+write throughput
+([commit_buffer.hpp:7-13](../include/viper/hiom/commit_buffer.hpp#L7-L13)).
+HiOM instead routes every successful write through a volatile DRAM **commit
+buffer**; a small pool of background **flushers** drains it, sorts entries by
+destination ColdTier bucket, and emits **two fences per bucket-group** instead
+of two per entry (§5.3, and the `bulk_upsert` two-phase persist of §4.1-I2).
+Design constraint 5 ("cold-tier writes are batched; single-key flush is a bug")
+is enforced here.
+
+The cost of deferral is a window where a just-written key is durable on PM but
+not yet in ColdTier; **I3 (pin safety)** covers that window, and **I6 (bounded
+recovery)** covers a crash inside it — both via the checkpoint of §5.4.
+
+## 5.2 The commit buffer
+
+[commit_buffer.hpp](../include/viper/hiom/commit_buffer.hpp). A `CommitEntry`
+([:56-82](../include/viper/hiom/commit_buffer.hpp#L56-L82)) is one cache line:
+`{op ∈ {kPut, kRemove}, fp64, KVOffset off, HotTier::SlotRef hot_slot, seq}`.
+
+- **Sharding.** The buffer is `kNumLanes = 8` cache-line-isolated queues
+  (`alignas(64) Lane`, each a `moodycamel::ConcurrentQueue` + an `approx_size`
+  atomic, [:208-216](../include/viper/hiom/commit_buffer.hpp#L208-L216)).
+- **Routing — the load-bearing property.** `lane_of_fp64(fp64)` maps a key to a
+  lane by its top fingerprint bits, grouping 4 ColdTier regions per lane
+  ([:92-104](../include/viper/hiom/commit_buffer.hpp#L92-L104)). **The same
+  `fp64` always lands in the same lane**, so every commit entry for a given key
+  is drained in one batch — exactly what the `(fp64, seq)` winner-picker of
+  §4.1-I5 needs (no fingerprint spans two lanes, so no winner decision is ever
+  split across batches).
+- **Producer tokens.** Each `(Client, lane)` pair lazily allocates one
+  `moodycamel::ProducerToken` on first push
+  ([hiom.hpp:727-733](../include/viper/hiom/hiom.hpp#L727-L733)), giving
+  near-SPSC enqueue and splitting the cross-producer contention the original
+  single queue suffered `kNumLanes` ways.
+- **`nonempty_mask`.** One bit per lane lets a flusher skip empty lanes without
+  probing every `approx_size`. To keep the mask itself from becoming the
+  contention point, `push` hits the atomic OR **only on the 0→1 transition**
+  (test-and-set), and drain clears the bit when it observes the lane drained to
+  empty ([:132-184](../include/viper/hiom/commit_buffer.hpp#L132-L184)).
+- **Volatile.** The buffer is pure DRAM; a crash loses every un-flushed entry —
+  safe because the corresponding PM data is already durable (I1) and the
+  unflushed window is recovered by tail-scan (I6).
+
+**Sequence stamps.** `seq = (client_local_seq << 16) | slot_idx`
+([hiom.hpp:781-785](../include/viper/hiom/hiom.hpp#L781-L785)). The high 48 bits
+are a per-Client monotone counter (strict intra-Client ordering); the low 16
+are the client's slot index, a deterministic cross-Client tiebreaker. `seq` is
+**not** load-bearing for the common winner-pick (HotTier-truth is, §6/§4.1-I5);
+it only orders the rare fallback walk. This is deliberate: an earlier design
+bumped a single global `commit_seq_` atomic *after* the Viper write, which both
+contended on the write path and admitted a CAS-winner/seq-loser race; per-Client
+local seq retired both problems (Status 2026-05-09).
+
+## 5.3 Push and multi-flusher drain
+
+**Push** ([hiom.hpp:727-760](../include/viper/hiom/hiom.hpp#L727-L760)). Route to
+the lane, enqueue, and wake flushers on the **rising edge through a per-lane
+watermark** (`lane_depth == high_watermark / kNumLanes`) — *and only that edge*.
+This threads between two measured failure modes
+([:736-754](../include/viper/hiom/hiom.hpp#L736-L754)):
+
+- *wake whenever depth ≥ watermark* → under a write storm the lane sits above the
+  mark and **every** push runs `wake_all_flushers` (a `kNumLanes`-mutex +
+  futex-wake storm) — this regressed delete 8→24 threads (2.56 vs scaling
+  target);
+- *wake on every empty→nonempty edge (depth==1)* → at t=1 the flusher drains each
+  entry and re-parks, so the next push re-arms the edge and pays a futex wake
+  **per op** — collapsed delete t=1 to ~0.28 M/s.
+
+The exact-watermark edge fires at most once per drain-cycle; a missed edge costs
+at most one `fcfg_.interval` (5 ms) of latency, since the flusher's timer +
+predicate re-check is the backstop. (Fix committed 657c9f2.)
+
+**Flushers** ([hiom.hpp:1525-1563](../include/viper/hiom/hiom.hpp#L1525-L1563)).
+`fcfg_.num_flushers` (default 4) background threads, each owning a **disjoint
+lane subset** (`lanes_mask_for_flusher`,
+[:333-350](../include/viper/hiom/hiom.hpp#L333-L350)). Because same `fp64` → same
+lane → same flusher, **two flushers never touch the same HotTier slot or
+ColdTier region**, so each flusher needs only its own mutex
+(`flusher_mus_[id]`), never a cross-flusher lock. Each waits on its own
+`(mu, cv)` `WakeSlot` ([:1623-1627](../include/viper/hiom/hiom.hpp#L1623-L1627))
+— a single shared CV would serialize all flushers through one lock and eat the
+parallelism.
+
+The wait predicate is **only** `(nonempty_mask & my_lanes) != 0`
+([:1544-1549](../include/viper/hiom/hiom.hpp#L1544-L1549)) — it must *not* also
+gate on `high_watermark`, or a back-pressure caller notifying with
+`size_hint() < high_watermark` would bounce off the predicate and the flusher
+would make progress only on the 5 ms timer (Bug A, 2026-05-16: a 1 M prefill
+stalled past 14 min). `high_watermark` keeps its two *other* roles: it gates the
+producer's wake decision (above) and the flusher's "keep draining vs re-park"
+inner loop ([:1559-1560](../include/viper/hiom/hiom.hpp#L1559-L1560)).
+
+**Drain + apply** (`drain_to_empty_and_apply_locked`,
+[:1114-1162](../include/viper/hiom/hiom.hpp#L1114-L1162)). Under the flusher's
+mutex: drain each owned non-empty lane to empty, `stable_sort` the batch by
+`(fp64, seq)`, and call `apply_batch` (one ColdTier op per `fp64` run — §4.2
+*Flush*, §6 for the slot transitions). Re-check the mask in case producers
+re-set bits during apply.
+
+**Cooperative inline-flush** (`try_inline_flush`,
+[:917-937](../include/viper/hiom/hiom.hpp#L917-L937)). When a writer's
+`upsert_pinned` hits a bucket full of pinned slots (back-pressure, §6.4), it
+`try_lock`s any *free* flusher's mutex and drains that flusher's lanes itself —
+the writer helps an idle flusher rather than blocking on a single contended
+lock, and backs off (yields) when all flushers are busy keeping up. This is the
+mechanism behind I3's "blocked until the entry reached ColdTier" guarantee.
+
+## 5.4 The A/B checkpoint
+
+[checkpoint.hpp](../include/viper/hiom/checkpoint.hpp). A 4 KB PM file with two
+64 B `CheckpointRecord` slots and an 8 B atomic `valid_pointer`. A record holds
+`{magic, seq, flushed_count, vpage_frontier, cold_size, summary_hash}`
+([:52-64](../include/viper/hiom/checkpoint.hpp#L52-L64)); `summary_hash` is an
+FNV-1a over the rest ([:218-228](../include/viper/hiom/checkpoint.hpp#L218-L228)).
+
+- **Write** ([:139-162](../include/viper/hiom/checkpoint.hpp#L139-L162)): write
+  the fresh record into the **inactive** slot (the one `valid_pointer` is *not*
+  pointing at; slot A first if none yet) → `pmem_persist` → **atomic-store
+  `valid_pointer` to the new slot** → persist. At most one slot is mid-write at
+  any instant.
+- **Read** ([:168-179](../include/viper/hiom/checkpoint.hpp#L168-L179)): load
+  `valid_pointer`; if `kValidNone`, return `nullopt`; else read that slot and
+  verify `summary_hash`; on mismatch, fall back to the other slot.
+- **Torn-write safety.** A crash mid-write tears only the *inactive* slot, and
+  `valid_pointer` has not flipped — so `read_valid()` still returns the previous,
+  hash-consistent record. The flip is a single 8 B atomic store, durable by
+  itself on ADR. **`read_valid()` therefore never returns a torn record** — only
+  a consistent one or `nullopt`. This is the crash-atomicity half of §4.1-I6.
+
+`valid_pointer` is the sole source of truth on read; `seq` is used to *prime*
+monotonicity across reopen (§5.5) and for diagnostics, not to arbitrate between
+slots (the protocol's invariant is that the valid slot is always the freshest
+consistent one).
+
+## 5.5 Cadence and the recovery frontier
+
+**Cadence.** A checkpoint fires whenever the cumulative `flushed_count` crosses
+a multiple of `ccfg_.cadence_entries` (default 4096). Because a bulk batch can
+span several boundaries, `apply_batch` emits **one checkpoint per crossed
+boundary** ([hiom.hpp:1380-1391](../include/viper/hiom/hiom.hpp#L1380-L1391)).
+`try_write_checkpoint` is `try_lock`-guarded (the background flusher and an
+inline-flusher can both reach it) and idempotent on a skipped round; inside the
+lock `++seq_` is the linearization point for the persisted sequence
+([:1407-1432](../include/viper/hiom/hiom.hpp#L1407-L1432)).
+
+**The frontier — multi-writer-aware (M4 Phase E).**
+`vpage_frontier = min(min_active_writer_block, viper_next)`
+([:1422-1428](../include/viper/hiom/hiom.hpp#L1422-L1428)). Capturing only
+Viper's global next-to-claim block (`viper_next`) is **unsafe** with concurrent
+writers: if client *X* is still filling block 30 while the global cursor has
+advanced to 50, a recovery scan of `[49, current)` would silently drop *X*'s
+unflushed entries. The `min` over all active clients' most-recent blocks
+(tracked lock-free in `client_slots_`, updated by `note_client_block` on every
+write, [:1071-1098](../include/viper/hiom/hiom.hpp#L1071-L1098)) guarantees
+every block that may hold an unflushed entry is `≥ vpage_frontier`. Without this
+fix, fast-flusher mid-stream crash iterations lost ~836 keys per run (M4 Phase
+E).
+
+A released client keeps its `last_block` (only `active` is cleared,
+[:1066-1069](../include/viper/hiom/hiom.hpp#L1066-L1069)): clearing it could let
+a checkpoint that fires before the client's entries drain pick a too-high
+frontier and miss them. The cost is a brief window where the frontier may be
+slightly *too low* — harmless, since over-scan only re-replays idempotently.
+
+**Priming on reopen.** The ctor reads `read_valid()` and primes `flushed_count_`
+and `seq_` from it ([:206-212](../include/viper/hiom/hiom.hpp#L206-L212)), so the
+monotonic-`seq` and cumulative-count invariants survive close+reopen.
+
+## 5.6 Recovery protocol
+
+On reopen with `RecoveryConfig::tail_scan`, the ctor runs three steps **before**
+any flusher or client starts, so no write interleaves with replay
+([hiom.hpp:200-326](../include/viper/hiom/hiom.hpp#L200-L326)):
+
+1. **Prime** counters from the checkpoint (§5.5).
+2. **Tail-scan** `recover_tail_into_cold`
+   ([:1446-1504](../include/viper/hiom/hiom.hpp#L1446-L1504)): scan Viper VPage
+   records in `[vpage_frontier − 1, current_block)` — starting one block early so
+   the boundary block that straddles drained/undrained entries is covered — and
+   `cold_->upsert(fp64(key), off)` each live record, parallelised across
+   `recovery_threads` (default 32) in the same shape as `Viper::recover_database`.
+   Idempotent: re-upserting an already-present `(fp64, same offset)` is a no-op
+   on `num_entries`, so the deliberate over-scan is free of correctness cost.
+   After this, **I2 holds for every live key**.
+3. **Spin up** flushers; steady state resumes.
+
+This is the O(tail) recovery measured in §M6.5 (~25× faster cold-start open at
+100 M; tail replay linear at 49.8 µs/entry) and validated by the M4
+crash-injection harness (18/18) and the M6 Phase-A/B/C tests
+(`replayed ≈ tail`, `cold_after_recovery == total`). The legacy `Viper::open`
+full-CCEH rebuild is skipped via `ViperConfig::skip_recovery=true`, so tail-scan
+is the sole index-recovery path.
+
+---
+
+# §6 State Machine and Tombstone Semantics
+
+*(Written 2026-06-11 from the shipped code. Specifies the per-HotTier-slot
+2-bit state machine the §5 flusher drives, the lock-free concurrency on it, its
+coupling to SIEVE eviction, and the update/delete semantics. **Corrects an
+earlier doc inaccuracy**: §2.9 / §A.5 describe delete as marking a "DRAM
+hot-tier TOMBSTONE", but the shipped HotTier has no tombstone state — remove
+clears the slot to empty; the authoritative tombstone lives in ColdTier as
+`kTombstoneOffset`. §6.5 states the actual semantics.)*
+
+## 6.1 Why a per-entry state exists
+
+Viper's CCEH has no per-entry state — it is the index, so every entry is
+authoritative. HotTier is different: it is a **cache with eviction** in front of
+the authoritative ColdTier. An entry whose durable ColdTier home is **not yet
+established** (its commit entry is still buffered) must not be evicted, or it
+would briefly exist nowhere a reader can find it (a hole in I3). The 2-bit state
+encodes exactly that distinction: "is this slot's authoritative copy already in
+ColdTier?"
+
+## 6.2 The 2-bit slot state
+
+Each `BucketMeta` packs 16 slots × 2 bits into one 32-bit atomic `state` word,
+parallel to the 128 B bucket of 8 B packed slots
+([hot_tier.hpp:77-90](../include/viper/hiom/hot_tier.hpp#L77-L90),
+[:387-393](../include/viper/hiom/hot_tier.hpp#L387-L393)):
+
+| State | Bits | Meaning | SIEVE |
+|-------|------|---------|-------|
+| `kUnpinned` | `00` | durable in ColdTier, **or** empty, **or** a verified cache copy | **evictable** |
+| `kPinned` | `01` | `upsert_pinned` set it; commit entry buffered, not yet in ColdTier | skipped |
+| `kInFlush` | `11` | a flusher won the slot and is performing the ColdTier write | skipped |
+| *(reserved)* | `10` | unused | — |
+
+Three orthogonal pieces of per-slot metadata must not be conflated: the **8 B
+packed `(fp32, offset)`** (the cached mapping; CAS'd atomically), the **2-bit
+`state`** (this section), and the **1-bit SIEVE `visited`** flag
+([:466-480](../include/viper/hiom/hot_tier.hpp#L466-L480)). Only `state` gates
+eviction safety; `visited` is a pure hit-rate hint (correctness never depends on
+it); the packed word is the data.
+
+## 6.3 Transitions
+
+| Transition | Driver | When | Code |
+|------------|--------|------|------|
+| `UNPINNED → PINNED` | writer | `upsert_pinned` after the PM put is durable (I1) | `force_pinned` [:526-532](../include/viper/hiom/hot_tier.hpp#L526-L532) |
+| `PINNED → IN_FLUSH` | flusher | CAS to take ownership of the cold write | `cas_slot_state` [:87-90](../include/viper/hiom/hot_tier.hpp#L87-L90),[:495-517](../include/viper/hiom/hot_tier.hpp#L495-L517) |
+| `IN_FLUSH → UNPINNED` | flusher | CAS **after** the ColdTier write is durable | `apply_batch` Stage 2 [hiom.hpp:1355-1366](../include/viper/hiom/hiom.hpp#L1355-L1366) |
+
+The ordering in the third row is the crux of **I4**: the unpin CAS is issued
+only after `bulk_upsert`/`remove` returns (Stage 1 precedes Stage 2 in
+`apply_batch`), so a slot is `UNPINNED` — and thus evictable — only once its
+offset is authoritative in ColdTier. This hands I3's "still resolvable" promise
+to I2's "authoritative" guarantee with no gap.
+
+**Benign-failure semantics.** `cas_slot_state(from, to)` returns false (and the
+caller leaves the slot alone) whenever `state ≠ from`
+([:495-517](../include/viper/hiom/hot_tier.hpp#L495-L517)). This is correct, not
+a missed update, in every case: a same-`fp` `upsert_pinned` may have re-pinned
+the slot (newer write — the new commit entry carries the latest offset and will
+drive its own transition), or a prior apply pass already advanced it. The
+flusher's per-entry walk over the whole batch
+([:1355-1366](../include/viper/hiom/hiom.hpp#L1355-L1366)) thus tolerates stale
+slot refs from earlier-seq duplicates of the same key. `force_pinned` itself is
+`fetch_or(pin) + fetch_and(~flush)`: a transient `kInFlush` bit is observable
+mid-call but harmless, because a racing flusher's `CAS(kInFlush → kUnpinned)`
+simply no-ops against the re-pinned slot.
+
+## 6.4 Concurrency: lock-free, per-slot CAS
+
+There is no per-bucket or per-slot mutex. A slot upsert is a single 8 B
+`compare_exchange` on the packed `(fp32, offset)` word
+([:117-180](../include/viper/hiom/hot_tier.hpp#L117-L180),
+[:189-252](../include/viper/hiom/hot_tier.hpp#L189-L252)) — and after CCEH was
+retired from the write path (P0), **that CAS is the linearization point for
+same-`fp32` writes**, which is what makes the HotTier-truth winner-picker of
+§4.1-I5 sound. The 2-bit `state` is a second atomic, advanced by its own CAS.
+Concurrent writers to the same `fp` share the one slot (last CAS wins in place);
+concurrent readers take a plain acquire-load and verify against PM (I1), so they
+need no coordination with the state machine at all.
+
+**Back-pressure (the all-pinned bucket).** If a 16-slot bucket is entirely
+non-`UNPINNED`, `sieve_evict` returns `kInvalidIdx` and `upsert_pinned` returns
+`SlotRef{valid=false}` ([:225-251](../include/viper/hiom/hot_tier.hpp#L225-L251)).
+The writer then drains cooperatively (§5.3 `try_inline_flush`) and retries, and
+if still unpinnable blocks until the buffer is empty
+([hiom.hpp:691-699](../include/viper/hiom/hiom.hpp#L691-L699)) — preserving I3's
+safety. As noted in §4.3, this loop's *liveness* is the one place that can
+starve under skewed writes at capacity (`a_zipf-33M`); safety is never at risk.
+
+## 6.5 Eviction interaction
+
+SIEVE eviction walks from the bucket `hand` and **unconditionally skips any
+non-`UNPINNED` slot** ([:431-432](../include/viper/hiom/hot_tier.hpp#L431-L432)),
+clearing `visited` as a second chance on `UNPINNED` survivors and evicting the
+first `UNPINNED` slot whose `visited` is already 0. Evicting an `UNPINNED` slot
+loses no authoritative state (I4 guarantees its offset is already in ColdTier),
+so the next read of that key misses HotTier, hits ColdTier, verifies against PM,
+and re-warms (§4.2 *Evict*). PINNED/IN_FLUSH slots — precisely those not yet
+durable — are never dropped.
+
+## 6.6 Update and delete / tombstone semantics
+
+- **Update, fixed-size value (in-place).** Viper overwrites the value at the
+  *same* slot; the offset is unchanged, so no state transition and no commit
+  entry are needed — `Client::update` only refreshes the SIEVE `visited` bit via
+  a plain `hot_.lookup` ([hiom.hpp:515-546](../include/viper/hiom/hiom.hpp#L515-L546)).
+  This is the write-amplification cut of d613cf9: the old path did
+  `upsert_pinned` + `push_commit` + a redundant ColdTier re-write of the
+  *same* `(fp64, offset)`.
+- **Update, variable-size value (`std::string`).** Viper may relocate the value
+  to a new offset, so HiOM re-runs the full `kPut` mirror — i.e. the *insert*
+  case (§4.2): a fresh `UNPINNED → PINNED` on the new offset's slot, old PM slot
+  freed.
+- **Delete — no HotTier tombstone.** `Client::remove`
+  ([:475-513](../include/viper/hiom/hiom.hpp#L475-L513)) calls `hot_.remove`,
+  which **clears the slot to empty** (`CAS packed → 0`,
+  [hot_tier.hpp:326-346](../include/viper/hiom/hot_tier.hpp#L326-L346)) — it does
+  *not* transition the state machine, and the `kRemove` commit entry carries an
+  invalid `hot_slot`, so it drives no PINNED handoff. The authoritative tombstone
+  is written by the flusher into **ColdTier** as `kTombstoneOffset` (the `fp64`
+  is retained so a later re-insert finds the slot via match-and-update, while
+  `lookup` returns `nullopt` on the tombstone,
+  [cold_tier.hpp:426-448](../include/viper/hiom/cold_tier.hpp#L426-L448)).
+  Crucially, the removed key is invisible **immediately**, before the `kRemove`
+  drains: Viper sets the VPage `free_slots` bit synchronously, so any read that
+  still finds a stale HotTier or ColdTier offset self-invalidates against the
+  freed PM slot (I1, §4.2 *Delete*). The `kRemove` is pushed through the buffer
+  (not applied to ColdTier directly) so it serializes after any still-buffered
+  `kPut` for the same key via the `(fp64, seq)` order (I5).
 
 ---
 
@@ -2249,25 +3096,29 @@ acknowledged cost. Each axis has a baseline HiOM beats:
 | **E1** DRAM vs N | C1 | index DRAM (MB) vs dataset size | HiOM flat 272 MB; Viper / Halo / DRAM-CCEH grow |
 | **E2** iso-DRAM reads | C2 | read tput / hit-rate vs **DRAM budget** | HiOM usable under tight budget; DRAM-index camp OOMs, PM camp slower |
 | **E3** recovery | C3 | open time vs N / tail size | O(tail) vs O(N); already 25× vs Viper, ≈736 K crossover |
-| **E4** write / scale | limitation | YCSB-A/B tput vs threads | YCSB-B (read-mostly) ≈ Viper (0.92–1.05×); YCSB-A (write-heavy) 0.46–0.74×; a documented cost, not hidden |
+| **E4** write / scale | limitation | YCSB-A/B tput vs threads | YCSB-B (read-mostly) ≈ Viper (0.92–1.05×), ~1.2–1.4× Dash/CCEH; YCSB-A (write-heavy) 0.46–0.74× Viper **and 0.39–0.47× Dash/CCEH (they overtake)**; a documented cost, not hidden |
 
-**Measured (2026-06-07, 10 M, four-system K8/V200, dense t=1..24)** — full E2/E4
-tables in Status (2026-06-07) above. Headlines: **E2 reads** — HiOM
-matches/exceeds Viper and beats Dash > CCEH at **every** thread count (zipf t24
-46.8 vs Viper 43.2); the earlier "Dash overtakes at t=24 → scope the read win to
-low/mid concurrency" was the single contended stats `fetch_add`, fixed via
-per-Client shards and now **RETRACTED**. **E4 writes** — **YCSB-B (read-mostly)
-≈ Viper (0.92–1.05×, even edges it at zipf t8) and ~2.5× Dash/CCEH**; **YCSB-A
-(write-heavy) 0.46× (zipf t24) – 0.74× (uniform t24) Viper** — up from the old
-0.27–0.34× after the update in-place skip-commit + rising-edge wake fix — still
-~5× Dash/CCEH but with a fixture caveat (the Dash/CCEH value store is per-op
-transaction-bound, not pure-index — do not claim a clean write win over Dash).
-E1/E3 unchanged (white-box DRAM / `hiom_recovery_bm`).
+**Measured (2026-06-07 + 2026-06-11, 10 M, four-system K8/V200, dense t=1..24)** —
+full E2/E4 tables in Status (2026-06-07) above (Dash/CCEH refreshed 2026-06-11
+under the unified PM value slab). Headlines: **E2 reads** — HiOM matches/exceeds
+Viper and **beats CCEH ≈ Dash by ~1.5×** at **every** thread count (zipf t24 46.8
+vs Viper 43.2, Dash 31.4, CCEH 31.8); the earlier "Dash overtakes at t=24 → scope
+the read win to low/mid concurrency" was the single contended stats `fetch_add`,
+fixed via per-Client shards and now **RETRACTED**. **E4 writes** — **YCSB-B
+(read-mostly) ≈ Viper (0.92–1.05×, even edges it at zipf t8) and ~1.2–1.4×
+Dash/CCEH**; **YCSB-A (write-heavy) 0.46× (zipf t24) – 0.74× (uniform t24) Viper**
+— up from the old 0.27–0.34× after the update in-place skip-commit + rising-edge
+wake fix. **Once the value-store artifact is removed (2026-06-11 slab), Dash/CCEH
+overtake HiOM on write-heavy** (a_zipf t24 HiOM 11.7 vs Dash 24.9 / CCEH 30.0 —
+HiOM 0.39–0.47×); the old "~5× Dash/CCEH" was the per-op-transaction artifact and
+is **retracted**. E4 is now a clean "HiOM write < Viper *and* < Dash/CCEH, a
+documented design cost," with no fixture caveat. E1/E3 unchanged (white-box DRAM /
+`hiom_recovery_bm`).
 Scoped (2026-06-08, thesis): baseline set frozen to **Viper + Dash + CCEH
 (+ HiOM)**; **Halo optional** (the one DRAM+recovery opponent worth a time-boxed
 build, cite-acceptable otherwise). (Four-system `lat` — DONE
-2026-06-08, see Status (2026-06-08): read latency ≈ Viper / ≪ Dash-CCEH,
-write t=24 tail inflation mirrors YCSB-A.) Dash/CCEH
+2026-06-08, Dash/CCEH refreshed 2026-06-11: read latency HiOM ≈ Viper ≈ CCEH
+(DRAM-indexed) ≪ Dash (PM-resident); write t=24 tail inflation mirrors YCSB-A.) Dash/CCEH
 vs-N scaling deliberately scoped out (vs-N value is on the DRAM axis, covered by
 E1; throughput is near-flat in N — a single 10 M point suffices as the
 PM-resident read control).
