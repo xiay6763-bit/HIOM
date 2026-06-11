@@ -2,6 +2,7 @@
 
 #include "viper/cceh.hpp"
 #include "common_fixture.hpp"
+#include "pmem_value_slab.hpp"
 #include "../benchmark.hpp"
 #include <libpmemobj++/allocator.hpp>
 #include <libpmemobj++/transaction.hpp>
@@ -13,11 +14,6 @@ namespace viper::kv_bm {
 template <typename KeyT = KeyType8, typename ValueT = ValueType8>
 class CcehFixture : public BaseFixture {
     using Entry = std::pair<KeyT, ValueT>;
-    using EntryVector = pmem::obj::vector<pmem::obj::persistent_ptr<Entry>>;
-
-    struct CcehPool {
-        pmem::obj::persistent_ptr<EntryVector> ptrs;
-    };
 
   public:
     void InitMap(const uint64_t num_prefill_inserts, const bool re_init) final;
@@ -41,9 +37,7 @@ class CcehFixture : public BaseFixture {
 
   protected:
     std::unique_ptr<cceh::CCEH<KeyT>> dram_map_;
-    pmem::obj::pool<CcehPool> pmem_pool_;
-    EntryVector* ptrs_;
-    std::atomic<size_t> pool_vector_pos_;
+    PmemValueSlab<Entry> slab_;
     std::string pmem_pool_name_;
     bool map_initialized_ = false;
 
@@ -59,20 +53,12 @@ void CcehFixture<KeyT, ValueT>::InitMap(const uint64_t num_prefill_inserts, cons
     pmem_pool_name_ = random_file(DB_PMEM_DIR);
     int sds_write_value = 0;
     pmemobj_ctl_set(NULL, "sds.at_create", &sds_write_value);
-    // Value store (Entry=(key,value) in a PM vector; DRAM CCEH holds offsets).
-    // 24 GiB ~= tens of millions K8/V200; was 80 GiB (100M-paper over-provision,
-    // unsafe on shared /pmem0 which FS-DAX fully allocates on create).
-    pmem_pool_ = pmem::obj::pool<CcehPool>::create(pmem_pool_name_, "", 24ul * ONE_GB, S_IRWXU);
-    if (pmem_pool_.handle() == nullptr) {
-        throw std::runtime_error("Could not create pool");
-    }
-    pmem::obj::transaction::run(pmem_pool_, [&] {
-        pmem_pool_.root()->ptrs = pmem::obj::make_persistent<EntryVector>();
-        ptrs_ = pmem_pool_.root()->ptrs.get();
-        ptrs_->resize(num_prefill_inserts * 2);
-    });
-
-    pool_vector_pos_ = 0;
+    // Value store: a pre-allocated PM slab written with clwb+sfence (no per-op
+    // PMDK transaction) — the SAME value-store discipline as Viper's VPage, so
+    // E2/E4 measure the index, not the value allocator (see pmem_value_slab.hpp).
+    // The DRAM CCEH holds the slab slot index in KeyValueOffset::block_number.
+    // 24 GiB ~= tens of millions K8/V200; FS-DAX fully allocates on create.
+    slab_.create(pmem_pool_name_, 24ul * ONE_GB);
     // Match Viper's CCEH init capacity (ViperConfig::cceh_init_cap = 131072 =
     // 2^17 segments x 16 KiB ~= 2 GiB) so DRAM-CCEH is a fair DRAM-index peer to
     // Viper, not an over-provisioned 2^19 (~8 GiB) outlier. The ctor arg is
@@ -85,22 +71,17 @@ void CcehFixture<KeyT, ValueT>::InitMap(const uint64_t num_prefill_inserts, cons
 
 template <typename KeyT, typename ValueT>
 void CcehFixture<KeyT, ValueT>::DeInitMap() {
-    pmem_pool_.close();
-    pmempool_rm(pmem_pool_name_.c_str(), 0);
+    slab_.destroy();
     dram_map_ = nullptr;
     map_initialized_ = false;
 }
 
 template <typename KeyT, typename ValueT>
 inline bool CcehFixture<KeyT, ValueT>::insert_internal(const KeyT& key, const ValueT& value) {
-    block_size_t ptrs_pos;
-    pmem::obj::persistent_ptr<Entry> offset_ptr;
-    pmem::obj::transaction::run(pmem_pool_, [&] {
-        offset_ptr = pmem::obj::make_persistent<Entry>(key, value);
-        ptrs_pos = pool_vector_pos_.fetch_add(1);
-        (*ptrs_)[ptrs_pos] = offset_ptr;
-    });
-    KeyValueOffset offset{ptrs_pos, 0, 0};
+    // Append the value into the pre-allocated PM slab (clwb+sfence, no PMDK
+    // transaction), then index its slot. Matches Viper's VPage value store.
+    const block_size_t slot = static_cast<block_size_t>(slab_.put(Entry{key, value}));
+    KeyValueOffset offset{slot, 0, 0};
     KeyValueOffset old_offset = dram_map_->Insert(key, offset);
     return old_offset.is_tombstone();
 }
@@ -142,7 +123,7 @@ uint64_t CcehFixture<KeyT, ValueT>::setup_and_find(uint64_t start_idx, uint64_t 
 
     auto key_check_fn = [this](const KeyT& key, IndexV offset) {
         block_size_t entry_ptr_pos = offset.block_number;
-        const pmem::obj::persistent_ptr<Entry>& entry_ptr = (*ptrs_)[entry_ptr_pos];
+        Entry* entry_ptr = slab_.at(entry_ptr_pos);
         return key == entry_ptr->first;
     };
 
@@ -152,7 +133,7 @@ uint64_t CcehFixture<KeyT, ValueT>::setup_and_find(uint64_t start_idx, uint64_t 
         const KeyValueOffset offset = dram_map_->Get(key, key_check_fn);
         if (!offset.is_tombstone()) {
             block_size_t entry_ptr_pos = offset.block_number;
-            pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
+            Entry* entry_ptr = slab_.at(entry_ptr_pos);
             ValueT found_val = entry_ptr->second;
             found_counter += (found_val.data[0] == key);
         }
@@ -168,7 +149,7 @@ uint64_t CcehFixture<std::string, std::string>::setup_and_find(uint64_t start_id
 
     auto key_check_fn = [this](const std::string& key, IndexV offset) {
         block_size_t entry_ptr_pos = offset.block_number;
-        pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
+        Entry* entry_ptr = slab_.at(entry_ptr_pos);
         return key == entry_ptr->first;
     };
 
@@ -183,7 +164,7 @@ uint64_t CcehFixture<std::string, std::string>::setup_and_find(uint64_t start_id
         const KeyValueOffset offset = dram_map_->Get(db_key, key_check_fn);
         if (!offset.is_tombstone()) {
             block_size_t entry_ptr_pos = offset.block_number;
-            pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
+            Entry* entry_ptr = slab_.at(entry_ptr_pos);
             found_counter += (entry_ptr->second == value);
         }
     }
@@ -198,7 +179,7 @@ uint64_t CcehFixture<KeyT, ValueT>::setup_and_update(uint64_t start_idx, uint64_
 
     auto key_check_fn = [this](const KeyT& key, IndexV offset) {
         block_size_t entry_ptr_pos = offset.block_number;
-        pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
+        Entry* entry_ptr = slab_.at(entry_ptr_pos);
         return key == entry_ptr->first;
     };
 
@@ -209,7 +190,7 @@ uint64_t CcehFixture<KeyT, ValueT>::setup_and_update(uint64_t start_idx, uint64_
         const KeyValueOffset offset = dram_map_->Get(db_key, key_check_fn);
         if (!offset.is_tombstone()) {
             block_size_t entry_ptr_pos = offset.block_number;
-            pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
+            Entry* entry_ptr = slab_.at(entry_ptr_pos);
             ValueT& value = entry_ptr->second;
             value.update_value();
             pmem_persist(&value, sizeof(uint64_t));
@@ -230,7 +211,7 @@ uint64_t CcehFixture<KeyT, ValueT>::setup_and_delete(uint64_t start_idx, uint64_
 
     auto key_check_fn = [this](const KeyT& key, IndexV offset) {
         block_size_t entry_ptr_pos = offset.block_number;
-        const pmem::obj::persistent_ptr<Entry>& entry_ptr = (*ptrs_)[entry_ptr_pos];
+        Entry* entry_ptr = slab_.at(entry_ptr_pos);
         return !!entry_ptr && key == entry_ptr->first;
     };
 
@@ -240,12 +221,9 @@ uint64_t CcehFixture<KeyT, ValueT>::setup_and_delete(uint64_t start_idx, uint64_
         const KeyT db_key{key};
         const KeyValueOffset offset = dram_map_->Get(db_key, key_check_fn);
         if (!offset.is_tombstone()) {
-            block_size_t entry_ptr_pos = offset.block_number;
-            pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
-            pmem::obj::transaction::run(pmem_pool_, [&] {
-                pmem::obj::delete_persistent<Entry>(entry_ptr);
-            });
-            (*ptrs_)[entry_ptr_pos] = pmem::obj::persistent_ptr<Entry>();
+            // Value-store artifact fix: no per-op transaction; leave the slab
+            // slot in place (Viper does not reclaim on delete by default) and
+            // only tombstone the index entry.
             dram_map_->Insert(key, IndexV::NONE(), key_check_fn);
             delete_counter++;
         }
@@ -284,7 +262,7 @@ uint64_t CcehFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
                 const KeyValueOffset offset = dram_map_->Get(record.key);
                 if (!offset.is_tombstone()) {
                     block_size_t entry_ptr_pos = offset.block_number;
-                    pmem::obj::persistent_ptr<Entry> entry_ptr = (*ptrs_)[entry_ptr_pos];
+                    Entry* entry_ptr = slab_.at(entry_ptr_pos);
                     // YCSB READ records carry no value, so the previous
                     // `== record.value` check was always false → found=0.
                     // Match Viper/Dash run_ycsb: a hit is a non-tombstone
@@ -294,8 +272,15 @@ uint64_t CcehFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
                 break;
             }
             case ycsb::Record::Op::UPDATE: {
-                insert_internal(record.key, record.value);
-                op_count++;
+                // In-place update (matches Viper): find the slot, mutate the
+                // value, persist 8 B — no re-alloc/re-index/transaction.
+                const KeyValueOffset offset = dram_map_->Get(record.key);
+                if (!offset.is_tombstone()) {
+                    Entry* entry = slab_.at(offset.block_number);
+                    entry->second.data[0] = record.value.data[0];
+                    viper::internal::pmem_persist(&entry->second, sizeof(uint64_t));
+                    op_count++;
+                }
                 break;
             }
             default: {
@@ -317,7 +302,6 @@ uint64_t CcehFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
 
 template <typename KeyT, typename ValueT>
 void CcehFixture<KeyT, ValueT>::prefill_ycsb(const std::vector<ycsb::Record>& data) {
-    ptrs_->resize(data.size() * 2);
     BaseFixture::prefill_ycsb(data);
 }
 

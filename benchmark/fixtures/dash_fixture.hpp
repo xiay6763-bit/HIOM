@@ -2,6 +2,7 @@
 
 #include "ex_finger.h"
 #include "common_fixture.hpp"
+#include "pmem_value_slab.hpp"
 #include "../benchmark.hpp"
 #include <libpmemobj++/allocator.hpp>
 #include <libpmemobj++/transaction.hpp>
@@ -66,6 +67,7 @@ class DashFixture : public BaseFixture {
 
   protected:
     Hash<DashKeyT>* dash_;
+    PmemValueSlab<Entry> slab_;
     pmem::obj::pool<DashPool> pmem_pool_;
     std::string dash_pool_name_;
     std::string pmem_pool_name_;
@@ -83,16 +85,13 @@ void DashFixture<KeyT, ValueT>::InitMap(const uint64_t num_prefill_inserts, cons
     pmem_pool_name_ = random_file(DB_PMEM_DIR);
     int sds_write_value = 0;
     pmemobj_ctl_set(NULL, "sds.at_create", &sds_write_value);
-    // Value store (every Entry=(key,value) is make_persistent'd here; Dash
-    // holds only offset pointers). Sized for the thesis's ~tens-of-millions
-    // range: 24 GiB ~= 50M K8/V200 at ~57% fill. Was 80 GiB for the original
-    // 100M-key Viper paper run — too large for /pmem0 (shared, ~134G free;
-    // FS-DAX fully allocates the pool on create, not sparse). Bump per-cell for
-    // a 100M run, coordinating with other /pmem0 tenants.
-    pmem_pool_ = pmem::obj::pool<DashPool>::create(pmem_pool_name_, "", 24ul * ONE_GB, S_IRWXU);
-    if (pmem_pool_.handle() == nullptr) {
-        throw std::runtime_error("Could not create pool");
-    }
+    // Value store: a pre-allocated PM slab written with clwb+sfence (no per-op
+    // PMDK transaction) — the SAME value-store discipline as Viper's VPage, so
+    // E2/E4 measure the index, not the value allocator (see pmem_value_slab.hpp).
+    // Dash's index holds a stable pointer into this slab. 24 GiB ~= tens of
+    // millions K8/V200; FS-DAX fully allocates on create — bump per-cell for a
+    // 100M run, coordinating with other /pmem0 tenants.
+    slab_.create(pmem_pool_name_, 24ul * ONE_GB);
 
     size_t segment_number = 64;
     dash_pool_name_ = random_file(DB_PMEM_DIR);
@@ -108,8 +107,7 @@ void DashFixture<KeyT, ValueT>::InitMap(const uint64_t num_prefill_inserts, cons
 
 template <typename KeyT, typename ValueT>
 void DashFixture<KeyT, ValueT>::DeInitMap() {
-    pmem_pool_.close();
-    pmempool_rm(pmem_pool_name_.c_str(), 0);
+    slab_.destroy();
     pmemobj_close(Allocator::Get()->pm_pool_);
     std::filesystem::remove(dash_pool_name_);
     dash_ = nullptr;
@@ -118,21 +116,18 @@ void DashFixture<KeyT, ValueT>::DeInitMap() {
 
 template <typename KeyT, typename ValueT>
 inline bool DashFixture<KeyT, ValueT>::insert_internal(const KeyT& key, const ValueT& value) {
-    pmem::obj::persistent_ptr<Entry> offset_ptr;
-    pmem::obj::transaction::run(pmem_pool_, [&] {
-        if constexpr (sizeof(KeyT) == 8) {
-            offset_ptr = pmem::obj::make_persistent<Entry>(key, value);
-        } else {
-            string_key str_k{};
-            str_k.length = sizeof(KeyT);
-            DashVarKeyT var_key{ .str_k = str_k, .key = key };
-            offset_ptr = pmem::obj::make_persistent<Entry>(var_key, value);
-        }
-    });
+    // Value-store artifact fix: append into the pre-allocated PM slab with a
+    // single clwb+sfence (no PMDK transaction), exactly as Viper writes a VPage
+    // entry. The index stores a stable pointer into the slab.
     if constexpr (sizeof(KeyT) == 8) {
-        return dash_->Insert(key, (char *)offset_ptr.get()) == 0;
+        const std::uint64_t slot = slab_.put(Entry{key, value});
+        return dash_->Insert(key, (char*)slab_.at(slot)) == 0;
     } else {
-        return dash_->Insert(&(offset_ptr->first.str_k), (char *)offset_ptr.get()) == 0;
+        string_key str_k{};
+        str_k.length = sizeof(KeyT);
+        DashVarKeyT var_key{ .str_k = str_k, .key = key };
+        const std::uint64_t slot = slab_.put(Entry{var_key, value});
+        return dash_->Insert(&(slab_.at(slot)->first.str_k), (char*)slab_.at(slot)) == 0;
     }
 }
 
@@ -143,14 +138,10 @@ inline bool DashFixture<KeyType8, ValueType8>::insert_internal(const KeyType8& k
 
 template <>
 inline bool DashFixture<std::string, std::string>::insert_internal(const std::string& key, const std::string& value) {
-    pmem::obj::persistent_ptr<Entry> offset_ptr;
     DashVarValue p_val;
     p_val.from_string(value);
-    pmem::obj::transaction::run(pmem_pool_, [&] {
-        offset_ptr = pmem::obj::make_persistent<Entry>(DashVarKeyT::from_string(key), p_val);
-    });
-
-    return dash_->Insert(&(offset_ptr->first.str_k), (char *)offset_ptr.get()) == 0;
+    const std::uint64_t slot = slab_.put(Entry{DashVarKeyT::from_string(key), p_val});
+    return dash_->Insert(&(slab_.at(slot)->first.str_k), (char *)slab_.at(slot)) == 0;
 }
 
 
@@ -262,10 +253,12 @@ uint64_t DashFixture<KeyT, ValueT>::setup_and_update(uint64_t start_idx, uint64_
 
         const bool found = val != NONE;
         if (found) {
+            // In-place update (matches Viper): mutate the value in its slab slot
+            // and persist 8 B — no re-alloc, no re-index, no PMDK transaction.
             Entry* entry = (Entry*) val;
-            ValueT value = entry->second;
-            value.update_value();
-            update_counter += !insert_internal(KeyT{key}, value);
+            entry->second.update_value();
+            viper::internal::pmem_persist(&entry->second, sizeof(uint64_t));
+            update_counter++;
         }
     }
     return update_counter;
@@ -296,10 +289,10 @@ uint64_t DashFixture<KeyT, ValueT>::setup_and_delete(uint64_t start_idx, uint64_
             continue;
         }
 
-        Entry* entry = (Entry*) val;
-        pmem::obj::transaction::run(pmem_pool_, [&] {
-            pmem::obj::delete_persistent<Entry>(entry);
-        });
+        // Value-store artifact fix: no per-op transaction. The slab slot is
+        // left in place (Viper likewise does not reclaim on delete by default);
+        // only the index entry is removed.
+        (void) val;
         if constexpr (sizeof(KeyT) == 8) {
             dash_->Delete(key);
         } else {
@@ -355,10 +348,11 @@ uint64_t DashFixture<KeyType8, ValueType200>::run_ycsb(uint64_t start_idx,
                 const char* val = dash_->Get(record.key);
                 const bool found = val != NONE;
                 if (found) {
+                    // In-place update (matches Viper): mutate the value in its
+                    // slab slot and persist 8 B — no re-alloc/re-index/txn.
                     Entry* entry = (Entry*) val;
-                    ValueType200 value = entry->second;
-                    value.update_value();
-                    insert_internal(record.key, value);
+                    entry->second.data[0] = record.value.data[0];
+                    viper::internal::pmem_persist(&entry->second, sizeof(uint64_t));
                     op_count++;
                 }
                 break;
