@@ -16,6 +16,42 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
 
 ---
 
+## Status (2026-06-12)
+
+- **E2 iso-DRAM / OOM figure — DONE (closes the "C1 OOM/iso-DRAM growth figure"
+  item from the 2026-06-11 priority #3–#5 list).** The §7.4 **E2** row ("iso-DRAM
+  reads") finally has its four-system Pareto figure:
+  [iso_dram_plot.py](../eval/iso_dram_plot.py) → **`eval/charts/iso_dram.pdf`**,
+  a 1×2 panel over a shared **log DRAM-budget x-axis** — (a) HotTier hit rate vs
+  DRAM budget (thread-independent) and (b) read throughput vs DRAM budget (t=1).
+  **Pure plotting, no new benchmark run**: it composes already-landed data —
+  HiOM's 6-point capacity curve from `results/hot_scan/summary.csv` (the C2
+  ablation), the Viper/CCEH/Dash **t=1** read points from
+  `results/thread_scaling/*_100r_*_10M_tp.json`, and the white-box index-DRAM
+  constants from [footprint_plot.py](../eval/footprint_plot.py) (Viper/CCEH 2052,
+  Dash ~2 MB).
+  - **Makes the C2 Pareto literal.** A shaded *infeasible* region covers DRAM
+    budgets `< 2052 MB`: across that whole interval the DRAM-index camp
+    (Viper/CCEH) cannot run — their CCEH directory is eager-preallocated to
+    ~2052 MB @10M — Dash runs at any budget (index in PM, DRAM ~0) but sits flat
+    and slow (~1.5 M/s, t=1), and **only HiOM is both feasible and fast**: its
+    entire curve lives inside the shaded region, reaching **0.9996 hit / 2.99 M/s
+    zipf at 272 MB (= 1/8 of Viper's 2052 MB)**. Viper/CCEH appear only at the
+    2052 MB right edge (their minimum feasible DRAM).
+  - **Honest boundaries (written into the figure caption + docstring, per the
+    doc's verified/derived nicety):** the infeasible region is **analytical**
+    (derived from the white-box index-DRAM floor), *not* a measured OOM crash;
+    the throughput panel is **t=1** because small HotTier capacities livelock in
+    the read path at t>1 (§Win condition limitation), while the **hit-rate panel
+    is thread-independent**, so (a) is fully general. Colours/markers reuse
+    [thread_scaling_plot.py](../eval/thread_scaling_plot.py) (same paper, same
+    systems: Viper `#1f77b4` / HiOM `#d62728` / Dash `#2ca02c` / CCEH `#9467bd`).
+  - **Remaining (priority #3–#5) now narrows to: Halo + PM-mode CCEH baselines;
+    SIEVE-vs-LRU eviction ablation; the `a_zipf-33M` livelock fix** — all
+    optional / limitation items; nothing blocking.
+
+---
+
 ## Status (2026-06-11)
 
 - **§4 Invariants and Correctness — WRITTEN.** The system + experiments were done but
@@ -63,8 +99,8 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   B-tree), and region-parallel load. The obsolete "§3–§6 (TODO)" roadmap block
   was replaced by the real §3, so the design block §1–§6 is now continuous.
   **Remaining work is evaluation-validity / baselines (priorities #3–#5: run
-  Halo + PM-mode CCEH; C1 OOM/iso-DRAM growth figure + SIEVE-vs-LRU ablation;
-  livelock). Priority #2 (de-artifact Dash/CCEH fixture) is DONE — next bullet.**
+  Halo + PM-mode CCEH; SIEVE-vs-LRU ablation; the C1 OOM/iso-DRAM growth
+  figure now DONE (2026-06-12); livelock). Priority #2 (de-artifact Dash/CCEH fixture) is DONE — next bullet.**
 - **Priority #2 — Dash/CCEH value-store artifact ELIMINATED (unified PM value
   slab).** The biggest eval-credibility threat, now closed. The Dash/CCEH
   fixtures used to persist every 200 B value via a per-op
@@ -3094,7 +3130,7 @@ acknowledged cost. Each axis has a baseline HiOM beats:
 | exp | claim | metric | expected result |
 |-----|-------|--------|-----------------|
 | **E1** DRAM vs N | C1 | index DRAM (MB) vs dataset size | HiOM flat 272 MB; Viper / Halo / DRAM-CCEH grow |
-| **E2** iso-DRAM reads | C2 | read tput / hit-rate vs **DRAM budget** | HiOM usable under tight budget; DRAM-index camp OOMs, PM camp slower |
+| **E2** iso-DRAM reads | C2 | read tput / hit-rate vs **DRAM budget** | HiOM usable under tight budget; DRAM-index camp OOMs, PM camp slower — **fig `iso_dram.pdf`** (DONE 2026-06-12) |
 | **E3** recovery | C3 | open time vs N / tail size | O(tail) vs O(N); already 25× vs Viper, ≈736 K crossover |
 | **E4** write / scale | limitation | YCSB-A/B tput vs threads | YCSB-B (read-mostly) ≈ Viper (0.92–1.05×), ~1.2–1.4× Dash/CCEH; YCSB-A (write-heavy) 0.46–0.74× Viper **and 0.39–0.47× Dash/CCEH (they overtake)**; a documented cost, not hidden |
 
@@ -3114,6 +3150,13 @@ HiOM 0.39–0.47×); the old "~5× Dash/CCEH" was the per-op-transaction artifac
 is **retracted**. E4 is now a clean "HiOM write < Viper *and* < Dash/CCEH, a
 documented design cost," with no fixture caveat. E1/E3 unchanged (white-box DRAM /
 `hiom_recovery_bm`).
+**E2 iso-DRAM / OOM figure shipped (2026-06-12): `eval/charts/iso_dram.pdf`** —
+four systems on a shared log DRAM-budget axis; the shaded infeasible region
+(`<2052 MB`) shows Viper/CCEH cannot run there, Dash flat-and-slow (~1.5 M/s,
+t=1), HiOM feasible **and** fast (0.9996 hit / 2.99 M/s zipf at 272 MB = 1/8 of
+Viper's DRAM). Panel (a) hit-rate is thread-independent; panel (b) tput is t=1;
+the infeasible region is analytical (white-box index-DRAM floor, not a measured
+OOM). See Status (2026-06-12).
 Scoped (2026-06-08, thesis): baseline set frozen to **Viper + Dash + CCEH
 (+ HiOM)**; **Halo optional** (the one DRAM+recovery opponent worth a time-boxed
 build, cite-acceptable otherwise). (Four-system `lat` — DONE
