@@ -1,96 +1,96 @@
-<h1 align="center">Viper: An Efficient Hybrid PMem-DRAM Key-Value Store</h1>
-<p align="center">This repository contains the code to our <a href="https://hpi.de/fileadmin/user_upload/fachgebiete/rabl/publications/2021/viper_vldb21.pdf"> VLDB '21 paper<a/>.<p/>
+<h1 align="center">HiOM: Hierarchical Offset Map for Viper</h1>
+<p align="center">A DRAM-efficient tiered offset map for persistent-memory key-value stores.</p>
 
+HiOM is a research extension of **Viper** ([VLDB '21](https://hpi.de/fileadmin/user_upload/fachgebiete/rabl/publications/2021/viper_vldb21.pdf))
+that replaces Viper's all-DRAM CCEH offset index with a **tiered offset map**:
 
-### Using Viper
-Viper is an embedded header-only key-value store for persistent memory.
-You can download it and include it in your application without using CMake (check out the [Downloading Viper](#downloading-viper) and [Dependencies](#dependencies) sections below).
-Here is a short example of Viper's interface (this is the content of `playground.cpp`).
+- a small, **fixed-size DRAM hot tier** — 8-byte fingerprint+offset slots under SIEVE eviction;
+- an **authoritative PMem cold tier** — a 32-region linear-hashing hash table;
+- **group-commit** buffering plus torn-write-safe **A/B checkpoints**, giving **O(tail)** recovery instead of Viper's O(N) index rebuild.
 
-```cpp
-#include <iostream>
-#include "viper/viper.hpp"
+It targets **DRAM-constrained, read-heavy, recovery-sensitive** deployments and
+is framed as a **three-axis Pareto point** — index DRAM × read throughput ×
+recovery time — not an across-the-board replacement for Viper.
 
-int main(int argc, char** argv) {
-  const size_t initial_size = 1073741824;  // 1 GiB
-  auto viper_db = viper::Viper<uint64_t, uint64_t>::create("/mnt/pmem2/viper", initial_size);
-  
-  // To modify records in Viper, you need to use a Viper Client.
-  auto v_client = viper_db->get_client();
-  
-  for (uint64_t key = 0; key < 10; ++key) {
-    const uint64_t value = key + 10;
-    v_client.put(key, value);
-  }
-  
-  for (uint64_t key = 0; key < 11; ++key) {
-    uint64_t value;
-    const bool found = v_client.get(key, &value);
-    if (found) {
-      std::cout << "Record: " << key << " --> " << value << std::endl;
-    } else {
-      std::cout << "No record found for key: " << key << std::endl;
-    }
-  }
-}
+> 📐 Full design, invariants, and evaluation: **[design/HIOM.md](design/HIOM.md)**.
+
+## Results
+
+10 M records, K8/V200, Intel Optane DCPMM (FS-DAX); four-system sweep
+(HiOM / Viper / Dash / CCEH). Numbers are verified from source — see HIOM.md.
+
+| axis | HiOM | vs. baselines |
+|------|------|---------------|
+| **Index DRAM** (C1) | **272 MB**, flat in N | Viper / DRAM-CCEH ~2052 MB → **−87%** |
+| **Read throughput** (C2) | 100r zipf, t24 **46.8 Mops/s** | ≈ Viper (43.2), **~1.5× Dash / CCEH** (~31) |
+| **Recovery** (C3) | ~87 ms cold open @100M | **~25× faster** than Viper's O(N) rebuild |
+| **Write** (limitation) | YCSB-A write-heavy | 0.46–0.74× Viper, 0.39–0.47× Dash/CCEH — a documented cost, not hidden |
+
+The DRAM × read trade-off is literal: under a tight DRAM budget the all-DRAM
+index camp (Viper / CCEH) is infeasible and the PM-resident camp (Dash) is slow,
+while HiOM stays **both feasible and fast** — 0.9996 hot-tier hit rate at 272 MB,
+which is 1/8 of Viper's index DRAM. Figures:
+`eval/charts/{footprint,iso_dram,thread_scaling_*,recovery_*,hot_*}.pdf`.
+
+## Architecture
+
+HiOM is header-only, in [include/viper/hiom/](include/viper/hiom/):
+
+| file | role |
+|------|------|
+| `hiom.hpp` | orchestrator — per-thread commit buffer, background flushers, checkpoint cadence, tail-scan recovery |
+| `hot_tier.hpp` | DRAM 8-byte fingerprint+offset slots under SIEVE eviction |
+| `cold_tier.hpp` | authoritative PMem hash table (32-region linear hashing) |
+| `commit_buffer.hpp` | lock-free group-commit lanes |
+| `checkpoint.hpp` | A/B torn-write-safe checkpoint |
+| `offset_codec.hpp` | compact block/page/slot offset encoding |
+
+When attached, HiOM **owns the write-path index** and Viper's CCEH is shrunk to a
+single segment. It builds on Viper's PMem storage engine — `ViperPageBlock`s with
+`clwb + sfence` persistence ([include/viper/viper.hpp](include/viper/viper.hpp)).
+
+## Build
+
+PMDK is expected at `/usr` (`libpmem.so` in `/usr/local/lib`); the host CPU must
+support CLWB (`-mclwb`). The library is header-only; CMake + the `benchmark/` tree
+exist to reproduce the experiments.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DVIPER_BUILD_BENCHMARKS=ON -DVIPER_BUILD_PLAYGROUND=ON
+cmake --build build -j
 ```
 
-### Downloading Viper
-As Viper is header-only, you only need to download the header files and include them in your code as shown above.
-You do not need to use Viper's CMakeLists.txt.
-Just make sure you have the [dependencies](#dependencies) installed.
-Here is a common way to do include Viper using `FetchContent` in CMake.
-By default, this will fetch all dependencies.
+## Benchmarks & tests
 
-```cmake
-include(FetchContent)
+- **Recovery** (standalone stopwatch): `hiom_recovery_bm` — modes `--full` /
+  `--open-only` / `--tail-sweep[-prefill]` (recovery time + O(tail) sensitivity).
+- **Throughput / YCSB**: `all_ops_bm`, `ycsb_bm` via `HiOMFixture`. YCSB needs
+  pre-generated binary workloads — run `benchmark/generate_ycsb.sh` first.
+- **Correctness**: `hiom_integration_test` (recovery + crash injection).
+- **Plots**: `eval/*.py` → `eval/charts/` (`pip install -r eval/requirements.txt`).
 
-FetchContent_Declare(
-  viper
-  GIT_REPOSITORY https://github.com/hpides/viper.git
-)
-FetchContent_MakeAvailable(viper)
-
-# ... other CMake stuff
-
-# Link Viper to get the transitive dependencies
-target_link_libraries(your-target viper)
+```bash
+cmake --build build -j --target hiom_recovery_bm all_ops_bm ycsb_bm
+./build/benchmark/hiom_recovery_bm --full
 ```
 
-This avoids calling all the Viper CMake code, which is mainly needed for the benchmark code.
-Of course, you can also simply download the code from GitHub into a third_party directory or use your preferred method.
-Check out the CMake options for Viper at the top of [CMakeLists.txt](https://github.com/hpides/viper/blob/master/CMakeLists.txt)
-for more details on what to include and build.
+PMem artefacts live under `/pmem0/hiom*`. The benchmark sizing and
+machine-specific paths are in [benchmark/benchmark.hpp](benchmark/benchmark.hpp).
 
-  
-### Dependencies
-Viper depends on [concurrentqueue 1.0.3](https://github.com/cameron314/concurrentqueue).
-As Viper is header-only, you should make sure that this dependency is available.
-Check out the CMake options for Viper at the top of the [CMakeLists.txt](https://github.com/hpides/viper/blob/master/CMakeLists.txt)
-for more details.
-Check out Viper's [CMakeLists.txt](https://github.com/hpides/viper/blob/c5a3707001dac131421f98a36ebf4f5309b19e35/CMakeLists.txt#L28-L36) to see an example of how to add `concurrentqueue` as a dependency.
-You can find the licenses of the dependencies in the [LICENSE file](https://github.com/hpides/viper/blob/master/LICENSE).
+## Built on Viper
 
-### Building the Benchmarks
-First off, if you want to compare your system's performance against Viper, it's probably best to include Viper in your 
-benchmark framework instead of relying on this one.
+HiOM extends **Viper: An Efficient Hybrid PMem-DRAM Key-Value Store** — Lawrence
+Benson, Hendrik Makait, Tilmann Rabl (VLDB '21;
+[paper](https://hpi.de/fileadmin/user_upload/fachgebiete/rabl/publications/2021/viper_vldb21.pdf),
+[original repository](https://github.com/hpides/viper)). Viper provides the
+header-only PMem-DRAM storage engine; HiOM swaps its offset index for the tiered
+hot/cold design above. Viper's own header-only embedding and the `playground.cpp`
+example are unchanged — see the original repository for that usage path.
 
-To build the benchmarks, you need to use pass:
-```
--DVIPER_BUILD_BENCHMARKS=ON -DVIPER_PMDK_PATH=/path/to/pmdk -DLIBPMEMOBJ++_PATH=/path/to/libpmemobj++
-```
-  
-CMake should download and build all dependencies automatically.
-You can then run the individual benchmarks (executables with `_bm` suffix) in the `benchmark` directory.
+## Citing
 
-**NOTE**: not all benchmarks will complete by default, due to things such as out-of-memory errors.
-These problems are in some third party systems that I could not fix.
-You might need to play around with them for a bit and remove certain runs/configurations and run them manually bit-by-bit.
-You will also need to specify some benchmark info in the `benchmark.hpp`, such as the data directories and CPU-affinity.
-
-
-### Cite Our Work
-If you use Viper in your work, please cite us.
+This is a research prototype; if you use it, please cite the underlying Viper paper:
 
 ```bibtex
 @article{benson_viper_2021,
@@ -104,3 +104,10 @@ If you use Viper in your work, please cite us.
   doi       = {10.14778/3461535.3461543}
 }
 ```
+
+## License
+
+MIT — © 2021 HPI Data Engineering Systems (for the Viper base). See
+[LICENSE](LICENSE), which also carries the dependency licenses: **CCEH** (free
+non-commercial research / educational / evaluation use, © Sungkyunkwan
+University) and **concurrentqueue** (BSD, © Cameron Desrochers).
