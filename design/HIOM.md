@@ -49,6 +49,27 @@ in `≈` are derived/projected; numbers without `≈` are verified from source
   - **Remaining (priority #3–#5) now narrows to: Halo + PM-mode CCEH baselines;
     SIEVE-vs-LRU eviction ablation; the `a_zipf-33M` livelock fix** — all
     optional / limitation items; nothing blocking.
+- **Doc-hygiene pass before paper-writing — DONE (2026-06-12).** Swept the design
+  prose for descriptions that lagged the shipped code (the "C-class" audit) and
+  aligned §2 to §4/§6: **(1)** §2.7 + §2.8 concurrency no longer claim
+  **EBR / epoch-reclaimer** — readers do a plain acquire-load + PM key-verify (no
+  EBR; analysed-and-not-implemented, M4 Phase D); **(2)** §2.3 HotTier default
+  corrected from the stale "25 % DRAM / 8 GB" to the actual eval config (`2²¹`
+  buckets × 16 slots ≈ 256 MB HotTier / 272 MB index DRAM, the E1 number);
+  **(3)** §A.5 + the §6 framing no longer say delete marks a "DRAM hot-tier
+  TOMBSTONE" (it clears the HotTier slot; the tombstone is ColdTier-side);
+  **(4)** §7.0's stale "§3–§6 design detail still TODO" removed (they were
+  written 2026-06-11); **(5)** roadmap M3 follow-up #3 (`commit_seq_` / lanes)
+  marked landed (8-lane buffer + per-Client local seq, §5.2); SIEVE/S3-FIFO
+  citations **web-verified 2026-06-12** (SIEVE = Zhang et al. NSDI '24; S3-FIFO =
+  Yang et al. SOSP '23) and the §2.4 first-author attribution fixed — it had read
+  "Yang et al." for SIEVE, whose lead author is Zhang.
+  No code or numbers changed — prose-vs-shipped-code consistency only. **Chart
+  follow-up DONE (2026-06-12)**: the last 4 PNGs (`hot_capacity_*`, `recovery_*`)
+  regenerated as vector PDF (the two plot scripts' `savefig` suffix flipped) and
+  the orphan PNGs removed — all 13 `eval/charts/` figures are now PDF. Re-plotted
+  numbers match the record (readheavy 0.90×/0.73×; recovery 2.9× / 180× margin),
+  a format-only change.
 
 ---
 
@@ -2155,13 +2176,16 @@ Rationale for static (vs. dynamic):
 - **Avoids tier-resize correctness**: a dynamic tier would interleave with
   ongoing flushes and pin states, drastically complicating the protocol.
 
-Default: **25% of available DRAM** (e.g., 32 GB DRAM → 8 GB hot tier →
-~890M entries at 9 B/entry). §6 includes a sensitivity sweep varying
-capacity from 1 GB to 16 GB.
+Default (the evaluation config, `HIOMFixture`): **2²¹ buckets × 16 slots ≈
+33.5 M entry slots**, a fixed **≈256 MB** HotTier (272 MB total index DRAM
+incl. the ColdTier control struct + the single residual CCEH segment — the
+E1/C1 number), **constant in N**. The capacity ablation (§Status 2026-06-05)
+sweeps `HIOM_HOT_BUCKETS_LOG2 ∈ [16, 21]` — ≈ a few MB up to 256 MB, i.e.
+10 %–330 % of the 10 M working set.
 
 ## 2.4 Eviction: SIEVE
 
-Hot-tier entries are evicted using SIEVE [Yang et al., NSDI '24], a
+Hot-tier entries are evicted using SIEVE [Zhang et al., NSDI '24], a
 lazy-promotion FIFO variant with O(1) update cost and consistently better
 hit rate than CLOCK or LRU on production traces.
 
@@ -2181,8 +2205,10 @@ rates, but SIEVE needs only 1 bit per entry vs. S3-FIFO's two-queue +
 ghost-set metadata. HiOM's compact-encoding constraint makes SIEVE the
 right pick.
 
-> **NOTE**: SIEVE venue/year needs verification before submission. May be
-> SOSP '23 or NSDI '24 — confirm via Google Scholar before citing.
+> **Citation (web-verified 2026-06-12)**: SIEVE = Zhang et al., *NSDI '24*
+> (USENIX, Community Award Winner); S3-FIFO = Yang et al., *SOSP '23*
+> (DOI 10.1145/3600006.3613147). Same research group, distinct papers — note the
+> first authors differ (Zhang leads SIEVE, Yang leads S3-FIFO).
 
 ## 2.5 Lookup path
 
@@ -2242,10 +2268,14 @@ with the same pattern as CCEH's `Insert`
 ([cceh.hpp:386-415](../include/viper/cceh.hpp#L386-L415)) — no per-bucket
 mutex, lock-free probe.
 
-Concurrent reader protection during eviction uses **epoch-based reclamation
-(EBR)**, reusing Viper's already-fetched `epoch-reclaimer` dependency.
-Writer threads acquire an EBR epoch on entry; eviction defers slot
-reclamation until the epoch advances past all reader epochs.
+Concurrent readers need **no coordination with eviction**: a reader takes a
+plain acquire-load of the 8 B packed `(fp32, offset)` slot and **verifies the
+looked-up key against the PM record** (I1, §6.4). A slot concurrently evicted
+and re-pinned for a different key fails this PM key-verify and reads as a miss,
+so the single atomic load + PM-verify subsumes exactly what EBR would guard —
+without its machinery. (EBR was analysed and **deliberately not implemented**,
+M4 Phase D; the fetched `epoch-reclaimer` dependency stays available as a
+future-optimization gate for a skip-verify fast path — §4.3.)
 
 ## 2.8 What changed vs. Viper's CCEH
 
@@ -2256,7 +2286,7 @@ reclamation until the epoch advances past all reader epochs.
 | Index resize | Extendible directory + segment splits | Fixed capacity |
 | Eviction | None (full retention) | SIEVE |
 | State per entry | None | EMPTY/UNPINNED/PINNED/IN_FLUSH (2 bits) |
-| Concurrency primitive | Segment-level `sema` counter | Per-slot CAS + EBR |
+| Concurrency primitive | Segment-level `sema` counter | Per-slot CAS + PM-verify (no EBR) |
 
 ## 2.9 Failure-mode analysis
 
@@ -2908,8 +2938,9 @@ is the sole index-recovery path.
 *(Written 2026-06-11 from the shipped code. Specifies the per-HotTier-slot
 2-bit state machine the §5 flusher drives, the lock-free concurrency on it, its
 coupling to SIEVE eviction, and the update/delete semantics. **Corrects an
-earlier doc inaccuracy**: §2.9 / §A.5 describe delete as marking a "DRAM
-hot-tier TOMBSTONE", but the shipped HotTier has no tombstone state — remove
+earlier doc inaccuracy** (now fixed in §2.9 / §A.5): earlier drafts described
+delete as marking a "DRAM hot-tier TOMBSTONE", but the shipped HotTier has no
+tombstone state — remove
 clears the slot to empty; the authoritative tombstone lives in ColdTier as
 `kTombstoneOffset`. §6.5 states the actual semantics.)*
 
@@ -3039,7 +3070,7 @@ durable — are never dropped.
 # §7 Evaluation Plan
 
 *(Baseline strategy finalized 2026-06-06 from a literature sweep on
-open-source, Optane-runnable PM hash indexes. §3–§6 design detail still TODO.)*
+open-source, Optane-runnable PM hash indexes. §3–§6 design detail written 2026-06-11.)*
 
 ## 7.1 Platform & harness
 
@@ -3414,19 +3445,16 @@ unchanged.
    VPage slot leak. Tests: `run_p0_skip_counter_sanity` +
    `run_p0_update_heavy_multi_thread`. See the M3 follow-up #2
    "Attempt C" entry in Status for the full write-up.
-3. **Per-thread commit-buffer lanes + retire `commit_seq_`** (still
-   open after P0 + winner-picker rework). With CCEH out of the
-   write path *and* the apply_batch winner picker no longer
-   depending on `seq` for correctness (HotTier-truth fast path
-   landed 2026-05-09), the dominant thread=8 insert bottleneck
-   is now the `commit_seq_` global atomic + moodycamel mpmc
-   enqueue contention. The 2026-05-08 lanes attempt regressed
-   thread=1; revisit with `seq` reduced to a per-lane local
-   counter (apply_batch's fallback walk uses it only as
-   tiebreaker among multiple alive kPuts in the same fp64 run,
-   which only happens for cross-thread same-key races within a
-   single batch — rare, and the per-lane local counter still
-   gives intra-lane monotone ordering).
+3. **Per-thread commit-buffer lanes + retire `commit_seq_`** — ✅
+   landed (2026-05-16). The commit buffer is now `kNumLanes=8`
+   cache-line-isolated queues with per-`(Client,lane)` producer
+   tokens (§5.2), and the global `commit_seq_` atomic is retired:
+   `seq = (client_local_seq << 16) | slot_idx` is a per-Client
+   local counter — no longer a global atomic and no longer
+   load-bearing for correctness (the HotTier-truth winner-picker,
+   §4.1-I5, is). The residual thread-8 insert gap is **PM-write-
+   bandwidth bound** (both Viper and HiOM plateau there; Status
+   2026-06-07), not `seq`/queue contention.
 4. **Inline-flush + `pin_failures` back-pressure landed in M4
    Phase B** — done.
 5. **Multi-thread shared-key stress** — M2 deferred; M4 Phase E's
@@ -3913,6 +3941,9 @@ These were not asked about in the proposal but discovered during reading:
 
 5. **Deadlock-handling in remove path** ([viper.hpp:1304-1412](../include/viper/viper.hpp#L1304-L1412))
    uses a global `deadlock_offset_lock_` + shared vector of pending offsets,
-   triggered after 32 retries on a contended page lock. HiOM remove marks
-   DRAM hot-tier `TOMBSTONE` + appends to commit buffer; the actual PM
-   bitset reset happens during the next flush, not synchronously.
+   triggered after 32 retries on a contended page lock. *(HiOM's own remove
+   does **not** use a HotTier tombstone — it clears the HotTier slot to empty
+   and pushes a `kRemove`; the authoritative tombstone is written into ColdTier
+   as `kTombstoneOffset` by the flusher, and Viper sets the VPage `free_slots`
+   bit **synchronously**, so the removed key is invisible immediately —
+   §6.6 / §4.2-Delete.)*

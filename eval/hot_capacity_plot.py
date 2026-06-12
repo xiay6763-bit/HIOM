@@ -13,8 +13,8 @@ hiom_fullcap_t8.json, viper_fullcap_t8.json}, takes ONLY the GBench `_median`
 aggregate row of `_tp` benchmarks, and emits:
   - results/hot_scan/summary.csv            (t=1 capacity curve)
   - results/hot_scan/readheavy_ratio.txt    (t=8 full-cap HiOM/Viper ratio)
-  - eval/charts/hot_capacity_hitrate.png
-  - eval/charts/hot_capacity_throughput.png
+  - eval/charts/hot_capacity_hitrate.pdf
+  - eval/charts/hot_capacity_throughput.pdf
 
 x-axis is hot_tier_index_dram_mb (HotTier index-structure DRAM, authoritative;
 NOT fixture_dram_mb which is the whole-fixture total). Hit rate is the
@@ -157,7 +157,7 @@ def main():
     plt.ylim(0, 1.02)
     plt.grid(True, alpha=0.3)
     plt.legend()
-    p1 = os.path.join(CHARTS_DIR, "hot_capacity_hitrate.png")
+    p1 = os.path.join(CHARTS_DIR, "hot_capacity_hitrate.pdf")
     plt.tight_layout()
     plt.savefig(p1, dpi=130)
     print("wrote", p1)
@@ -177,7 +177,7 @@ def main():
     plt.title("C2: read throughput vs DRAM budget (10M, t=1)")
     plt.grid(True, alpha=0.3)
     plt.legend()
-    p2 = os.path.join(CHARTS_DIR, "hot_capacity_throughput.png")
+    p2 = os.path.join(CHARTS_DIR, "hot_capacity_throughput.pdf")
     plt.tight_layout()
     plt.savefig(p2, dpi=130)
     print("wrote", p2)

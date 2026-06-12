@@ -4,8 +4,8 @@
 Reads results/recovery/tail_sweep.csv + tail_sweep_meta.json (produced by
 `hiom_recovery_bm --tail-sweep[-prefill] <N>`), takes the per-(threads, tail)
 median over reps, and emits:
-  - eval/charts/recovery_tail_scan.png    figure 1: pure O(tail), threads=1
-  - eval/charts/recovery_vs_baseline.png  figure 2: total open vs Viper, t=32
+  - eval/charts/recovery_tail_scan.pdf    figure 1: pure O(tail), threads=1
+  - eval/charts/recovery_vs_baseline.pdf  figure 2: total open vs Viper, t=32
   - results/recovery/summary.txt          slope + speedup + crossover + cadence
 
 Conventions / caveats (see design/HIOM.md):
@@ -174,7 +174,7 @@ def main():
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
-        p1 = os.path.join(CHARTS_DIR, "recovery_tail_scan.png")
+        p1 = os.path.join(CHARTS_DIR, "recovery_tail_scan.pdf")
         plt.savefig(p1, dpi=130)
         print("wrote", p1)
 
@@ -198,7 +198,7 @@ def main():
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
-        p2 = os.path.join(CHARTS_DIR, "recovery_vs_baseline.png")
+        p2 = os.path.join(CHARTS_DIR, "recovery_vs_baseline.pdf")
         plt.savefig(p2, dpi=130)
         print("wrote", p2)
 
