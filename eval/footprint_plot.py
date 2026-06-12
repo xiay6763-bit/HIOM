@@ -24,11 +24,22 @@ Data provenance (10 M records, K8/V200 = 216 B):
       Dash ~210 MB (extendible hashing; Viper paper Dash index 2.1 GB @100M /10).
       Viper/CCEH keep the index in DRAM -> 0 PMem.
 """
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-OUT = "/root/viper/eval/charts/footprint.pdf"
+# BW=1 → grayscale + hatch, written to paper/figures/ (B&W-printed journals).
+BW = os.environ.get("BW") == "1"
+OUT = "/root/viper/paper/figures/footprint.pdf" if BW else "/root/viper/eval/charts/footprint.pdf"
+if BW:
+    C_DATA, C_INDEX, C_DRAM = "0.82", "0.55", "0.15"
+    H_DATA, H_INDEX, H_DRAM = "", "//", "xx"
+    DRAM_TXT = "0.0"
+else:
+    C_DATA, C_INDEX, C_DRAM = "#cfcfcf", "#7f7f7f", "#d62728"
+    H_DATA, H_INDEX, H_DRAM = "", "", ""
+    DRAM_TXT = "#d62728"
 
 DATA_VPAGE = 2120.0      # MB  (Viper/HiOM compact VPage ~ raw, Viper-paper scaled)
 DATA_PERENTRY = 2380.0   # MB  (CCEH/Dash per-entry PMDK alloc, +~10%)
@@ -47,11 +58,11 @@ dram     = [s[1]["dram"]     / 1024 for s in SYS]
 
 fig, ax = plt.subplots(figsize=(7, 5))
 x = range(len(labels))
-ax.bar(x, pm_data,  color="#cfcfcf", label="PMem — data records")
-ax.bar(x, pm_index, bottom=pm_data, color="#7f7f7f",
+ax.bar(x, pm_data,  color=C_DATA, hatch=H_DATA, edgecolor="0.2", label="PMem — data records")
+ax.bar(x, pm_index, bottom=pm_data, color=C_INDEX, hatch=H_INDEX, edgecolor="0.2",
        label="PMem — index (HiOM ColdTier / Dash hash)")
 base2 = [a + b for a, b in zip(pm_data, pm_index)]
-ax.bar(x, dram, bottom=base2, color="#d62728",
+ax.bar(x, dram, bottom=base2, color=C_DRAM, hatch=H_DRAM, edgecolor="0.2",
        label="DRAM — index (offset map)")
 
 for i in x:
@@ -60,13 +71,17 @@ for i in x:
     ax.text(i, total + 0.06,
             (f"DRAM\n{dmb:.0f} MB" if dmb >= 10 else "DRAM\n~0"),
             ha="center", va="bottom", fontsize=9, fontweight="bold",
-            color="#d62728")
+            color=DRAM_TXT)
+
+# Headroom so the two-line DRAM labels clear the title and the legend box.
+_max_total = max(b + d for b, d in zip(base2, dram))
+ax.set_ylim(0, _max_total * 1.22)
 
 ax.set_xticks(list(x))
 ax.set_xticklabels(labels)
 ax.set_ylabel("Memory footprint (GB)")
 ax.set_title("Memory footprint @10M (K8/V200)\n"
-             "DRAM white-box measured · PMem analytical estimate")
+             "DRAM white-box measured · PMem analytical estimate", pad=12)
 ax.legend(loc="upper right", fontsize=8)
 ax.grid(axis="y", alpha=0.3)
 plt.tight_layout()

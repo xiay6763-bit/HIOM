@@ -10,8 +10,6 @@ results/
 charts/
 *.dat
 *.json
-ycsb*.pdf
-ycsb*.png
 
 # 忽略所有以 ycsb- 开头的文件夹（解压后的工具包）
 benchmark/ycsb-*/
@@ -20,3 +18,6 @@ benchmark/*.tar.gz
 
 # 本地 Claude Code 项目指南，不入库
 CLAUDE.md
+
+# 论文（本地草稿，不入库）
+paper/

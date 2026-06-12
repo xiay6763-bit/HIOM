@@ -31,7 +31,9 @@ import re
 import sys
 
 HOT_SCAN_DIR = sys.argv[1] if len(sys.argv) > 1 else "results/hot_scan"
-CHARTS_DIR = "eval/charts"
+# BW=1 → grayscale, written to paper/figures/ (B&W-printed journals).
+BW = os.environ.get("BW") == "1"
+CHARTS_DIR = "paper/figures" if BW else "eval/charts"
 
 
 def workload_of(name):
@@ -138,7 +140,12 @@ def main():
         print("matplotlib unavailable, charts skipped:", e)
         return
     os.makedirs(CHARTS_DIR, exist_ok=True)
-    colors = {"100r_uniform": "#000099", "100r_zipf": "#990000"}
+    if BW:
+        STY = {"100r_zipf":    {"color": "0.0",  "marker": "s", "ls": "-",  "mfc": "0.0"},
+               "100r_uniform": {"color": "0.45", "marker": "^", "ls": "--", "mfc": "white"}}
+    else:
+        STY = {"100r_zipf":    {"color": "#990000", "marker": "o", "ls": "-",  "mfc": "#990000"},
+               "100r_uniform": {"color": "#000099", "marker": "o", "ls": "-",  "mfc": "#000099"}}
 
     def series(wl, key):
         rs = [r for r in rows if r["workload"] == wl]
@@ -150,7 +157,9 @@ def main():
     for wl in ("100r_zipf", "100r_uniform"):
         x, y = series(wl, "hot_hit_rate")
         if x:
-            plt.plot(x, y, marker="o", color=colors[wl], label=wl)
+            s = STY[wl]
+            plt.plot(x, y, marker=s["marker"], color=s["color"], ls=s["ls"],
+                     mfc=s["mfc"], label=wl)
     plt.xlabel("HotTier index DRAM (MB)")
     plt.ylabel("cumulative read-phase hit rate")
     plt.title("C2: HotTier hit rate vs DRAM budget (10M, t=1)")
@@ -166,11 +175,12 @@ def main():
     plt.figure(figsize=(6, 4))
     for wl in ("100r_zipf", "100r_uniform"):
         x, y = series(wl, "items_per_second")
+        s = STY[wl]
         if x:
-            plt.plot(x, [v / 1e6 for v in y], marker="o", color=colors[wl],
-                     label="HiOM " + wl)
+            plt.plot(x, [v / 1e6 for v in y], marker=s["marker"], color=s["color"],
+                     ls=s["ls"], mfc=s["mfc"], label="HiOM " + wl)
         if wl in viper_t1:
-            plt.axhline(viper_t1[wl] / 1e6, color=colors[wl], ls="--", alpha=0.6,
+            plt.axhline(viper_t1[wl] / 1e6, color=s["color"], ls=":", alpha=0.6,
                         label="Viper " + wl)
     plt.xlabel("HotTier index DRAM (MB)")
     plt.ylabel("throughput (M items/s, t=1)")

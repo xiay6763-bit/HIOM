@@ -35,7 +35,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 RESULTS_DIR = "/root/viper/results/scaling"
-OUTPUT_DIR = "/root/viper/eval/charts"
+# BW=1 → grayscale, written to paper/figures/ (B&W-printed journals).
+BW = os.environ.get("BW") == "1"
+OUTPUT_DIR = "/root/viper/paper/figures" if BW else "/root/viper/eval/charts"
 MAX_SIZE_M = 33
 HOT_THREADS = 8           # representative thread axis for HotTier metrics
 HOT_CAPACITY = 33554432   # 2^21 buckets x 16 slots = 33.5 M
@@ -43,10 +45,16 @@ HOT_CAPACITY = 33554432   # 2^21 buckets x 16 slots = 33.5 M
 # HotTier behaviour is workload-dependent; the read workloads show the
 # fill-toward-capacity / graceful-degradation story cleanest (no write
 # interference). Extend this tuple to overlay YCSB-A/B if ever wanted.
-WORKLOADS = (
-    ("100r_zipf",    {"color": "#d62728", "marker": "s", "ms": 7, "label": "100r zipf"}),
-    ("100r_uniform", {"color": "#1f77b4", "marker": "o", "ms": 7, "label": "100r uniform"}),
-)
+if BW:
+    WORKLOADS = (
+        ("100r_zipf",    {"color": "0.0",  "marker": "s", "ms": 7, "ls": "-",  "mfc": "0.0",   "label": "100r zipf"}),
+        ("100r_uniform", {"color": "0.45", "marker": "^", "ms": 7, "ls": "--", "mfc": "white", "label": "100r uniform"}),
+    )
+else:
+    WORKLOADS = (
+        ("100r_zipf",    {"color": "#d62728", "marker": "s", "ms": 7, "ls": "-", "mfc": "#d62728", "label": "100r zipf"}),
+        ("100r_uniform", {"color": "#1f77b4", "marker": "o", "ms": 7, "ls": "-", "mfc": "#1f77b4", "label": "100r uniform"}),
+    )
 
 # Google Benchmark "name" like
 #   HiOMFixture<KeyType8,ValueType200>/100r_zipf_tp/iterations:1/repeats:3/real_time/threads:8_median
@@ -113,9 +121,10 @@ def plot_hot_scaling(data):
             if xs:
                 drew = True
                 ax.plot(xs, ys, color=st["color"], marker=st["marker"],
-                        ms=st["ms"], lw=2.0, label=st["label"])
+                        ms=st["ms"], ls=st.get("ls", "-"), mfc=st.get("mfc", st["color"]),
+                        lw=2.0, label=st["label"])
         if metric == "hot_size":
-            ax.axhline(HOT_CAPACITY, ls="--", color="gray", alpha=0.6,
+            ax.axhline(HOT_CAPACITY, ls=":", color="0.4", alpha=0.8,
                        label="HotTier capacity (33.5 M)")
         ax.set_title(ylabel, fontsize=12)
         ax.set_xlabel("Dataset size (M records)")

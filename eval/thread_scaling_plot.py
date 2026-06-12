@@ -50,16 +50,28 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+# BW=1 → grayscale, line-style + marker differentiated, written to paper/figures/
+# (for B&W-printed Chinese journals). Default = colour into eval/charts/.
+BW = os.environ.get("BW") == "1"
 RESULTS_DIR = "/root/viper/results/thread_scaling"
-OUTPUT_DIR = "/root/viper/eval/charts"
+OUTPUT_DIR = "/root/viper/paper/figures" if BW else "/root/viper/eval/charts"
 THREADS = (1, 2, 4, 8, 16, 24)
 FIXTURES = ("ViperFixture", "HiOMFixture", "DashFixture", "CcehFixture")
-STYLES = {
-    "ViperFixture": {"color": "#1f77b4", "marker": "o", "ms": 7, "label": "Viper"},
-    "HiOMFixture":  {"color": "#d62728", "marker": "s", "ms": 7, "label": "HiOM"},
-    "DashFixture":  {"color": "#2ca02c", "marker": "^", "ms": 7, "label": "Dash (PM-resident)"},
-    "CcehFixture":  {"color": "#9467bd", "marker": "D", "ms": 6, "label": "CCEH (DRAM-idx)"},
-}
+if BW:
+    # HiOM = hero (solid black); others by distinct shade + linestyle + marker.
+    STYLES = {
+        "ViperFixture": {"color": "0.0",  "ls": "--", "marker": "o", "ms": 7, "mfc": "white", "label": "Viper"},
+        "HiOMFixture":  {"color": "0.0",  "ls": "-",  "marker": "s", "ms": 7, "mfc": "0.0",   "label": "HiOM"},
+        "DashFixture":  {"color": "0.45", "ls": ":",  "marker": "^", "ms": 7, "mfc": "white", "label": "Dash (PM-resident)"},
+        "CcehFixture":  {"color": "0.45", "ls": "-.", "marker": "D", "ms": 6, "mfc": "0.45",  "label": "CCEH (DRAM-idx)"},
+    }
+else:
+    STYLES = {
+        "ViperFixture": {"color": "#1f77b4", "ls": "-", "marker": "o", "ms": 7, "mfc": "#1f77b4", "label": "Viper"},
+        "HiOMFixture":  {"color": "#d62728", "ls": "-", "marker": "s", "ms": 7, "mfc": "#d62728", "label": "HiOM"},
+        "DashFixture":  {"color": "#2ca02c", "ls": "-", "marker": "^", "ms": 7, "mfc": "#2ca02c", "label": "Dash (PM-resident)"},
+        "CcehFixture":  {"color": "#9467bd", "ls": "-", "marker": "D", "ms": 6, "mfc": "#9467bd", "label": "CCEH (DRAM-idx)"},
+    }
 
 # One figure per workload family.
 FAMILIES = (
@@ -150,7 +162,8 @@ def plot_family_tp(data, fam):
             if xs:
                 st = STYLES[fx]
                 ax.plot(xs, ys, color=st["color"], marker=st["marker"],
-                        ms=st["ms"], lw=2.0, label=st["label"])
+                        ms=st["ms"], mfc=st.get("mfc", st["color"]),
+                        ls=st.get("ls", "-"), lw=2.0, label=st["label"])
         ax.set_title(title, fontsize=12)
         ax.set_xlabel("Number of threads")
         ax.set_xticks(list(THREADS))
@@ -184,10 +197,12 @@ def plot_family_lat(data, fam):
                 continue
             st = STYLES[fx]
             ax.plot(xs, [pts[t]["p99"] for t in xs], color=st["color"],
-                    marker=st["marker"], ms=st["ms"], lw=2.0, label=st["label"])
+                    marker=st["marker"], ms=st["ms"], mfc=st.get("mfc", st["color"]),
+                    ls=st.get("ls", "-"), lw=2.0, label=st["label"])
             p50 = [pts[t].get("p50") for t in xs]
             if all(v is not None for v in p50):
-                ax.plot(xs, p50, color=st["color"], lw=1.3, ls="--", alpha=0.55)
+                ax.plot(xs, p50, color=st["color"], lw=1.3,
+                        ls=st.get("ls", "-"), alpha=0.45)
         ax.set_title(title, fontsize=12)
         ax.set_xlabel("Number of threads")
         ax.set_xticks(list(THREADS))

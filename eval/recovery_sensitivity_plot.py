@@ -32,7 +32,13 @@ from collections import defaultdict
 from statistics import median
 
 REC_DIR = sys.argv[1] if len(sys.argv) > 1 else "results/recovery"
-CHARTS_DIR = "eval/charts"
+# BW=1 → grayscale, written to paper/figures/ (B&W-printed journals).
+BW = os.environ.get("BW") == "1"
+CHARTS_DIR = "paper/figures" if BW else "eval/charts"
+if BW:
+    C_TAIL, C_OPEN, C_BASE, C_CROSS, C_CAD = "0.0", "0.0", "0.45", "0.3", "0.3"
+else:
+    C_TAIL, C_OPEN, C_BASE, C_CROSS, C_CAD = "#990000", "#000099", "#444444", "#cc6600", "#009900"
 
 
 def load():
@@ -163,10 +169,10 @@ def main():
     # figure 1: pure O(tail), threads=1, through origin.
     if x1:
         plt.figure(figsize=(6, 4))
-        plt.scatter(x1, y1, color="#990000", zorder=3, label="tail_scan (t=1)")
+        plt.scatter(x1, y1, color=C_TAIL, zorder=3, label="tail_scan (t=1)")
         if s1 == s1:  # not nan
             xs = np.linspace(0, max(x1), 100)
-            plt.plot(xs, s1 * xs + b1, color="#990000", ls="--", alpha=0.7,
+            plt.plot(xs, s1 * xs + b1, color=C_TAIL, ls="--", alpha=0.7,
                      label="fit: %.0f ms/M, intercept %.1f ms" % (s1 * 1e6, b1))
         plt.xlabel("tail entries replayed (measured)")
         plt.ylabel("tail-scan time (ms)")
@@ -181,16 +187,16 @@ def main():
     # figure 2: total open vs Viper baseline (t=32) + crossover + cadence.
     if x32:
         plt.figure(figsize=(6, 4))
-        plt.plot(x32, y32, marker="o", color="#000099",
+        plt.plot(x32, y32, marker="o", color=C_OPEN,
                  label="HiOM open total (t=32)")
-        plt.axhline(baseline, color="#444444", ls="--",
+        plt.axhline(baseline, color=C_BASE, ls="--",
                     label="Viper O(N) rebuild (%.0f ms)" % baseline)
         if crossover == crossover and 0 < crossover <= max(x32) * 1.5:
-            plt.axvline(crossover, color="#cc6600", ls="-.", alpha=0.8,
+            plt.axvline(crossover, color=C_CROSS, ls="-.", alpha=0.8,
                         label="crossover ≈ %.0fK entries" % (crossover / 1e3))
         cm = t32.get(cadence)
         cadence_x = cm["replayed"] if (cm and cm["replayed"] > 0) else cadence
-        plt.axvline(cadence_x, color="#009900", ls=":", alpha=0.9,
+        plt.axvline(cadence_x, color=C_CAD, ls=":", alpha=0.9,
                     label="cadence=%d worst-case tail" % cadence)
         plt.xlabel("tail entries replayed (measured)")
         plt.ylabel("total open time (ms)")

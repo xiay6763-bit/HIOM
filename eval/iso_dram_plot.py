@@ -44,7 +44,9 @@ from matplotlib.lines import Line2D
 
 HOT_SCAN = "results/hot_scan"
 TS = "results/thread_scaling"
-OUT = "eval/charts/iso_dram.pdf"
+# BW=1 → grayscale, written to paper/figures/ (B&W-printed journals).
+BW = os.environ.get("BW") == "1"
+OUT = "paper/figures/iso_dram.pdf" if BW else "eval/charts/iso_dram.pdf"
 
 # White-box index DRAM (MB) -- identical to footprint_plot.py SYS.
 DRAM_MB = {"Viper": 2052.0, "CCEH": 2052.0, "Dash": 2.0}
@@ -53,12 +55,20 @@ DRAM_MB = {"Viper": 2052.0, "CCEH": 2052.0, "Dash": 2.0}
 # this is infeasible for Viper/CCEH (analytical bound, not a measured OOM).
 DRAM_INDEX_FLOOR = 2052.0
 
-STYLE = {
-    "Viper": {"color": "#1f77b4", "marker": "o", "label": "Viper (DRAM-idx)"},
-    "HiOM":  {"color": "#d62728", "marker": "s", "label": "HiOM"},
-    "Dash":  {"color": "#2ca02c", "marker": "^", "label": "Dash (PM-resident)"},
-    "CCEH":  {"color": "#9467bd", "marker": "D", "label": "CCEH (DRAM-idx)"},
-}
+if BW:
+    STYLE = {
+        "Viper": {"color": "0.0",  "marker": "o", "label": "Viper (DRAM-idx)"},
+        "HiOM":  {"color": "0.0",  "marker": "s", "label": "HiOM"},
+        "Dash":  {"color": "0.45", "marker": "^", "label": "Dash (PM-resident)"},
+        "CCEH":  {"color": "0.45", "marker": "D", "label": "CCEH (DRAM-idx)"},
+    }
+else:
+    STYLE = {
+        "Viper": {"color": "#1f77b4", "marker": "o", "label": "Viper (DRAM-idx)"},
+        "HiOM":  {"color": "#d62728", "marker": "s", "label": "HiOM"},
+        "Dash":  {"color": "#2ca02c", "marker": "^", "label": "Dash (PM-resident)"},
+        "CCEH":  {"color": "#9467bd", "marker": "D", "label": "CCEH (DRAM-idx)"},
+    }
 WL_LS = {"zipf": "-", "uniform": "--"}           # system = colour, workload = linestyle
 WL_FROM_CSV = {"100r_zipf": "zipf", "100r_uniform": "uniform"}
 
