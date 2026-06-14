@@ -13,11 +13,12 @@ charts/
 
 # 忽略所有以 ycsb- 开头的文件夹（解压后的工具包）
 benchmark/ycsb-*/
-# 忽略 YCSB 的压缩包
-benchmark/*.tar.gz
 
 # 本地 Claude Code 项目指南，不入库
 CLAUDE.md
 
 # 论文（本地草稿，不入库）
 paper/
+
+# HiOM 设计文档（本地研究文档，不入库）
+design/HIOM.md
