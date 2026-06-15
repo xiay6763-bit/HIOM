@@ -80,7 +80,7 @@ ax.set_ylim(0, _max_total * 1.22)
 ax.set_xticks(list(x))
 ax.set_xticklabels(labels)
 ax.set_ylabel("Memory footprint (GB)")
-ax.set_title("Memory footprint @10M (K8/V200)\n"
+ax.set_title("C1: Memory footprint @10M (K8/V200)\n"
              "DRAM white-box measured · PMem analytical estimate", pad=12)
 ax.legend(loc="upper right", fontsize=8)
 ax.grid(axis="y", alpha=0.3)

@@ -187,7 +187,7 @@ def main():
     fig.legend(handles=sys_handles + wl_handles, loc="lower center", ncol=6,
                fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.01))
 
-    fig.suptitle("E2 / C2: iso-DRAM reads @10M (K8/V200) -- "
+    fig.suptitle("C2: iso-DRAM reads @10M (K8/V200) -- "
                  "only HiOM is feasible under a tight DRAM budget AND fast",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0.07, 1, 0.95])
