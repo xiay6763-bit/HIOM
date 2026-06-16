@@ -49,6 +49,20 @@ inline constexpr char kHiomViperPoolDir[] = "/pmem0/hiom_bench/viper";
 inline constexpr char kHiomColdFile[] = "/pmem0/hiom_bench/cold.bin";
 inline constexpr char kHiomChkptFile[] = "/pmem0/hiom_bench/chkpt.bin";
 
+// ColdTier + A/B-checkpoint backing directory. Defaults to the PM bench
+// root. Override with HIOM_COLD_DIR to place the *secondary index* on a
+// different medium — e.g. a node-1 remote-DRAM tmpfs (mounted mpol=bind:1)
+// to emulate a volatile CXL-DDR cold tier and measure whether the write
+// penalty shrinks vs Optane. Viper's VPage *data* pool always stays on PM
+// (kHiomViperPoolDir); only the index backing moves, so the comparison
+// isolates the secondary-index medium.
+inline std::string hiom_cold_dir() {
+    if (const char* e = std::getenv("HIOM_COLD_DIR"); e && *e) {
+        return std::string{e};
+    }
+    return std::string{kHiomBenchRoot};
+}
+
 template <typename KeyT = KeyType16, typename ValueT = ValueType200>
 class HiOMFixture : public BaseFixture {
   public:
@@ -199,10 +213,17 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     //    ColdTier::create handles up to ~256K main + 256K overflow per
     //    region × 32 regions = 16M entries main capacity, plenty for
     //    the 1M default and the 100M aspirational sweep.
-    cold_ = viper::hiom::ColdTier::create(kHiomColdFile);
+    //    HIOM_COLD_DIR can redirect this backing off PM (e.g. a node-1
+    //    remote-DRAM tmpfs) to emulate a volatile CXL-DDR cold tier.
+    const std::string cold_dir = hiom_cold_dir();
+    std::filesystem::create_directories(cold_dir);
+    if (std::getenv("HIOM_COLD_DIR")) {  // only chatter when redirected off PM
+        std::cerr << "[HiOM] ColdTier+checkpoint backing = " << cold_dir << std::endl;
+    }
+    cold_ = viper::hiom::ColdTier::create(cold_dir + "/cold.bin");
 
-    // 3. Checkpoint (A/B PM record).
-    chkpt_ = viper::hiom::Checkpoint::create(kHiomChkptFile);
+    // 3. Checkpoint (A/B record, same backing medium as ColdTier).
+    chkpt_ = viper::hiom::Checkpoint::create(cold_dir + "/chkpt.bin");
 
     // 4. HiOM. CheckpointConfig.cadence_entries gates per-N-flushed
     //    checkpoint writes; 4096 is the integration-test default and
@@ -263,6 +284,15 @@ void HiOMFixture<KeyT, ValueT>::DeInitMap() {
     if (root.find("/pmem0/hiom_bench") == 0
         && std::filesystem::exists(root)) {
         std::filesystem::remove_all(root);
+    }
+    // If ColdTier/checkpoint were redirected off the PM root (HIOM_COLD_DIR,
+    // e.g. a remote-DRAM tmpfs), remove just the two files we created —
+    // never the directory itself, which we don't own.
+    const std::string cold_dir = hiom_cold_dir();
+    if (cold_dir != std::string{kHiomBenchRoot}) {
+        std::error_code ec;
+        std::filesystem::remove(cold_dir + "/cold.bin", ec);
+        std::filesystem::remove(cold_dir + "/chkpt.bin", ec);
     }
 }
 

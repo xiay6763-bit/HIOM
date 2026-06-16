@@ -15,7 +15,10 @@ PM-resident end (DRAM ~0) but pays it back in read throughput (see E2).
 
 Data provenance (10 M records, K8/V200 = 216 B):
   - DRAM (index): WHITE-BOX measured via fixture_dram_bytes()
-      Viper 2052, CCEH 2052, HiOM 272, Dash ~0 MB.
+      Viper 2052, CCEH 2052, Halo 247, HiOM 272, Dash ~0 MB.
+      (Halo: total bucket bytes = total_slot/3 * 64 B, primary + overflow,
+       measured 2026-06-15 via the Halo hash_api harness. At 10M Halo < HiOM —
+       the strategies cross near 11M; see footprint_vs_n_plot.py for the trend.)
   - PMem data: ANALYTICAL. raw = N*216B = 2.16 GB. VPage layout (Viper/HiOM)
       packs ~= raw (Viper paper: 21.2 GB @100M vs raw 21.6 GB). Per-entry PMDK
       allocation (CCEH/Dash) carries ~+10% (Viper paper: Dash 23.8 GB @100M).
@@ -47,6 +50,7 @@ DATA_PERENTRY = 2380.0   # MB  (CCEH/Dash per-entry PMDK alloc, +~10%)
 SYS = [
     ("Viper", dict(dram=2052, pm_data=DATA_VPAGE,    pm_index=0)),
     ("CCEH",  dict(dram=2052, pm_data=DATA_PERENTRY, pm_index=0)),
+    ("Halo",  dict(dram=247,  pm_data=DATA_VPAGE,    pm_index=0)),
     ("HiOM",  dict(dram=272,  pm_data=DATA_VPAGE,    pm_index=96)),
     ("Dash",  dict(dram=2,    pm_data=DATA_PERENTRY, pm_index=210)),
 ]

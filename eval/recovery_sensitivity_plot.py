@@ -6,6 +6,7 @@ Reads results/recovery/tail_sweep.csv + tail_sweep_meta.json (produced by
 median over reps, and emits:
   - eval/charts/recovery_tail_scan.pdf    figure 1: pure O(tail), threads=1
   - eval/charts/recovery_vs_baseline.pdf  figure 2: total open vs Viper, t=32
+    (eval/charts only — superseded in the paper by recovery_vs_n.pdf; not emitted under BW=1)
   - results/recovery/summary.txt          slope + speedup + crossover + cadence
 
 Conventions / caveats (see design/HIOM.md):
@@ -185,7 +186,8 @@ def main():
         print("wrote", p1)
 
     # figure 2: total open vs Viper baseline (t=32) + crossover + cadence.
-    if x32:
+    # eval/charts only: the paper uses recovery_vs_n.pdf instead, so skip under BW=1.
+    if x32 and not BW:
         plt.figure(figsize=(6, 4))
         plt.plot(x32, y32, marker="o", color=C_OPEN,
                  label="HiOM open total (t=32)")
