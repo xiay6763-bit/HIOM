@@ -94,6 +94,7 @@ class HiOMFixture : public BaseFixture {
     // prefill_ycsb finishes (init thread only).
     void flush_post_prefill() final {
         if (hiom_) hiom_->flush_and_wait();
+        warm_hot_if_requested();
     }
 
     // Augments the base RSS snapshot with HiOM-specific telemetry from
@@ -134,6 +135,23 @@ class HiOMFixture : public BaseFixture {
     void SetCheckpointCadence(std::uint64_t e) { checkpoint_cadence_ = e; }
 
   protected:
+    // Warm the HotTier from the authoritative ColdTier so the timed read
+    // phase starts page-resident and populated, lifting the lazy-mmap
+    // first-touch fault + cold→hot re-warm out of the measurement (see
+    // HiOM::warm_hot_tier / hot_tier.hpp). Opt-in via HIOM_WARM_HOT so
+    // existing eval configs — and the C2 from-empty capacity sweep, which
+    // intentionally measures warming during the read phase — keep their
+    // current default behaviour. Called post-prefill, pre-timed-loop, on
+    // the init thread only.
+    void warm_hot_if_requested() {
+        if (!hiom_) return;
+        const char* e = std::getenv("HIOM_WARM_HOT");
+        if (!e || e[0] == '0' || e[0] == '\0') return;
+        const std::size_t warmed = hiom_->warm_hot_tier();
+        std::cerr << "[HiOM] warm_hot_tier installed " << warmed
+                  << " offsets into HotTier" << std::endl;
+    }
+
     // Defensive cleanup helper. Only touches our own paths under
     // /pmem0/hiom_bench/; mirrors the CLAUDE.md-mandated viper_fixture
     // pattern. A misconfigured prefix aborts before we touch anything.
@@ -207,6 +225,14 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     // peeks CCEH for the offset and skips if tombstone) — correctness
     // unaffected; YCSB-C is read-only so this side-effect is moot.
     vcfg.cceh_init_cap = 1;
+    // Opt-in prefault, same switch as ViperFixture (VIPER_PREFAULT=1):
+    // pre-touch fresh PM mappings at create/resize time so timed puts skip
+    // the first-touch page fault (design/HIOM.md E4). Keep it OFF for
+    // recovery experiments.
+    if (const char* pf = std::getenv("VIPER_PREFAULT"); pf && *pf && *pf != '0') {
+        vcfg.prefault_new_mappings = true;
+        std::cerr << "[HiOM] VIPER_PREFAULT set -> prefaulting new PM mappings" << std::endl;
+    }
     viper_ = ViperT::create(kHiomViperPoolDir, BM_POOL_SIZE, vcfg);
 
     // 2. ColdTier (PM-resident hash index). Default sizing in
@@ -230,6 +256,17 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     //    matches HIOM.md §M5. FlusherConfig defaults to 5 ms / 1024
     //    high-watermark.
     typename HiOMT::FlusherConfig fcfg;
+    // HIOM_FLUSHERS (must divide CommitBuffer::kNumLanes=8; default 4):
+    // the 2026-07-07 split-probe showed background flusher PM writes poison
+    // the foreground resolver's PM reads — fewer flushers => far faster
+    // write path (INSERT t8 4.2× / t24 2.1× at f1 vs f4 in the microprobe).
+    // Wired here so the YCSB eval can confirm the microprobe result on the
+    // real workload and check the recovery/flush-drain trade-off before we
+    // change the struct default. See design/HIOM.md §Status(2026-07-07).
+    if (const char* e = std::getenv("HIOM_FLUSHERS"); e && *e) {
+        fcfg.num_flushers = std::strtoul(e, nullptr, 10);
+        std::cerr << "[HiOM] HIOM_FLUSHERS=" << fcfg.num_flushers << std::endl;
+    }
     typename HiOMT::CheckpointConfig ccfg;
     ccfg.cadence_entries = checkpoint_cadence_;
     typename HiOMT::RecoveryConfig rcfg;  // tail_scan=false (fresh DB)
@@ -263,6 +300,11 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
                                         cold_.get(), fcfg,
                                         chkpt_.get(), ccfg, rcfg);
     }
+    // Optionally warm the (final) HotTier from ColdTier so an all_ops
+    // timed read phase doesn't absorb the lazy-mmap first-touch faults.
+    // Opt-in (HIOM_WARM_HOT); no-op for YCSB (prefill=0 here → empty
+    // ColdTier), which warms in flush_post_prefill instead.
+    warm_hot_if_requested();
     initialized_ = true;
 }
 
@@ -300,11 +342,19 @@ template <typename KeyT, typename ValueT>
 uint64_t HiOMFixture<KeyT, ValueT>::insert(uint64_t start_idx,
                                             uint64_t end_idx) {
     auto cl = hiom_->get_client();
+    // PoC opt-in (HIOM_ASSUME_NEW): the insert benchmark and prefill both issue
+    // only brand-new, monotonically-increasing keys, so HiOM's put can skip the
+    // old-offset resolver (a ColdTier PM negative lookup that is pure waste for
+    // a new key — see HiOM write-path attribution, results/wbw). Read once here,
+    // off the per-op loop. YCSB run / update / delete never reach insert(), so
+    // the resolver-skip's unsafe case (key already exists) can't be triggered.
+    const char* e = std::getenv("HIOM_ASSUME_NEW");
+    const bool assume_new = e && e[0] != '0' && e[0] != '\0';
     uint64_t insert_counter = 0;
     for (uint64_t key = start_idx; key < end_idx; ++key) {
         const KeyT db_key{key};
         const ValueT value{key};
-        insert_counter += cl.put(db_key, value);
+        insert_counter += cl.put(db_key, value, assume_new);
     }
     return insert_counter;
 }

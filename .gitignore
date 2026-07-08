@@ -22,3 +22,6 @@ paper/
 
 # HiOM 设计文档（本地研究文档，不入库）
 design/HIOM.md
+
+# ipmctl tool default config (system, not viper)
+ipmctl.conf

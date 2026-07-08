@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdlib>
+#include <iostream>
+
 #include "../benchmark.hpp"
 #include "common_fixture.hpp"
 #include "viper/viper.hpp"
@@ -71,6 +74,16 @@ void ViperFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts, ViperConf
     // shared with other users — see CLAUDE.md).
     if (pool_file_.find("/dev/dax") == std::string::npos) {
         std::filesystem::remove_all(pool_file_);
+    }
+
+    // Opt-in prefault (VIPER_PREFAULT=1): pre-touch fresh PM mappings at
+    // create/resize time so the timed puts don't pay first-touch page
+    // faults (design/HIOM.md E4). Write-throughput runs set this; recovery
+    // runs must NOT (it would inflate the untimed setup by seconds and is
+    // pointless for open()-path measurements).
+    if (const char* pf = std::getenv("VIPER_PREFAULT"); pf && *pf && *pf != '0') {
+        v_config.prefault_new_mappings = true;
+        std::cerr << "[ViperFixture] VIPER_PREFAULT set -> prefaulting new PM mappings" << std::endl;
     }
 
 //    viper_ = ViperT::open(pool_file_, v_config);

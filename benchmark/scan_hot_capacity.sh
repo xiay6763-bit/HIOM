@@ -21,6 +21,23 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 export YCSB_SIZE_TAG="${YCSB_SIZE_TAG:-10M}"   # 10M-record working set (matches Status 05-17)
+
+# 2026-06-24: HIOM_WARM_HOT pre-warms the HotTier from ColdTier before the timed
+# read (consumed in HiOMFixture::flush_post_prefill). EMPIRICALLY it makes NO
+# difference for this C2 sweep, so it defaults OFF (口径 1, from-empty):
+#   - t=1 capacity curve: single-threaded, no concurrent first-touch fault
+#     contention to lift; and the baseline shows no log2=20 dip to begin with
+#     (zipf 2.30->2.92->2.99 monotone; uniform log2=20 2.32 > log2=21 2.26).
+#   - t=8 full-cap (log2=20, from-empty rebuild, no livelock): warm off vs on =
+#     19.6/19.0 (zipf), 17.1/18.1 (uniform) M items/s — within noise (CV~6%).
+# Root cause: YCSB-C issues ~100M reads against a 10M working set, so the
+# one-shot warm-up cost (10M first-touches, of which only ~5.5M are even
+# encodable into the single-region 4-byte offset — route_to_region_default() is
+# region 0, kBlockLowBits=21 => 2 Mi blocks, §4.4) amortizes to invisibility.
+# Contrast all_ops, where reads == working set (1M, fully encodable) and warming
+# gives 3.5x at t=24 (7.7->27 M/s) — THAT is warm's home, not this sweep.
+# Set HIOM_WARM_HOT=1 to reproduce the (null) A/B here.
+export HIOM_WARM_HOT="${HIOM_WARM_HOT:-0}"
 mkdir -p results/hot_scan eval/charts
 
 mode="${1:-full}"

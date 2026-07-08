@@ -20,11 +20,14 @@
 #   ./run_thread_scaling.sh            # run
 #   ./run_thread_scaling.sh --dry-run  # print plan only
 # Env overrides: TS_FIXTURES, TS_WORKLOADS, TS_METRICS (tp|lat, default tp),
-#                TS_PER_CELL_TIMEOUT_S.
+#                TS_PER_CELL_TIMEOUT_S,
+#                TS_OUT_DIR (e.g. results/thread_scaling_prefault for the
+#                VIPER_PREFAULT=1 re-run — keeps the no-prefault baseline
+#                files intact for A/B comparison).
 set -e
 
 YCSB_BM="/root/viper/build/benchmark/ycsb_bm"
-OUT_DIR="/root/viper/results/thread_scaling"
+OUT_DIR="${TS_OUT_DIR:-/root/viper/results/thread_scaling}"
 mkdir -p "${OUT_DIR}"
 
 SIZE=10
