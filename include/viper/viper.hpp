@@ -6,9 +6,15 @@
 #include <unistd.h>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <cmath>
 #include <linux/mman.h>
 #include <sys/mman.h>
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23  // Linux 5.14+; fallback if <sys/mman.h> predates it
+#endif
 #include <atomic>
 #include <assert.h>
 #include <filesystem>
@@ -116,6 +122,38 @@ struct ViperConfig {
     // recovery/open timing — write-throughput experiments opt in
     // (fixtures read VIPER_PREFAULT=1).
     bool prefault_new_mappings = false;
+    // Bound (bytes) on the create-time prefault touch. 0 = whole pool (the
+    // original behaviour). When >0, prefault_new_mappings touches only the
+    // first prefault_bytes of fresh mapping space and stops — sized to the
+    // expected working set (e.g. expected_keys x entry_size) rather than the
+    // full 64 GiB pool, so create() stays fast (~1-2 s for 2 GB vs ~40 s for
+    // the whole pool) while still lifting every first-touch fault the workload
+    // will actually hit. Zero foreground concurrency (unlike the background
+    // runway), so it dodges the fsdax VMA-lock contention that made the runway
+    // a net loss (see design/HIOM.md 2026-07-08).
+    size_t prefault_bytes = 0;
+    // Background prefault "runway": instead of the synchronous whole-pool
+    // touch of prefault_new_mappings (a blunt create()-time instrument), a
+    // long-lived worker thread walks ahead of the allocation cursor
+    // (current_block_page_) and MADV_POPULATE_WRITE-s a bounded runway of
+    // blocks, so the foreground put() gets a page whose page tables are
+    // already built. Advantages over prefault_new_mappings: create() returns
+    // immediately; only cursor+lookahead is populated (not the whole 64 GiB);
+    // MADV_POPULATE_WRITE builds page tables without touching contents, so it
+    // is safe on live/recovered mappings too. If writes outrun the runway the
+    // foreground just pays a normal minor fault (same as no prefault). Off by
+    // default; mutually exclusive with prefault_new_mappings in practice
+    // (enable one or the other for A/B). See design/HIOM.md write-path notes.
+    bool background_prefault = false;
+    // Runway depth in blocks: the worker keeps prefault_hi_ >= cursor_block +
+    // this. 4096 blocks x 24 KiB ~= 96 MiB of lookahead.
+    size_t prefault_runway_blocks = 4096;
+    // Parallelism for the runway populate. A single MADV_POPULATE_WRITE thread
+    // only sustains ~1.16 GiB/s on this fsdax host, far below the ~2.2 GiB/s at
+    // which 8+ foreground writers consume fresh blocks; the populate must fan
+    // out across threads (mirrors the legacy 8-thread prefault touch) or the
+    // runway falls behind instantly and the foreground pays the fault anyway.
+    unsigned prefault_threads = 8;
 };
 
 namespace internal {
@@ -665,6 +703,7 @@ class Viper {
 
     ViperFileMapping allocate_v_page_blocks();
     void add_v_page_blocks(ViperFileMapping mapping, bool is_new_space);
+    void prefault_runway();
     void recover_database();
     void trigger_resize();
     void trigger_reclaim(size_t num_reclaim_ops);
@@ -719,6 +758,20 @@ class Viper {
     std::atomic<bool> is_reclaiming_;
     std::unique_ptr<std::thread> reclaim_thread_;
 
+    // Background prefault runway (ViperConfig::background_prefault). The worker
+    // MADV_POPULATE_WRITE-s blocks [0, prefault_hi_) ahead of the allocation
+    // cursor. prefault_cv_ is only used to wake the worker promptly at
+    // shutdown; the foreground write path never signals it (no wake-storm).
+    std::unique_ptr<std::thread> prefault_thread_;
+    std::atomic<bool> prefault_stop_{false};
+    std::atomic<block_size_t> prefault_hi_{0};
+    std::mutex prefault_mtx_;
+    std::condition_variable prefault_cv_;
+    // Cumulative bytes touched by the bounded create-time prefault, across all
+    // add_v_page_blocks calls, so ViperConfig::prefault_bytes caps the total
+    // (not per-mapping). Only touched under the create/resize prefault path.
+    std::atomic<size_t> prefaulted_bytes_{0};
+
     std::atomic<bool> deadlock_offset_lock_;
     std::vector<KVOffset> deadlock_offsets_;
 
@@ -768,10 +821,23 @@ Viper<K, V>::Viper(ViperBase v_base, const std::filesystem::path pool_dir, const
         recover_database();
     }
     current_block_page_ = KVOffset{v_base.v_metadata->num_used_blocks.load(LOAD_ORDER), 0, 0}.offset;
+
+    // Start the background prefault runway last, once current_block_page_ and
+    // num_v_blocks_ are set. Safe on both new and recovered pools —
+    // MADV_POPULATE_WRITE only builds page tables, never touches contents.
+    if (v_config.background_prefault) {
+        prefault_thread_ = std::make_unique<std::thread>([this] { prefault_runway(); });
+    }
 }
 
 template <typename K, typename V>
 Viper<K, V>::~Viper() {
+    // Stop the prefault runway before unmapping — it touches mapped memory.
+    if (prefault_thread_) {
+        prefault_stop_.store(true, std::memory_order_release);
+        prefault_cv_.notify_all();
+        prefault_thread_->join();
+    }
     if (owns_pool_) {
         DEBUG_LOG("Closing pool file.");
         munmap(v_base_.v_metadata, v_base_.v_metadata->block_offset);
@@ -1061,10 +1127,31 @@ void Viper<K, V>::add_v_page_blocks(ViperFileMapping mapping, bool is_new_space)
 #ifdef VIPER_ALLOC_ABLATE
     do_prefault = true;  // L3: the ablation probes always prefault
 #endif
+    // When the background runway is enabled it owns prefaulting (asynchronously,
+    // off create()/resize()); never also do the synchronous whole-mapping touch.
+    if (v_config_.background_prefault) do_prefault = false;
     if (do_prefault && is_new_space) {
-        const std::size_t pages = mapping.mapped_size / PAGE_SIZE;
+        // Bound the touch to ViperConfig::prefault_bytes total (0 = whole
+        // pool). Sizing to the working set keeps create() fast while still
+        // lifting the faults the workload will hit.
+        std::size_t bytes_this = mapping.mapped_size;
+        if (v_config_.prefault_bytes > 0) {
+            const std::size_t done = prefaulted_bytes_.load(LOAD_ORDER);
+            if (done >= v_config_.prefault_bytes) {
+                bytes_this = 0;
+            } else {
+                bytes_this = std::min(bytes_this, v_config_.prefault_bytes - done);
+            }
+            prefaulted_bytes_.fetch_add(bytes_this, STORE_ORDER);
+        }
+        const std::size_t pages = bytes_this / PAGE_SIZE;
         char* base = reinterpret_cast<char*>(mapping.start_addr);
         const unsigned nt = 8;
+        // Byte-touch (one store per 4 KiB page), striped over nt threads. On
+        // this fs-dax path this measured faster than MADV_POPULATE_WRITE
+        // (~8.9 s vs ~22.7 s for 2 GiB) — the O_DIRECT-opened mapping's madvise
+        // fault path is slower than plain stores here. Safe: create/resize
+        // prefault runs with no foreground writers.
         std::vector<std::thread> pf;
         pf.reserve(nt);
         for (unsigned t = 0; t < nt; ++t) {
@@ -1082,6 +1169,79 @@ void Viper<K, V>::add_v_page_blocks(ViperFileMapping mapping, bool is_new_space)
         v_blocks_.push_back(start_block + block_offset);
     }
     num_v_blocks_.store(v_blocks_.size(), STORE_ORDER);
+}
+
+// Background prefault runway: walk ahead of the allocation cursor
+// (current_block_page_) and MADV_POPULATE_WRITE a bounded lookahead of blocks
+// so the foreground put() never pays the first-touch minor fault on a fresh PM
+// page. POPULATE_WRITE builds writable page tables without modifying contents,
+// and a large contiguous range gives the kernel the chance to fault in PMD/huge
+// mappings. Pure timed polling — the foreground path never signals this worker,
+// so there is no wake-storm; prefault_cv_ only exists for prompt shutdown.
+template <typename K, typename V>
+void Viper<K, V>::prefault_runway() {
+    const block_size_t runway = v_config_.prefault_runway_blocks;
+    const block_size_t low_water = runway / 2;  // refill once drained this far
+    const unsigned nthreads = std::max(1u, v_config_.prefault_threads);
+    block_size_t hi = 0;
+    while (!prefault_stop_.load(std::memory_order_acquire)) {
+        // v_blocks_ may be memmoved by a concurrent resize; wait it out (same
+        // guard the foreground get_block_based_access uses).
+        while (is_v_blocks_resizing_.load(std::memory_order_acquire)) asm("nop");
+
+        const block_size_t avail = num_v_blocks_.load(std::memory_order_acquire);
+        const block_size_t cur = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+        const block_size_t want = std::min<block_size_t>(cur + runway, avail);
+        const block_size_t lookahead = (hi > cur) ? (hi - cur) : 0;
+
+        // Refill only once the runway has drained below the low watermark (or at
+        // cold start where lookahead==0), so the fork/join is amortized over a
+        // batch of ~low_water blocks rather than one block at a time.
+        if (hi >= avail || lookahead >= low_water) {
+            std::unique_lock<std::mutex> lk(prefault_mtx_);
+            prefault_cv_.wait_for(lk, std::chrono::microseconds(200), [&] {
+                const block_size_t c = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+                return prefault_stop_.load(std::memory_order_acquire) ||
+                       (hi < c + low_water && hi < num_v_blocks_.load(std::memory_order_acquire));
+            });
+            continue;
+        }
+
+        // Snapshot the block pointers for [hi, want) so a concurrent resize's
+        // vector reallocation can't invalidate what the workers dereference.
+        const block_size_t n = want - hi;
+        std::vector<VPageBlock*> snap(n);
+        for (block_size_t i = 0; i < n; ++i) snap[i] = v_blocks_[hi + i];
+
+        // Fan the populate across nthreads. Each worker MADV_POPULATE_WRITEs its
+        // slice in maximal pointer-contiguous runs (block pointers are
+        // contiguous within one mmap chunk, break at chunk boundaries).
+        auto populate_slice = [&snap](block_size_t lo, block_size_t hh) {
+            for (block_size_t b = lo; b < hh; ) {
+                VPageBlock* base = snap[b];
+                block_size_t run = 1;
+                while (b + run < hh && snap[b + run] == base + run) ++run;
+                ::madvise(base, run * sizeof(VPageBlock), MADV_POPULATE_WRITE);
+                b += run;
+            }
+        };
+        if (nthreads == 1 || n < nthreads) {
+            populate_slice(0, n);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(nthreads - 1);
+            const block_size_t per = (n + nthreads - 1) / nthreads;
+            for (unsigned t = 1; t < nthreads; ++t) {
+                const block_size_t lo = std::min<block_size_t>((block_size_t)t * per, n);
+                const block_size_t hh = std::min<block_size_t>(lo + per, n);
+                if (lo < hh) workers.emplace_back(populate_slice, lo, hh);
+            }
+            populate_slice(0, std::min<block_size_t>(per, n));  // this thread: slice 0
+            for (auto& w : workers) w.join();
+        }
+        hi = want;
+        prefault_hi_.store(hi, std::memory_order_release);
+    }
 }
 
 template <typename K, typename V>

@@ -85,6 +85,20 @@ void ViperFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts, ViperConf
         v_config.prefault_new_mappings = true;
         std::cerr << "[ViperFixture] VIPER_PREFAULT set -> prefaulting new PM mappings" << std::endl;
     }
+    // Bounded create-time prefault: cap the touch to VIPER_PREFAULT_BYTES so
+    // create() stays fast on the 64 GiB pool (touch only the working set).
+    if (const char* pb = std::getenv("VIPER_PREFAULT_BYTES"); pb && *pb) {
+        v_config.prefault_bytes = std::strtoull(pb, nullptr, 10);
+        std::cerr << "[ViperFixture] VIPER_PREFAULT_BYTES=" << v_config.prefault_bytes << std::endl;
+    }
+    // Background prefault runway: async, off create() — safe for all runs.
+    if (const char* rw = std::getenv("VIPER_PREFAULT_RUNWAY"); rw && *rw && *rw != '0') {
+        v_config.background_prefault = true;
+        if (const char* rb = std::getenv("VIPER_RUNWAY_BLOCKS"); rb && *rb)
+            v_config.prefault_runway_blocks = std::strtoul(rb, nullptr, 10);
+        std::cerr << "[ViperFixture] VIPER_PREFAULT_RUNWAY set -> background prefault runway ("
+                  << v_config.prefault_runway_blocks << " blocks)" << std::endl;
+    }
 
 //    viper_ = ViperT::open(pool_file_, v_config);
     viper_ = ViperT::create(pool_file_, BM_POOL_SIZE, v_config);

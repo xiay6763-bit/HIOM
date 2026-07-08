@@ -61,6 +61,21 @@ void guarded_reset() {
     std::filesystem::create_directories(kRoot);
 }
 
+// Apply the two prefault knobs from env so the probe can A/B baseline vs the
+// legacy create-time touch (VIPER_PREFAULT=1) vs the background runway
+// (VIPER_PREFAULT_RUNWAY=1).
+void apply_prefault_env(viper::ViperConfig& cfg) {
+    if (const char* e = getenv("VIPER_PREFAULT"); e && *e && *e != '0')
+        cfg.prefault_new_mappings = true;
+    if (const char* e = getenv("VIPER_PREFAULT_BYTES"); e && *e)
+        cfg.prefault_bytes = strtoull(e, nullptr, 10);
+    if (const char* e = getenv("VIPER_PREFAULT_RUNWAY"); e && *e && *e != '0') {
+        cfg.background_prefault = true;
+        if (const char* rb = getenv("VIPER_RUNWAY_BLOCKS"); rb && *rb)
+            cfg.prefault_runway_blocks = strtoul(rb, nullptr, 10);
+    }
+}
+
 std::size_t gib_round(std::size_t bytes) {
     constexpr std::size_t G = 1ULL << 30;
     return std::max<std::size_t>(1, (bytes + G - 1) / G) * G;
@@ -103,6 +118,7 @@ void run_insert(int nthreads, std::size_t ops) {
     guarded_reset();
     const std::size_t pool = gib_round((std::size_t)nthreads*ops*224*7/5);
     viper::ViperConfig cfg; cfg.resize_threshold = 1e9;  // pre-mapped; no resize
+    apply_prefault_env(cfg);
     auto viper = ViperT::create(kPool, pool, cfg);
 
     std::atomic<int> ready{0}; std::atomic<bool> go{false};
@@ -134,6 +150,7 @@ void run_update(int nthreads, std::size_t ops, std::size_t prefill) {
     const std::size_t pool =
         gib_round((prefill + (std::size_t)nthreads*ops)*224*7/5);
     viper::ViperConfig cfg; cfg.resize_threshold = 1e9;  // pre-mapped; no resize
+    apply_prefault_env(cfg);
     auto viper = ViperT::create(kPool, pool, cfg);
     {   // single-thread prefill of `prefill` distinct keys (untimed; its
         // wprof::tl lives on this thread and is ignored)
