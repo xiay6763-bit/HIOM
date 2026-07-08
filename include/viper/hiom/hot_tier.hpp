@@ -34,6 +34,8 @@
 #include <optional>
 #include <vector>
 
+#include <sys/mman.h>  // mmap/munmap for lazy zero-page bucket allocation
+
 namespace viper::hiom {
 
 class HotTier {
@@ -95,7 +97,7 @@ class HotTier {
         : num_buckets_(num_buckets_pow2),
           mask_(num_buckets_pow2 - 1),
           buckets_(allocate_buckets(num_buckets_pow2)),
-          meta_(num_buckets_pow2) {
+          meta_(allocate_meta(num_buckets_pow2)) {
         assert((num_buckets_pow2 & (num_buckets_pow2 - 1)) == 0
                && "num_buckets must be a power of two");
         assert(num_buckets_pow2 >= 1);
@@ -392,21 +394,57 @@ class HotTier {
     };
     static_assert(sizeof(BucketMeta) == 8, "BucketMeta must be 8 bytes");
 
-    struct BucketArrayDeleter {
-        std::size_t count;
-        void operator()(Bucket* p) const noexcept {
-            if (!p) return;
-            for (std::size_t i = 0; i < count; ++i) p[i].~Bucket();
-            ::operator delete(p, std::align_val_t{64});
+    // Lazy, zero-filled allocation via anonymous mmap. The OS hands back
+    // demand-zero pages: the mapping call is O(1) and a page is physically
+    // faulted in only on first touch (i.e. when an entry in it is actually
+    // warmed), so HotTier construction no longer pays an eager
+    // touch-every-bucket cost. That eager zero-init used to sit on the
+    // RECOVERY critical path — ~28 ms at 2^21 buckets, ~1 s at 16 M buckets
+    // (design/HIOM.md §M6.5 hiom_ctor breakdown) — even though a freshly
+    // recovered HotTier starts empty and is warmed lazily by reads anyway.
+    //
+    // We deliberately do NOT placement-new each Bucket/BucketMeta: both are
+    // composed solely of lock-free integer std::atomics whose all-zero bit
+    // pattern is the value 0, which is exactly what an anonymous mapping
+    // guarantees — so the zero pages already are a valid, correctly-zeroed
+    // array. Eager placement-new would re-touch every page and defeat the
+    // laziness (that eager touch was the source of the floor in the first
+    // place). dram_bytes() is unchanged (it reports logical capacity); only
+    // RSS shrinks to the touched working set, which if anything strengthens C1.
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+                  "Bucket slots rely on zero-init == lock-free atomic(0)");
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                  "BucketMeta::state relies on zero-init == lock-free atomic(0)");
+
+    template <typename T>
+    struct MmapDeleter {
+        std::size_t bytes;
+        void operator()(T* p) const noexcept {
+            if (p) ::munmap(p, bytes);
         }
     };
-    using BucketArray = std::unique_ptr<Bucket[], BucketArrayDeleter>;
 
+    static void* mmap_zeroed(std::size_t bytes) {
+        void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) throw std::bad_alloc();
+        // mmap is page-aligned (>= 4 KiB), satisfying Bucket's 64-byte
+        // alignment requirement (asserted in the ctor).
+        return p;
+    }
+
+    using BucketArray = std::unique_ptr<Bucket[], MmapDeleter<Bucket>>;
     static BucketArray allocate_buckets(std::size_t n) {
-        Bucket* raw = static_cast<Bucket*>(
-            ::operator new(sizeof(Bucket) * n, std::align_val_t{64}));
-        for (std::size_t i = 0; i < n; ++i) new (raw + i) Bucket{};
-        return BucketArray(raw, BucketArrayDeleter{n});
+        const std::size_t bytes = sizeof(Bucket) * n;
+        return BucketArray(static_cast<Bucket*>(mmap_zeroed(bytes)),
+                           MmapDeleter<Bucket>{bytes});
+    }
+
+    using MetaArray = std::unique_ptr<BucketMeta[], MmapDeleter<BucketMeta>>;
+    static MetaArray allocate_meta(std::size_t n) {
+        const std::size_t bytes = sizeof(BucketMeta) * n;
+        return MetaArray(static_cast<BucketMeta*>(mmap_zeroed(bytes)),
+                         MmapDeleter<BucketMeta>{bytes});
     }
 
     // SIEVE eviction within a single bucket. Returns the slot index that
@@ -564,7 +602,7 @@ class HotTier {
     std::size_t num_buckets_;
     std::size_t mask_;
     BucketArray buckets_;
-    std::vector<BucketMeta> meta_;
+    MetaArray meta_;
     std::atomic<std::size_t> size_{0};
     std::atomic<std::size_t> eviction_count_{0};
     std::atomic<std::size_t> pin_failures_{0};

@@ -86,6 +86,35 @@
 #define HIOM_RSTAT_INC(field) ((void)0)
 #endif
 
+// --- HiOM write-path profiling (opt-in, shares VIPER_WRITE_PROFILE) --------
+// Times the HiOM-side mirror work (HotTier upsert_pinned, commit-buffer push,
+// misc encode/note) so it can be compared against Viper's CCEH index cost.
+// The viper-internal phases (incl. the resolver, which replaces CCEH when
+// hiom_owns_index_) are captured separately by viper::wprof (viper.hpp).
+#ifdef VIPER_WRITE_PROFILE
+namespace viper { namespace hiom { namespace wprof2 {
+struct Phases {
+    std::uint64_t hot_upsert, commit_push, mirror_misc;
+    // 2026-07-04 deepening — commit_push split (all inside the old
+    // commit_push span): fadd+enqueue vs watermark-wake vs the rare
+    // synchronous full drain; and resolver split: HotTier probe (DRAM)
+    // vs ColdTier lookup (PM read) vs the key-verify read-at-offset
+    // (PM read). Counters let us normalise per-event.
+    std::uint64_t push_fadd_enq, push_wake, push_sync_drain;
+    std::uint64_t resolv_hot, resolv_cold, resolv_verify;
+    std::uint64_t wake_calls, sync_drains, cold_neg_lookups;
+};
+inline thread_local Phases tl{};
+}}}  // namespace viper::hiom::wprof2
+#define HWP_DECL() std::uint64_t _hwp = viper::wprof::now()
+#define HWP_LAP(f) do { std::uint64_t _n = viper::wprof::now(); viper::hiom::wprof2::tl.f += _n - _hwp; _hwp = _n; } while (0)
+#define HWP_CNT(f) (++viper::hiom::wprof2::tl.f)
+#else
+#define HWP_DECL() ((void)0)
+#define HWP_LAP(f) ((void)0)
+#define HWP_CNT(f) ((void)0)
+#endif
+
 namespace viper::hiom {
 
 // Compute a 4-byte fingerprint from a key. Reuses Viper's routing hash
@@ -256,9 +285,11 @@ class HiOM {
                     // and the post-restart cold-only case.
                     K stored_key{};
                     V stored_val{};
+                    HWP_DECL();
 
                     const std::uint32_t fp32 = key_fingerprint(key);
                     if (auto packed = hot_.lookup(fp32)) {
+                        HWP_LAP(resolv_hot);
                         const auto d = decode(*packed,
                                               route_to_region_default(),
                                               base_map_);
@@ -271,15 +302,21 @@ class HiOM {
                         if (ro.hiom_read_at_offset(off, &stored_key,
                                                    &stored_val)
                             && stored_key == key) {
+                            HWP_LAP(resolv_verify);
                             return off;
                         }
+                        HWP_LAP(resolv_verify);
                         // fp32 collision (~1/2^32) or stale slot —
                         // fall through to ColdTier.
+                    } else {
+                        HWP_LAP(resolv_hot);
                     }
 
                     const std::uint64_t fp64 = key_fingerprint64(key);
                     auto cold_off = cold_->lookup(fp64);
+                    HWP_LAP(resolv_cold);
                     if (!cold_off) {
+                        HWP_CNT(cold_neg_lookups);
                         return KVOffset::Tombstone();
                     }
                     const KVOffset off = *cold_off;
@@ -291,12 +328,42 @@ class HiOM {
                     auto ro = viper_.get_read_only_client();
                     if (!ro.hiom_read_at_offset(off, &stored_key,
                                                 &stored_val)) {
+                        HWP_LAP(resolv_verify);
                         return KVOffset::Tombstone();  // page locked / torn
                     }
                     if (!(stored_key == key)) {
+                        HWP_LAP(resolv_verify);
                         return KVOffset::Tombstone();  // fp collision
                     }
+                    HWP_LAP(resolv_verify);
                     return off;
+                });
+
+            // Update fast path: DRAM-only HotTier resolver. Returns the
+            // HotTier hit's decoded offset WITHOUT the PM key-verify
+            // read the full resolver above does — Viper::Client::update
+            // folds that verify into the write lock it must take anyway
+            // (read data[slot].first under lock, compare, apply in
+            // place), eliminating the separate resolv_verify PM read on
+            // the common in-place-update path. hot_.lookup still sets
+            // the SIEVE visited bit, so it doubles as the SIEVE touch
+            // that Client::update used to do explicitly. A HotTier miss
+            // or a candidate that fails the in-lock key-check falls back
+            // to the full (verified) resolver installed above.
+            viper_.set_hiom_hot_only_resolver(
+                [this](const K& key) -> KVOffset {
+                    const std::uint32_t fp32 = key_fingerprint(key);
+                    if (auto packed = hot_.lookup(fp32)) {
+                        const auto d = decode(*packed,
+                                              route_to_region_default(),
+                                              base_map_);
+                        return KVOffset{
+                            static_cast<viper::block_size_t>(d.block_number),
+                            static_cast<viper::page_size_t>(d.page_number),
+                            static_cast<viper::data_offset_size_t>(
+                                d.data_offset)};
+                    }
+                    return KVOffset::Tombstone();
                 });
 
             // M3 follow-up #2 / P0: HiOM is the index from this point
@@ -401,7 +468,7 @@ class HiOM {
             }
         }
 
-        bool put(const K& key, const V& value) {
+        bool put(const K& key, const V& value, bool assume_new = false) {
             // Step 1: viper does the PM-side write (data + bitset persisted)
             // and updates its own CCEH. Persistence ordering is unchanged
             // from the original Viper put path (viper.hpp ~1037-1054).
@@ -412,7 +479,14 @@ class HiOM {
             // otherwise updates of an existing key would silently miss
             // the commit buffer + ColdTier path, leaving the CCEH offset
             // and the HiOM offset divergent (M4 Phase C bug).
-            const bool is_new_item = viper_.put(key, value);
+            // assume_new (pure-insert fast path): use the public put_assume_new
+            // shim so Viper's owns_index branch skips the old-offset resolver
+            // (a ColdTier PM negative lookup that is pure waste for a brand-new
+            // key). mirror below is unchanged (uses last_put_offset, never the
+            // resolver).
+            const bool is_new_item = assume_new
+                                         ? viper_.put_assume_new(key, value)
+                                         : viper_.put(key, value);
 
             // Step 2: mirror into HotTier (PINNED) and the commit buffer /
             // ColdTier. M4 Phase C: take the offset directly from the
@@ -539,9 +613,12 @@ class HiOM {
             // mirror_write(kPut) path.
             if constexpr (std::is_same_v<V, std::string>) {
                 mirror_write(key, CommitEntry::Op::kPut);
-            } else {
-                hiom_.hot_.lookup(key_fingerprint(key));  // SIEVE touch only
             }
+            // Fixed-size V: viper_.update took the owns_index fast path,
+            // whose hot_only_resolver already ran hot_.lookup (setting
+            // the SIEVE visited bit) to find the slot. No extra touch or
+            // commit push needed — the in-place write is durable at the
+            // unchanged offset and ColdTier's offset is unchanged.
             return true;
         }
 
@@ -592,6 +669,7 @@ class HiOM {
         void mirror_write_with_offset(const K& key, CommitEntry::Op op,
                                       KVOffset off) {
             if (off.is_tombstone()) return;
+            HWP_DECL();
 
             // M4 Phase E: report this client's most recent write block
             // so HiOM's next checkpoint frontier can be computed as
@@ -637,6 +715,7 @@ class HiOM {
             // failure stalled the producer ~50 µs per put,
             // collapsing thread:1 insert throughput to ~18 K/s. Gate
             // it on `packed_ok` so encode failure short-circuits.
+            HWP_LAP(mirror_misc);
             const bool packed_ok = packed.has_value();
             if (packed_ok) {
                 if (hiom_.cold_ != nullptr) {
@@ -667,10 +746,17 @@ class HiOM {
                     hiom_.hot_.upsert(key_fingerprint(key), *packed);
                 }
             }
+            HWP_LAP(hot_upsert);
 
             if (hiom_.cold_ != nullptr) {
                 push_commit({op, {}, key_fingerprint64(key), off, ref,
                              next_seq()});
+                // NOTE (profiling): commit_push below is the wall-clock of
+                // the push_commit call; its internal fadd+enqueue / wake
+                // split is accumulated separately (push_fadd_enq,
+                // push_wake) inside push_commit — components, not
+                // additional time.
+                HWP_LAP(commit_push);
                 // M4 Phase B: if upsert_pinned failed (ref.valid==false),
                 // the entry isn't in HotTier. Block until the commit
                 // buffer is drained so it reaches ColdTier before this
@@ -689,6 +775,7 @@ class HiOM {
                 // KeyType16+ValueType200 at ~885K records) would block
                 // the producer on a full drain every single put.
                 if (packed_ok && !ref.valid && hiom_.commit_buf_) {
+                    HWP_CNT(sync_drains);
                     while (hiom_.commit_buf_->size_hint() > 0) {
                         if (hiom_.try_inline_flush(kInlineFlushBatch) == 0) {
                             hiom_.wake_all_flushers();
@@ -697,6 +784,9 @@ class HiOM {
                         }
                     }
                 }
+                HWP_LAP(push_sync_drain);
+            } else {
+                HWP_LAP(commit_push);
             }
         }
 
@@ -725,6 +815,7 @@ class HiOM {
         // entries for a given key end up in the same drained batch
         // and the (fp64, seq) sort + winner picker stays correct.
         void push_commit(const CommitEntry& e) {
+            HWP_DECL();
             const std::size_t lane = CommitBuffer::lane_of_fp64(e.fp64);
             if (!prod_toks_[lane]) {
                 prod_toks_[lane]
@@ -754,9 +845,12 @@ class HiOM {
             // — the flusher's timer + predicate re-check is the backstop.
             const std::size_t lane_depth
                 = hiom_.commit_buf_->push(*prod_toks_[lane], lane, e);
+            HWP_LAP(push_fadd_enq);
             if (lane_depth == hiom_.per_lane_high_watermark_) {
                 hiom_.wake_all_flushers();
+                HWP_CNT(wake_calls);
             }
+            HWP_LAP(push_wake);
         }
 
         // M3 follow-up #2 Step 1 (2026-05-14): per-Client local seq,
@@ -839,6 +933,51 @@ class HiOM {
         return b;
     }
     BlockBaseMap& base_map() { return base_map_; }
+
+    // Warm the DRAM HotTier from the authoritative ColdTier: install every
+    // live (fp64, offset) into HotTier, touching its pages and populating
+    // the offset cache. OFF the steady-state path — intended for benchmark
+    // fixtures (gated by HIOM_WARM_HOT) to lift the lazy-mmap first-touch
+    // page-fault + the cold→hot re-warm OUT of the timed read loop, so the
+    // measured phase reflects steady-state HotTier hits rather than the
+    // one-shot warm-up (see the lazy-mmap change in hot_tier.hpp).
+    //
+    // Returns the number of offsets installed. Best-effort: an entry whose
+    // offset is not encodable into the 4-byte compact form (block beyond
+    // the single-region codec range, §4.4) is skipped — it stays
+    // ColdTier-only exactly as in steady state, and a read of that key
+    // simply misses HotTier and resolves via ColdTier.
+    //
+    // Concurrency: call when no client is writing (post-prefill /
+    // pre-timed-loop). HotTier::upsert is lock-free, so the parallel_load
+    // workers are safe; under a HotTier smaller than the live set they may
+    // evict each other and the surviving residents are arbitrary — warming
+    // is only meaningful at HotTier capacity ≥ working set (the full-
+    // capacity read config), which is exactly where the warm-up artifact
+    // appears. The C2 from-empty capacity sweep deliberately does NOT set
+    // HIOM_WARM_HOT, so it keeps warming during the read phase as before.
+    std::size_t warm_hot_tier(std::size_t num_threads = 8) {
+        if (cold_ == nullptr) return 0;
+        std::atomic<std::size_t> warmed{0};
+        cold_->parallel_load(
+            num_threads,
+            [this, &warmed](std::uint64_t fp64, KVOffset off) {
+                if (off.is_tombstone()) return;
+                const auto [block, page, slot] = off.get_offsets();
+                auto packed = encode(
+                    block, static_cast<std::uint8_t>(page),
+                    static_cast<std::uint16_t>(slot),
+                    route_to_region_default(), base_map_);
+                if (!packed) return;
+                // Reconstruct the fp32 key_fingerprint() would have produced
+                // (low 32 bits of the same hash, biased away from kEmptyFp).
+                std::uint32_t fp32 = static_cast<std::uint32_t>(fp64);
+                if (fp32 == HotTier::kEmptyFp) fp32 = 1u;
+                hot_.upsert(fp32, *packed);
+                warmed.fetch_add(1, std::memory_order_relaxed);
+            });
+        return warmed.load(std::memory_order_relaxed);
+    }
 
     // M5 introspection. flushed_count is the cumulative number of
     // commit-buffer entries that have been applied to ColdTier (across

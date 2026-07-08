@@ -18,6 +18,26 @@
 #include "cceh.hpp"
 #include "concurrentqueue.h"
 
+// --- Write-path profiling (opt-in via -DVIPER_WRITE_PROFILE) ---------------
+// Per-thread rdtscp phase accumulators for Client::put. Zero-cost (compiles
+// to (void)0) when the macro is undefined. Driver:
+// benchmark/write_profile_probe.cpp reads viper::wprof::tl from each worker.
+#ifdef VIPER_WRITE_PROFILE
+#include <cstdint>
+namespace viper { namespace wprof {
+struct Phases { uint64_t n, lock, slot, rec, bitmap, index, freeold, tail, alloc; };
+inline thread_local Phases tl{};
+inline uint64_t now() { unsigned a; return __rdtscp(&a); }
+}}  // namespace viper::wprof
+#define WP_DECL() uint64_t _wp = viper::wprof::now()
+#define WP_LAP(f) do { uint64_t _n = viper::wprof::now(); viper::wprof::tl.f += _n - _wp; _wp = _n; } while (0)
+#define WP_CNT() (++viper::wprof::tl.n)
+#else
+#define WP_DECL() ((void)0)
+#define WP_LAP(f) ((void)0)
+#define WP_CNT() ((void)0)
+#endif
+
 #ifndef NDEBUG
 #define DEBUG_LOG(msg) (std::cout << msg << std::endl)
 #else
@@ -86,6 +106,16 @@ struct ViperConfig {
     // ~2 GB to ~16 KB. The legacy fallback paths (M0 caller without
     // HiOM) still see the M0 default unless they explicitly opt in.
     size_t cceh_init_cap = 131072;
+    // Pre-fault freshly mapped VPage space at create/resize time (off the
+    // timed foreground path) so put() doesn't pay a first-touch page fault
+    // on every new PM page — the dominant fsdax write cost (design/HIOM.md
+    // E4; SEPH ships the same as -DPREFAULT=true). Applies to NEW mappings
+    // only; mappings recovered by open() are never touched (writing them
+    // would corrupt existing data). Off by default: create() of a large
+    // pool becomes seconds slower with it on, which would pollute
+    // recovery/open timing — write-throughput experiments opt in
+    // (fixtures read VIPER_PREFAULT=1).
+    bool prefault_new_mappings = false;
 };
 
 namespace internal {
@@ -414,6 +444,14 @@ class Viper {
       public:
         bool put(const K& key, const V& value);
 
+        // HiOM pure-insert fast path: like put() but the caller guarantees
+        // `key` is brand-new, so Viper's owns_index branch skips the old-offset
+        // resolver (a ColdTier PM negative lookup — pure waste for a new key).
+        // UNSAFE if `key` already exists (leaks the old VPage slot; never
+        // corrupts reads/recovery). Only the insert/prefill benchmark path
+        // (HIOM_ASSUME_NEW) calls it.
+        bool put_assume_new(const K& key, const V& value);
+
         // M4 Phase C: returns the KVOffset of the slot that put()
         // just allocated (vs. CCEH-peek, which can return a stale
         // duplicate entry under heavy update concurrency). Defined
@@ -442,7 +480,10 @@ class Viper {
       protected:
         Client(ViperT& viper);
 
-        bool put(const K& key, const V& value, bool delete_old);
+        // assume_new: caller guarantees `key` is brand-new (pure-insert
+        // workload), so the prior-offset lookup is skippable. HiOM-only
+        // (owns_index) fast path; see the resolver-skip in the definition.
+        bool put(const K& key, const V& value, bool delete_old, bool assume_new = false);
         inline void update_access_information();
         inline void update_var_size_page_information();
         inline bool get_value_from_offset(KVOffset offset, V* value);
@@ -542,6 +583,24 @@ class Viper {
         hiom_old_offset_resolver_ = std::move(fn);
     }
 
+    // Update fast path: a DRAM-only resolver that returns the HotTier
+    // hit's KVOffset WITHOUT the PM key-verify read that
+    // hiom_old_offset_resolver_ does. On a HotTier hit it returns the
+    // decoded offset (a fp32-collision *candidate*, not yet confirmed
+    // to hold `key`); on a HotTier miss it returns Tombstone().
+    // Client::update folds the key-verify into the write lock it must
+    // take anyway (read data[slot].first under lock, compare, then
+    // apply in place), so the separate 216 B resolv_verify PM read is
+    // eliminated on the common in-place-update path. A candidate whose
+    // in-lock key-check fails (fp32 collision / evicted+reused slot)
+    // falls back to the full hiom_old_offset_resolver_ (hot→cold+verify).
+    // Correctness: the key-check still happens BEFORE the destructive
+    // in-place write, so a fp32 collision can never overwrite another
+    // key's slot. Null unless HiOM owns the index.
+    void set_hiom_hot_only_resolver(OldOffsetResolver fn) {
+        hiom_hot_only_resolver_ = std::move(fn);
+    }
+
     // M3 follow-up #2 / P0: when true, write paths
     // (Client::put / update / remove / free_occupied_slot) skip
     // map_.Insert / map_.Get and use hiom_old_offset_resolver_ as
@@ -605,7 +664,7 @@ class Viper {
     void remove_client(Client* client);
 
     ViperFileMapping allocate_v_page_blocks();
-    void add_v_page_blocks(ViperFileMapping mapping);
+    void add_v_page_blocks(ViperFileMapping mapping, bool is_new_space);
     void recover_database();
     void trigger_resize();
     void trigger_reclaim(size_t num_reclaim_ops);
@@ -625,6 +684,11 @@ class Viper {
     // (empty std::function) means "no HiOM attached"; the
     // operator bool() check in the write paths gates the fallback.
     OldOffsetResolver hiom_old_offset_resolver_;
+
+    // Update fast path: see set_hiom_hot_only_resolver(). DRAM-only
+    // HotTier resolve, no PM verify; Client::update folds the verify
+    // into its write lock. Null unless HiOM owns the index.
+    OldOffsetResolver hiom_hot_only_resolver_;
 
     // M3 follow-up #2 / P0: see set_hiom_owns_index(). When true,
     // the legacy CCEH-on-write-path is fully bypassed in favour
@@ -694,7 +758,9 @@ Viper<K, V>::Viper(ViperBase v_base, const std::filesystem::path pool_dir, const
     }
 
     for (ViperFileMapping mapping : v_base_.v_mappings) {
-        add_v_page_blocks(mapping);
+        // A brand-new pool's mappings are fresh (all-zero) space; an opened
+        // pool's mappings hold live data and must never be pre-touched.
+        add_v_page_blocks(mapping, v_base_.is_new_db);
     }
 
     if (!v_base_.is_new_db && !v_config.skip_recovery) {
@@ -978,9 +1044,36 @@ ViperFileMapping Viper<K, V>::allocate_v_page_blocks() {
 }
 
 template <typename K, typename V>
-void Viper<K, V>::add_v_page_blocks(ViperFileMapping mapping) {
+void Viper<K, V>::add_v_page_blocks(ViperFileMapping mapping, bool is_new_space) {
     VPageBlock* start_block = reinterpret_cast<VPageBlock*>(mapping.start_addr);
     const block_size_t num_blocks_to_map = mapping.mapped_size / sizeof(VPageBlock);
+
+    // Pre-fault the mapping now (at create/resize time, off the timed write
+    // path) so the foreground put() doesn't pay first-touch minor faults on
+    // fresh PM pages (ViperConfig::prefault_new_mappings; VIPER_ALLOC_ABLATE
+    // keeps implying it for the legacy probes). Restricted to NEW space:
+    // create()'s initial mappings and resize()'s extensions are all-zero, so
+    // the touch writes are no-ops; a mapping recovered by open() holds live
+    // data and must not be written. Safe against concurrent clients — the
+    // blocks are published to v_blocks_ only after this loop, and resize
+    // runs on the background resize thread.
+    bool do_prefault = v_config_.prefault_new_mappings;
+#ifdef VIPER_ALLOC_ABLATE
+    do_prefault = true;  // L3: the ablation probes always prefault
+#endif
+    if (do_prefault && is_new_space) {
+        const std::size_t pages = mapping.mapped_size / PAGE_SIZE;
+        char* base = reinterpret_cast<char*>(mapping.start_addr);
+        const unsigned nt = 8;
+        std::vector<std::thread> pf;
+        pf.reserve(nt);
+        for (unsigned t = 0; t < nt; ++t) {
+            pf.emplace_back([=] {
+                for (std::size_t i = t; i < pages; i += nt) base[i * PAGE_SIZE] = 0;
+            });
+        }
+        for (auto& x : pf) x.join();
+    }
 
     is_v_blocks_resizing_.store(true, STORE_ORDER);
     v_blocks_.reserve(v_blocks_.size() + num_blocks_to_map);
@@ -1113,8 +1206,13 @@ void Viper<K, V>::get_block_based_access(Client* client) {
     client->v_page_->init();
     client->v_block_->v_pages[0].version_lock |= CLIENT_BIT;
 
+#ifndef VIPER_ALLOC_ABLATE
     v_base_.v_metadata->num_used_blocks.fetch_add(1, std::memory_order_relaxed);
     internal::pmem_persist(v_base_.v_metadata, sizeof(ViperFileMetadata));
+#endif
+    // VIPER_ALLOC_ABLATE (L2a): drop the per-block shared-cacheline atomic +
+    // PM persist of v_metadata. THROUGHPUT-ONLY: breaks num_used_blocks-based
+    // recovery; the real fix batches this per-thread instead of deleting it.
 }
 
 template <typename K, typename V>
@@ -1135,7 +1233,18 @@ KeyValueOffset Viper<K, V>::get_new_block() {
         // Choose random offset to evenly distribute load on all DIMMs
         page_size_t new_page = 0;
         if constexpr (!std::is_same_v<std::string, K>) {
+#ifdef VIPER_ALLOC_ABLATE
+            // L1: thread-local xorshift instead of glibc rand() (which takes
+            // a process-global lock on every call -> serializes allocators).
+            static thread_local uint64_t _ablate_r
+                = 0x243F6A8885A308D3ull ^ reinterpret_cast<uintptr_t>(&new_offset);
+            _ablate_r ^= _ablate_r << 13;
+            _ablate_r ^= _ablate_r >> 7;
+            _ablate_r ^= _ablate_r << 17;
+            new_page = _ablate_r % num_pages_per_block;
+#else
             new_page = rand() % num_pages_per_block;
+#endif
         }
         new_offset = KVOffset{new_block, new_page, 0};
     } while (!current_block_page_.compare_exchange_weak(raw_block_page, new_offset.offset));
@@ -1155,7 +1264,7 @@ void Viper<K, V>::trigger_resize() {
     resize_thread_ = std::make_unique<std::thread>([this] {
         DEBUG_LOG("Start resizing.");
         ViperFileMapping mapping = allocate_v_page_blocks();
-        add_v_page_blocks(mapping);
+        add_v_page_blocks(mapping, /*is_new_space=*/true);
         is_resizing_.store(false, STORE_ORDER);
         DEBUG_LOG("End resizing.");
     });
@@ -1235,8 +1344,11 @@ inline bool Viper<K, V>::check_key_equality(const K& key, const KVOffset offset_
 }
 
 template <typename K, typename V>
-bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_old) {
+bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_old,
+                              const bool assume_new) {
+    WP_DECL();
     v_page_->lock();
+    WP_LAP(lock);
 
     // We now have the lock on this page
     std::bitset<VPage::num_slots_per_page>* free_slots = &v_page_->free_slots;
@@ -1245,17 +1357,22 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
     if (free_slot_idx >= free_slots->size()) {
         // Page is full. Free lock on page and restart.
         v_page_->unlock();
+        WP_LAP(slot);
         update_access_information();
-        return put(key, value, delete_old);
+        WP_LAP(alloc);
+        return put(key, value, delete_old, assume_new);
     }
+    WP_LAP(slot);
 
     // We have found a free slot on this page. Persist data.
     v_page_->data[free_slot_idx] = {key, value};
     typename VPage::VEntry* entry_ptr = v_page_->data.data() + free_slot_idx;
     internal::pmem_persist(entry_ptr, sizeof(typename VPage::VEntry));
+    WP_LAP(rec);
 
     free_slots->reset(free_slot_idx);
     internal::pmem_persist(free_slots, sizeof(*free_slots));
+    WP_LAP(bitmap);
 
     // Store data in DRAM map.
     const KVOffset kv_offset{v_block_number_, v_page_number_, free_slot_idx};
@@ -1277,7 +1394,18 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
         // possible split contend across writers).
         this->viper_.hiom_map_skipped_.fetch_add(
             1, std::memory_order_relaxed);
-        old_offset = this->viper_.hiom_old_offset_resolver_(key);
+        // PoC (2026-06-24): pure-insert callers set assume_new ⇒ `key` is
+        // brand-new, so the prior offset is necessarily a tombstone. Skip the
+        // resolver: for a new key it would walk HotTier (miss) then a ColdTier
+        // PM linear-probe miss (~7.4k cyc @ insert-t24 = 60% of write time)
+        // only to confirm "not present". Misuse (key already exists) leaks the
+        // old VPage slot but never corrupts reads/recovery — HotTier/ColdTier
+        // still receive the new offset via mirror_write_with_offset.
+        if (assume_new) {
+            old_offset = KVOffset::Tombstone();
+        } else {
+            old_offset = this->viper_.hiom_old_offset_resolver_(key);
+        }
     } else {
         if constexpr (using_fp) {
             auto key_check_fn = [&](auto key, auto offset) { return this->viper_.check_key_equality(key, offset); };
@@ -1302,23 +1430,28 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
         }
     }
 
+    WP_LAP(index);
+
     const bool is_new_item = old_offset.is_tombstone();
     if (!is_new_item && delete_old) {
         // Need to free slot at old location for this key
         free_occupied_slot(old_offset, key);
     }
+    WP_LAP(freeold);
 
     v_page_->unlock();
 
     // We have added one value, so +1
     size_delta_++;
     info_sync();
+    WP_LAP(tail);
 
+    WP_CNT();
     return is_new_item;
 }
 
 template <>
-bool Viper<std::string, std::string>::Client::put(const std::string& key, const std::string& value, const bool delete_old) {
+bool Viper<std::string, std::string>::Client::put(const std::string& key, const std::string& value, const bool delete_old, const bool /*assume_new*/) {
     v_page_->lock();
     VPage* start_v_page = v_page_;
 
@@ -1431,6 +1564,11 @@ bool Viper<K, V>::Client::put(const K& key, const V& value) {
     return put(key, value, true);
 }
 
+template <typename K, typename V>
+bool Viper<K, V>::Client::put_assume_new(const K& key, const V& value) {
+    return put(key, value, /*delete_old=*/true, /*assume_new=*/true);
+}
+
 /**
  * Get the `value` for a given `key`.
  * Returns true if the item was found or false if not.
@@ -1522,31 +1660,82 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
         return this->viper_.check_key_equality(key, offset);
     };
 
+    if (this->viper_.hiom_owns_index_) {
+        // M3 follow-up #2 / P0: HiOM owns the index — skip map_.Get.
+        // Fast path folds the old-offset key-verify into the write
+        // lock: the DRAM-only hot_only_resolver gives a HotTier hit
+        // *candidate* offset (no PM read), then we lock the target
+        // page and confirm data[slot].first == key BEFORE the
+        // destructive in-place write. This eliminates the separate
+        // 216 B resolv_verify PM read on the common HotTier-hit path
+        // (the ~1654-cyc update bottleneck) while keeping the verify
+        // strictly before the write, so a fp32 collision can never
+        // overwrite another key's slot.
+        this->viper_.hiom_map_skipped_.fetch_add(
+            1, std::memory_order_relaxed);
+
+        enum TriState { kApplied, kKeyMismatch, kLockBusy };
+        // Lock the slot at `off`, verify it still holds `key`, apply
+        // update_fn in place. free_slots guard mirrors
+        // hiom_read_at_offset: a set bit ⇒ slot freed (reclaim off,
+        // so stale data lingers) ⇒ treat as mismatch.
+        auto try_at = [&](KVOffset off) -> TriState {
+            const auto [block, page, slot] = off.get_offsets();
+            VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
+            if (v_page.free_slots[slot]) return kKeyMismatch;
+            if (!v_page.lock(false)) return kLockBusy;
+            if (v_page.free_slots[slot]
+                || !(v_page.data[slot].first == key)) {
+                v_page.unlock();
+                return kKeyMismatch;
+            }
+            update_fn(&(v_page.data[slot].second));
+            v_page.unlock();
+            return kApplied;
+        };
+
+        // Fast path: HotTier (DRAM). Retry the SAME offset on lock
+        // contention (record can't move under an in-place workload);
+        // a key mismatch (fp32 collision / evicted+reused slot) falls
+        // through to the verified hot→cold resolver.
+        const KVOffset hot_off = this->viper_.hiom_hot_only_resolver_(key);
+        if (!hot_off.is_tombstone()) {
+            for (;;) {
+                const TriState r = try_at(hot_off);
+                if (r == kApplied) return true;
+                if (r == kKeyMismatch) break;  // → ColdTier fallback
+                // kLockBusy: spin on the same offset.
+            }
+        }
+
+        // Slow path: HotTier miss or fp32 collision. Fall back to the
+        // full verified resolver (hot→cold + PM verify). Rare on a
+        // hot-working-set update workload; behaviour is unchanged.
+        const KVOffset cold_off = this->viper_.hiom_old_offset_resolver_(key);
+        if (cold_off.is_tombstone()) return false;
+        for (;;) {
+            const TriState r = try_at(cold_off);
+            if (r == kApplied) return true;
+            if (r == kKeyMismatch) return false;  // slot no longer ours
+            // kLockBusy: spin on the same offset.
+        }
+    }
+
     while (true) {
-        KVOffset kv_offset;
-        if (this->viper_.hiom_owns_index_) {
-            // M3 follow-up #2 / P0: skip map_.Get; resolver is the
-            // sole index. Resolver returns Tombstone if no prior
-            // entry — same semantics as map_.Get returning tombstone.
-            this->viper_.hiom_map_skipped_.fetch_add(
-                1, std::memory_order_relaxed);
-            kv_offset = this->viper_.hiom_old_offset_resolver_(key);
-        } else {
-            kv_offset = this->viper_.map_.Get(key, key_check_fn);
-            // M6.5 full: post-restart with skip_recovery=true, map_ is
-            // empty for pre-existing keys; consult HiOM and hydrate map_
-            // so the next update on this key hits the fast path.
-            if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
-                const KVOffset resolved
-                    = this->viper_.hiom_old_offset_resolver_(key);
-                if (!resolved.is_tombstone()) {
-                    if constexpr (using_fp) {
-                        this->viper_.map_.Insert(key, resolved, key_check_fn);
-                    } else {
-                        this->viper_.map_.Insert(key, resolved);
-                    }
-                    kv_offset = resolved;
+        KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
+        // M6.5 full: post-restart with skip_recovery=true, map_ is
+        // empty for pre-existing keys; consult HiOM and hydrate map_
+        // so the next update on this key hits the fast path.
+        if (kv_offset.is_tombstone() && this->viper_.hiom_old_offset_resolver_) {
+            const KVOffset resolved
+                = this->viper_.hiom_old_offset_resolver_(key);
+            if (!resolved.is_tombstone()) {
+                if constexpr (using_fp) {
+                    this->viper_.map_.Insert(key, resolved, key_check_fn);
+                } else {
+                    this->viper_.map_.Insert(key, resolved);
                 }
+                kv_offset = resolved;
             }
         }
         if (kv_offset.is_tombstone()) {
