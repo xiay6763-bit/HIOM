@@ -2283,12 +2283,21 @@ inline void Viper<K, V>::ReadOnlyClient::hiom_prefetch_at_offset(
     // v_blocks_ / v_pages / data[] are DRAM-resident metadata; computing the
     // record address touches no PM. We deliberately skip the free_slots /
     // version_lock checks here — this is a hint, and pass 2's real
-    // hiom_read_at_offset re-validates. Prefetch to all cache levels (T0):
-    // the record (key+value, ~208B for KeyType16/ValueType200) spans a few
-    // lines, but the first line is what the read stalls on first, so a single
-    // prefetch of the record head already overlaps most of the miss latency.
+    // hiom_read_at_offset re-validates.
+    //
+    // A record is std::pair<K,V> (e.g. 16B key + 200B value = 216B for
+    // KeyType16/ValueType200) and straddles ceil(216/64) = 4 cache lines.
+    // pass 2 reads the WHOLE record (key verify + full value copy), so a
+    // single head-line prefetch (the previous behaviour) only overlapped
+    // ~1/4 of the PM miss — the last 3 lines still stalled cold. Prefetch
+    // every line the record spans (T0, all cache levels) so the entire
+    // record-read latency is overlapped, not just its first line.
     const VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
-    __builtin_prefetch(&v_page.data[slot], /*rw=*/0, /*locality=*/3);
+    const char* rec = reinterpret_cast<const char*>(&v_page.data[slot]);
+    constexpr std::size_t kRecLines =
+        (sizeof(typename VPage::VEntry) + 63) / 64;
+    for (std::size_t l = 0; l < kRecLines; ++l)
+        __builtin_prefetch(rec + l * 64, /*rw=*/0, /*locality=*/3);
 }
 
 template <>
