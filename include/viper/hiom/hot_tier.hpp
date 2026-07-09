@@ -29,12 +29,21 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <new>
 #include <optional>
 #include <vector>
 
 #include <sys/mman.h>  // mmap/munmap for lazy zero-page bucket allocation
+
+// SIMD bucket-scan probe (experimental, env-gated HIOM_SIMD_LOOKUP=1).
+// Compiled in only when the TU is built with AVX2 (benchmark/CMakeLists.txt
+// passes -mavx2). Scalar path is always present as fallback.
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define HIOM_HAVE_AVX2 1
+#endif
 
 namespace viper::hiom {
 
@@ -271,6 +280,48 @@ class HotTier {
         assert(fingerprint != kEmptyFp);
         const std::size_t bidx = bucket_index(fingerprint);
         const Bucket& b = buckets_[bidx];
+#if defined(HIOM_HAVE_AVX2)
+        // Experimental SIMD bucket scan (env HIOM_SIMD_LOOKUP=1). The wide
+        // (non-atomic) 256-bit loads act purely as a FILTER: for every slot
+        // whose high-32b fp lane the vector compare flags, we re-load that
+        // slot with an atomic acquire load and re-check the fp before
+        // trusting it — so a torn/stale wide read can only produce a
+        // candidate we then reject, never a false hit. A miss relative to a
+        // concurrent insert is the same benign race the scalar loop has (the
+        // lookup simply linearizes before that insert). packed = (fp<<32)|off,
+        // so fp lives in the HIGH dword of each 64-bit slot.
+        static const bool use_simd = [] {
+            const char* e = std::getenv("HIOM_SIMD_LOOKUP");
+            return e && *e && *e != '0';
+        }();
+        if (use_simd) {
+            const __m256i want = _mm256_set1_epi32(
+                static_cast<int>(fingerprint));
+            const std::uint64_t* base =
+                reinterpret_cast<const std::uint64_t*>(&b.slots[0]);
+            // 16 slots × 8B = 128B → four 256-bit chunks of 4 slots each.
+            for (int c = 0; c < 4; ++c) {
+                const __m256i v = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(base + c * 4));
+                const __m256i eq = _mm256_cmpeq_epi32(v, want);
+                // 8 dword lanes; fp is the odd (high) dword of each slot →
+                // keep only mask bits 1,3,5,7 == 0xAA.
+                int mm = _mm256_movemask_ps(_mm256_castsi256_ps(eq)) & 0xAA;
+                while (mm) {
+                    const int p = __builtin_ctz(mm);   // odd dword position
+                    mm &= mm - 1;
+                    const std::size_t i = c * 4 + (p >> 1);
+                    const std::uint64_t vv =
+                        b.slots[i].packed.load(std::memory_order_acquire);
+                    if (unpack_fp(vv) == fingerprint) {
+                        set_visited(meta_[bidx], i);
+                        return unpack_off(vv);
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+#endif
         for (std::size_t i = 0; i < kSlotsPerBucket; ++i) {
             const std::uint64_t v
                 = b.slots[i].packed.load(std::memory_order_acquire);
