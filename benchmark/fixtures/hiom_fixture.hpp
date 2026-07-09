@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -387,12 +388,87 @@ uint64_t HiOMFixture<KeyT, ValueT>::setup_and_find(uint64_t start_idx,
     std::random_device rnd{};
     auto rnd_engine = std::default_random_engine(rnd());
     std::uniform_int_distribution<> distrib(start_idx, end_idx);
+    std::uniform_real_distribution<double> udist(0.0, 1.0);
 
     auto cl = hiom_->get_client();
     uint64_t found_counter = 0;
+
+    // Opt-in skewed key distribution (HIOM_ZIPF=theta, e.g. 0.99). Default /
+    // unset => uniform (original behaviour). Standard YCSB ZipfianGenerator:
+    // rank 0 (== start_idx) is hottest, so the hot value set stays tiny and
+    // LLC-resident. This is the clean way to test [[value-cache-negative]]'s
+    // mechanism — whether value-read prefetch still helps once the hot values
+    // no longer miss to PM. zeta() is O(range) but computed once per thread.
+    const uint64_t range = end_idx > start_idx ? end_idx - start_idx : 1;
+    struct ZipfGen {
+        double theta, zeta_n, alpha, eta;
+        uint64_t n;
+        static double zeta(uint64_t k, double th) {
+            double s = 0.0;
+            for (uint64_t i = 1; i <= k; ++i) s += 1.0 / std::pow((double)i, th);
+            return s;
+        }
+        ZipfGen(uint64_t n_, double th) : theta(th), n(n_) {
+            const double z2 = zeta(2, th);
+            zeta_n = zeta(n, th);
+            alpha = 1.0 / (1.0 - th);
+            eta = (1.0 - std::pow(2.0 / (double)n, 1.0 - th)) /
+                  (1.0 - z2 / zeta_n);
+        }
+        uint64_t next(double u) const {
+            const double uz = u * zeta_n;
+            if (uz < 1.0) return 0;
+            if (uz < 1.0 + std::pow(0.5, theta)) return 1;
+            return (uint64_t)((double)n * std::pow(eta * u - eta + 1.0, alpha));
+        }
+    };
+    static thread_local const double zipf_theta = [] {
+        const char* e = std::getenv("HIOM_ZIPF");
+        return (!e || !*e) ? 0.0 : std::strtod(e, nullptr);
+    }();
+    const bool use_zipf = zipf_theta > 0.0;
+    const ZipfGen zipf{range, use_zipf ? zipf_theta : 0.99};
+    auto next_key = [&]() -> uint64_t {
+        return use_zipf ? start_idx + (zipf.next(udist(rnd_engine)) % range)
+                        : (uint64_t)distrib(rnd_engine);
+    };
+
+    // Opt-in batched group-prefetching read path (HIOM_GET_BATCH=B, B in
+    // [2, HiOMT::Client::kGetBatchMax]). Default / unset preserves the
+    // original per-key cl.get() loop exactly, so every existing eval config
+    // is unaffected. The batch path gathers B keys, then cl.get_batch()
+    // runs the two-pass prefetch pipeline. See HiOM::Client::get_batch.
+    static thread_local const uint64_t batch = [] {
+        const char* e = std::getenv("HIOM_GET_BATCH");
+        if (!e || !*e) return uint64_t{0};
+        const uint64_t b = std::strtoull(e, nullptr, 10);
+        constexpr uint64_t kMax = HiOMT::Client::kGetBatchMax;
+        return b < 2 ? uint64_t{0} : (b > kMax ? kMax : b);
+    }();
+
+    if (batch >= 2) {
+        std::vector<KeyT> keys(batch);
+        std::vector<ValueT> vals(batch);
+        std::vector<char> got(batch);
+        uint64_t done = 0;
+        while (done < num_finds) {
+            const uint64_t b = std::min<uint64_t>(batch, num_finds - done);
+            for (uint64_t j = 0; j < b; ++j)
+                keys[j] = KeyT{next_key()};
+            cl.get_batch(keys.data(), b, vals.data(),
+                         reinterpret_cast<bool*>(got.data()));
+            for (uint64_t j = 0; j < b; ++j)
+                found_counter += got[j]
+                    && (vals[j] == ValueT{static_cast<uint64_t>(
+                                              keys[j].data[0])});
+            done += b;
+        }
+        return found_counter;
+    }
+
     ValueT value;
     for (uint64_t i = 0; i < num_finds; ++i) {
-        const uint64_t key = distrib(rnd_engine);
+        const uint64_t key = next_key();
         const KeyT db_key{key};
         const bool found = cl.get(db_key, &value);
         found_counter += found && (value == ValueT{key});
@@ -460,6 +536,68 @@ inline uint64_t HiOMFixture<KeyType8, ValueType200>::run_ycsb(
     const bool log_latency = (hdrs.read != nullptr || hdrs.write != nullptr);
     uint64_t op_count = 0;
     std::chrono::high_resolution_clock::time_point start;
+
+    // Opt-in batched group-prefetching read path for YCSB (HIOM_GET_BATCH=B).
+    // Only in throughput mode: batching folds B reads' latency into one
+    // sample, which would corrupt the per-op HDR histogram — so latency runs
+    // always take the scalar path below. Consecutive GETs are gathered into a
+    // batch resolved by cl.get_batch (same two-pass prefetch pipeline as
+    // all_ops); any non-GET op flushes the pending batch first, preserving
+    // program order across the read/write boundary. For a 100r (YCSB-C)
+    // workload this degenerates to a pure prefetch pipeline. Semantics
+    // (op_count) are identical to the scalar loop.
+    static thread_local const uint64_t ycsb_batch = [] {
+        const char* e = std::getenv("HIOM_GET_BATCH");
+        if (!e || !*e) return uint64_t{0};
+        const uint64_t b = std::strtoull(e, nullptr, 10);
+        constexpr uint64_t kMax = HiOMT::Client::kGetBatchMax;
+        return b < 2 ? uint64_t{0} : (b > kMax ? kMax : b);
+    }();
+    if (ycsb_batch >= 2 && !log_latency) {
+        std::vector<KeyType8> keys(ycsb_batch);
+        std::vector<ValueType200> vals(ycsb_batch);
+        std::vector<char> got(ycsb_batch);
+        uint64_t bn = 0;
+        auto flush = [&]() {
+            if (bn == 0) return;
+            cl.get_batch(keys.data(), bn, vals.data(),
+                         reinterpret_cast<bool*>(got.data()));
+            for (uint64_t j = 0; j < bn; ++j)
+                op_count += got[j] && (vals[j] != null_value);
+            bn = 0;
+        };
+        for (uint64_t op_num = start_idx; op_num < end_idx; ++op_num) {
+            const ycsb::Record& record = data[op_num];
+            switch (record.op) {
+                case ycsb::Record::Op::GET:
+                    keys[bn++] = record.key;
+                    if (bn == ycsb_batch) flush();
+                    break;
+                case ycsb::Record::Op::INSERT:
+                    flush();
+                    cl.put(record.key, record.value);
+                    ++op_count;
+                    break;
+                case ycsb::Record::Op::UPDATE: {
+                    flush();
+                    auto update_fn = [&](ValueType200* v) {
+                        v->data[0] = record.value.data[0];
+                        viper::internal::pmem_persist(
+                            v->data.data(), sizeof(uint64_t));
+                    };
+                    op_count += cl.update(record.key, update_fn);
+                    break;
+                }
+                default:
+                    throw std::runtime_error(
+                        "Unknown YCSB op: "
+                        + std::to_string(static_cast<int>(record.op)));
+            }
+        }
+        flush();
+        return op_count;
+    }
+
     for (uint64_t op_num = start_idx; op_num < end_idx; ++op_num) {
         const ycsb::Record& record = data[op_num];
 

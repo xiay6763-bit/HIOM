@@ -511,7 +511,15 @@ class HiOM {
             } else {
                 HIOM_RSTAT_INC(hot_misses);
             }
+            return resolve_slow(key, fp, value);
+        }
 
+        // HotTier-miss / fp-collision tail shared by get() and get_batch().
+        // `fp` is the caller's already-computed 32-bit fingerprint (kept in
+        // the signature so batch pass-2 need not recompute and a future
+        // membership-filter hook has it). Behaviour is byte-identical to the
+        // original monolithic get()'s fall-through.
+        bool resolve_slow(const K& key, std::uint32_t /*fp*/, V* value) {
             if (hiom_.cold_ != nullptr) {
                 // M3 Phase D: ColdTier is authoritative when attached.
                 // No CCEH fallback. A double-miss (HotTier + ColdTier)
@@ -544,6 +552,65 @@ class HiOM {
                                         viper_.hiom_peek_offset(key));
             HIOM_RSTAT_INC(hot_warmups);
             return true;
+        }
+
+        // Batched group-prefetching get (Chen et al. SIGMOD'04). Resolves
+        // `n` independent keys with the PM record-read latencies overlapped:
+        //   pass 1 — for every key, probe the DRAM HotTier (fast, no PM) and,
+        //            on a hit, decode the compact offset to a KVOffset and
+        //            issue a software prefetch for the PM record.
+        //   pass 2 — perform the blocking verify+read at each resolved
+        //            offset (now warm) and, on a HotTier miss / fp collision,
+        //            fall through to the exact same ColdTier path get() uses.
+        // Semantics are identical to calling get() on each key in order;
+        // found[i] and values[i] mirror get()'s return/out-param. Because
+        // HiOM's index is DRAM-resident, pass 1 does zero index-chase PM
+        // reads — the two-pass pipeline degenerates to a clean value-only
+        // prefetch, which PM-resident-index schemes (EEPH+/PetPS) cannot do.
+        //
+        // n must be <= kGetBatchMax. Larger requests are chunked by the
+        // caller (fixture) or would overflow the on-stack state array.
+        static constexpr std::size_t kGetBatchMax = 32;
+        void get_batch(const K* keys, std::size_t n,
+                       V* values, bool* found) {
+            assert(n <= kGetBatchMax);
+            // Per-lookup state carried from pass 1 to pass 2.
+            std::uint32_t fp[kGetBatchMax];
+            KVOffset off[kGetBatchMax];
+            bool hot_hit[kGetBatchMax];
+
+            // Pass 1: DRAM HotTier probe + prefetch resolved PM records.
+            for (std::size_t i = 0; i < n; ++i) {
+                fp[i] = key_fingerprint(keys[i]);
+                hot_hit[i] = false;
+                if (auto packed = hiom_.hot_.lookup(fp[i])) {
+                    const auto d = decode(*packed, route_to_region_default(),
+                                          hiom_.base_map_);
+                    off[i] = KVOffset{
+                        static_cast<viper::block_size_t>(d.block_number),
+                        static_cast<viper::page_size_t>(d.page_number),
+                        static_cast<viper::data_offset_size_t>(d.data_offset)};
+                    hot_hit[i] = true;
+                    if (!off[i].is_tombstone())
+                        viper_.hiom_prefetch_at_offset(off[i]);
+                }
+            }
+
+            // Pass 2: blocking verify+read on the (now warm) records, with
+            // the ColdTier fallback matching get() exactly.
+            for (std::size_t i = 0; i < n; ++i) {
+                if (hot_hit[i]) {
+                    if (verify_and_read_offset(keys[i], off[i], &values[i])) {
+                        HIOM_RSTAT_INC(hot_hits);
+                        found[i] = true;
+                        continue;
+                    }
+                    HIOM_RSTAT_INC(hot_fp_collisions);
+                } else {
+                    HIOM_RSTAT_INC(hot_misses);
+                }
+                found[i] = resolve_slow(keys[i], fp[i], &values[i]);
+            }
         }
 
         bool remove(const K& key) {

@@ -1,3 +1,4 @@
+#include <iostream>
 #include <string>
 #include <random>
 
@@ -145,6 +146,23 @@ void bm_get(benchmark::State& state, BaseFixture& fixture) {
     state.SetItemsProcessed(num_finds_per_thread);
 
     if (is_init_thread(state)) {
+        // Env-guarded (HIOM_HITRATE=1) hit-rate diagnostic. Default: zero
+        // cost. Prints HotTier vs ColdTier hit split so a capacity sweep can
+        // tell whether a throughput knee is hit-rate-driven or something else.
+        // Safe here: the timed loops of all threads have completed (same
+        // point DeInitMap is gated to), and fixture_telemetry folds the
+        // per-Client stat shards. Viper returns zeros (no-op line).
+        if (const char* e = std::getenv("HIOM_HITRATE"); e && *e && *e != '0') {
+            const MemSnapshot snap = fixture.fixture_telemetry();
+            const double tot = static_cast<double>(snap.hot_hits + snap.cold_hits);
+            const double hr = tot > 0 ? snap.hot_hits / tot : 0.0;
+            std::cerr << "[hitrate] cap=" << snap.hot_capacity
+                      << " size=" << snap.hot_size
+                      << " hot=" << snap.hot_hits
+                      << " cold=" << snap.cold_hits
+                      << " rate=" << hr
+                      << " evict=" << snap.hot_evictions << std::endl;
+        }
         fixture.DeInitMap();
     }
 

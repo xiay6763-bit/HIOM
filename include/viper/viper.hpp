@@ -470,6 +470,14 @@ class Viper {
         // so HiOM can verify a 4-byte fingerprint match against the real
         // PM-side key.
         inline bool hiom_read_at_offset(KVOffset offset, K* key_out, V* value_out) const;
+        // HiOM group-prefetching (Chen et al. SIGMOD'04): issue a software
+        // prefetch for the PM record at `offset` without touching (loading)
+        // it, so a subsequent hiom_read_at_offset finds the line warm. Used
+        // by HiOM::Client::get_batch to overlap the PM record-read latency
+        // of B independent lookups. Pure address arithmetic on DRAM-resident
+        // VPage metadata + a non-faulting _mm_prefetch; no lock/version check
+        // (correctness is re-established by the real read in pass 2).
+        inline void hiom_prefetch_at_offset(KVOffset offset) const;
       protected:
         explicit ReadOnlyClient(ViperT& viper);
         inline const std::pair<typename KeyAccessor<K>::checker_type, typename ValueAccessor<V>::checker_type> get_const_entry_from_offset(KVOffset offset) const;
@@ -2266,6 +2274,21 @@ inline bool Viper<K, V>::ReadOnlyClient::hiom_read_at_offset(
     *key_out = v_page.data[slot].first;
     *value_out = v_page.data[slot].second;
     return lock_val == page_lock.load(LOAD_ORDER);
+}
+
+template <typename K, typename V>
+inline void Viper<K, V>::ReadOnlyClient::hiom_prefetch_at_offset(
+        KVOffset offset) const {
+    const auto [block, page, slot] = offset.get_offsets();
+    // v_blocks_ / v_pages / data[] are DRAM-resident metadata; computing the
+    // record address touches no PM. We deliberately skip the free_slots /
+    // version_lock checks here — this is a hint, and pass 2's real
+    // hiom_read_at_offset re-validates. Prefetch to all cache levels (T0):
+    // the record (key+value, ~208B for KeyType16/ValueType200) spans a few
+    // lines, but the first line is what the read stalls on first, so a single
+    // prefetch of the record head already overlaps most of the miss latency.
+    const VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
+    __builtin_prefetch(&v_page.data[slot], /*rw=*/0, /*locality=*/3);
 }
 
 template <>
