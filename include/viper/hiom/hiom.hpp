@@ -170,18 +170,29 @@ class HiOM {
     //
     // num_flushers (M3 follow-up #2 Step 3, 2026-05-14): how many
     // background flusher threads to spawn, each owning a disjoint
-    // subset of CommitBuffer::kNumLanes. Default 4 → each flusher
-    // owns 2 lanes (8 ColdTier regions). Must divide kNumLanes
+    // subset of CommitBuffer::kNumLanes. Must divide kNumLanes
     // evenly; valid values are 1, 2, 4, 8 (kNumLanes=8). Since same
     // fp64 always lives in one lane, two flushers never touch the
     // same HotTier slot or ColdTier region, so per-flusher mutexes
     // serialize each owner with its own inline-flusher writers
     // without cross-flusher contention.
+    //
+    // Default 2 (2026-07-09, was 4): background flusher PM writes poison
+    // the foreground resolver's PM reads, so fewer flushers => faster
+    // writes (all_ops insert t24: 1=1.97 / 2=1.44 / 4=1.31 M ops/s;
+    // YCSB-A mixed t24: flat ~13.1 for all). BUT fewer flushers also lag
+    // the checkpoint frontier, lengthening the O(tail) recovery replay
+    // (integration test: slow flusher => recovery_replayed jumps toward
+    // the full write set) — and recovery is HiOM's core (C3) axis. So we
+    // do NOT go to 1 (max write, longest tail); 2 keeps most of the write
+    // win with a bounded recovery-tail cost. num_flushers=1 stays
+    // available as an insert-heavy tuning knob (HIOM_FLUSHERS=1) at the
+    // documented cost of a longer recovery tail.
     struct FlusherConfig {
         std::chrono::milliseconds interval{std::chrono::milliseconds(5)};
         std::size_t high_watermark{1024};   // wake on size_hint() >= this
         std::size_t batch_max{8192};        // drain at most this many per cycle
-        std::size_t num_flushers{4};
+        std::size_t num_flushers{2};
     };
 
     // Tunables for the M5 A/B checkpoint protocol. cadence_entries is
@@ -565,8 +576,11 @@ class HiOM {
         // Semantics are identical to calling get() on each key in order;
         // found[i] and values[i] mirror get()'s return/out-param. Because
         // HiOM's index is DRAM-resident, pass 1 does zero index-chase PM
-        // reads — the two-pass pipeline degenerates to a clean value-only
-        // prefetch, which PM-resident-index schemes (EEPH+/PetPS) cannot do.
+        // reads — the two-pass pipeline is a clean value-only prefetch.
+        // (NOTE: this is the standard Chen'04 group-prefetch technique, not a
+        // HiOM novelty — EEPH+ [TACO'25], whose index is ALSO DRAM-resident,
+        // ships the same "batching & prefetching" scheme. get_batch is an
+        // engineering reuse, not a contribution; cite Chen'04 + EEPH+.)
         //
         // n must be <= kGetBatchMax. Larger requests are chunked by the
         // caller (fixture) or would overflow the on-stack state array.
