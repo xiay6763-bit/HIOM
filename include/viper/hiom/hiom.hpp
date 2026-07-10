@@ -139,6 +139,29 @@ inline std::uint64_t key_fingerprint64(const K& key) {
     return h == 0 ? 1ull : h;
 }
 
+// Step 1 (HashToken): the write path derives BOTH fingerprints from the
+// same key — fp32 for HotTier, fp64 for ColdTier — and the old code called
+// cceh::h twice (once per key_fingerprint / key_fingerprint64). fp32 is just
+// the low 32 bits of the SAME hash fp64 uses, so a single cceh::h yields
+// both. make_key_hash computes it once; fp32/fp64 are bit-identical to what
+// the standalone helpers produce (same low-32 / full-64 bias-to-1 rules), so
+// HotTier slots and ColdTier entries written via KeyHash match reads that
+// still go through key_fingerprint(). Used on the write/remove paths where
+// both fingerprints are always needed; the read hot path stays on the
+// single-fp32 key_fingerprint() so a hot hit never eagerly computes fp64.
+struct KeyHash {
+    std::uint32_t fp32;  // HotTier fingerprint (biased away from kEmptyFp)
+    std::uint64_t fp64;  // ColdTier fingerprint (biased away from 0)
+};
+
+template <typename K>
+inline KeyHash make_key_hash(const K& key) {
+    const std::uint64_t h
+        = static_cast<std::uint64_t>(cceh::h(&key, sizeof(K)));
+    const std::uint32_t fp = static_cast<std::uint32_t>(h);
+    return KeyHash{fp == 0u ? 1u : fp, h == 0ull ? 1ull : h};
+}
+
 template <typename K, typename V>
 class HiOM {
   public:
@@ -629,6 +652,9 @@ class HiOM {
 
         bool remove(const K& key) {
             const bool viper_ok = viper_.remove(key);
+            // Step 1 (HashToken): fp32 (HotTier evict) + fp64 (commit route)
+            // from one hash — remove hashed the key twice before.
+            const KeyHash kh = make_key_hash(key);
             // M3 follow-up #2 / P0: even if viper_.remove returned false,
             // the resolver may have missed an in-flight kPut for `key`
             // (HotTier fp32 collision + ColdTier stale offset, before
@@ -643,7 +669,7 @@ class HiOM {
             // applies and a future reclaim pass would compact it. This
             // is a known P0 trade-off, exercised only when fp32
             // collisions happen during heavy update+remove churn.
-            hiom_.hot_.remove(key_fingerprint(key));
+            hiom_.hot_.remove(kh.fp32);
             if (hiom_.cold_ != nullptr) {
                 // Push remove through the buffer so it serializes with
                 // earlier puts of the same key. Direct cold_.remove
@@ -651,7 +677,7 @@ class HiOM {
                 // and the flusher would then write the obsolete put
                 // *after* the remove.
                 push_commit({CommitEntry::Op::kRemove,
-                             {}, key_fingerprint64(key),
+                             {}, kh.fp64,
                              KVOffset{},  // unused for kRemove
                              HotTier::SlotRef{},
                              next_seq()});
@@ -752,6 +778,12 @@ class HiOM {
             if (off.is_tombstone()) return;
             HWP_DECL();
 
+            // Step 1 (HashToken): one cceh::h for both fingerprints. fp32
+            // (HotTier pin) and fp64 (ColdTier route + commit entry) are the
+            // low-32 / full-64 slices of the same hash — computing them apart
+            // hashed the key twice per write.
+            const KeyHash kh = make_key_hash(key);
+
             // M4 Phase E: report this client's most recent write block
             // so HiOM's next checkpoint frontier can be computed as
             // the min over all active clients. Without this, an "old"
@@ -806,7 +838,7 @@ class HiOM {
                     // PINNED slots, drain a chunk synchronously and
                     // retry — the inline-flush turns some PINNED
                     // slots back to UNPINNED, freeing room.
-                    const std::uint32_t fp32 = key_fingerprint(key);
+                    const std::uint32_t fp32 = kh.fp32;
                     ref = hiom_.hot_.upsert_pinned(fp32, *packed);
                     for (int attempt = 0;
                          !ref.valid && attempt < kMaxBackpressureRetries;
@@ -824,13 +856,13 @@ class HiOM {
                 } else {
                     // No buffer; classic M0 mirror. Eviction is safe
                     // because Viper's CCEH still holds the offset.
-                    hiom_.hot_.upsert(key_fingerprint(key), *packed);
+                    hiom_.hot_.upsert(kh.fp32, *packed);
                 }
             }
             HWP_LAP(hot_upsert);
 
             if (hiom_.cold_ != nullptr) {
-                push_commit({op, {}, key_fingerprint64(key), off, ref,
+                push_commit({op, {}, kh.fp64, off, ref,
                              next_seq()});
                 // NOTE (profiling): commit_push below is the wall-clock of
                 // the push_commit call; its internal fadd+enqueue / wake
