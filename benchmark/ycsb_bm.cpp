@@ -1,6 +1,8 @@
 #include <string>
 #include <random>
 #include <fstream>
+#include <cstdio>
+#include <cstdlib>
 
 #include <benchmark/benchmark.h>
 #include <hdr_histogram.h>
@@ -102,6 +104,12 @@ inline std::string ycsb_workload_path(const char* workload) {
 
 
 static std::vector<ycsb::Record> prefill_data;
+// True only when the prefill was actually shrunk below the full dataset
+// (YCSB_PREFILL_LIMIT), so reads may target keys that were never
+// inserted. Used to downgrade the read-correctness gate to a warning:
+// a full prefill must still pass read_success==1.0. Note this is
+// independent of YCSB_OPS_LIMIT — capping ops keeps reads ⊆ prefill.
+static bool prefill_was_capped = false;
 static std::vector<ycsb::Record> data_uniform_50_50;
 static std::vector<ycsb::Record> data_uniform_10_90;
 static std::vector<ycsb::Record> data_zipf_50_50;
@@ -135,6 +143,11 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
         // The global prefill_data vector is already resident in both snapshots
         // and cancels out — no more estimated harness-vector subtraction.
         mem_baseline = capture_mem();
+        // Size any fixture-owned index (HiOM's ColdTier) to the actual
+        // prefill before it's built — InitMap's num_prefill_inserts is 0
+        // on the YCSB path, so the count must be passed in here. No-op
+        // for fixtures that don't own a resizable index.
+        fixture.reserve_index_capacity(prefill_data.size());
         fixture.InitMap();
         fixture.prefill_ycsb(prefill_data);
         // Drain any async post-prefill work (e.g., HiOM commit buffer)
@@ -253,9 +266,41 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
         mem_loaded.hot_evictions = mem_final.hot_evictions;
         mem_loaded.hot_hits = mem_final.hot_hits;
         mem_loaded.cold_hits = mem_final.cold_hits;
+        mem_loaded.cold_misses = mem_final.cold_misses;
+        mem_loaded.cold_fp_collisions = mem_final.cold_fp_collisions;
         mem_loaded.rss_kb = mem_final.rss_kb;
         mem_loaded.pool_rss_kb = mem_final.pool_rss_kb;
         report_mem(state, mem_baseline, mem_loaded, fixture.fixture_dram_bytes());
+
+        // found==expected gate: with a full prefill == keyspace and every
+        // read drawn from within it, a failed read means the read path is
+        // wrong (e.g. silent ColdTier overflow lost an entry, or a verify
+        // race). Fail hard rather than publish an inflated hit rate. Only
+        // sound when reads ⊆ prefill — that holds unless the prefill was
+        // actually shrunk (YCSB_PREFILL_LIMIT); capping ops alone keeps
+        // reads within the full prefill. cold_fp_collisions is included
+        // in the failure count (it too is a non-successful read), so the
+        // message says "read correctness" rather than "lost entries".
+        // Skipped for non-HiOM fixtures (cold_* counters stay zero).
+        const std::uint64_t th = mem_final.hot_hits + mem_final.cold_hits;
+        const std::uint64_t tg =
+            th + mem_final.cold_misses + mem_final.cold_fp_collisions;
+        if (tg > 0 && th != tg) {
+            std::fprintf(stderr,
+                "[HiOM %s] read correctness failure: read_success_rate="
+                "%.6f < 1.0 (%llu of %llu gets failed: %llu cold_misses, "
+                "%llu fp_collisions)%s\n",
+                prefill_was_capped ? "WARN" : "FATAL",
+                static_cast<double>(th) / static_cast<double>(tg),
+                static_cast<unsigned long long>(tg - th),
+                static_cast<unsigned long long>(tg),
+                static_cast<unsigned long long>(mem_final.cold_misses),
+                static_cast<unsigned long long>(mem_final.cold_fp_collisions),
+                prefill_was_capped
+                    ? " — expected under prefill cap, not aborting"
+                    : "");
+            if (!prefill_was_capped) std::abort();
+        }
 
         fixture.DeInitMap();
     }
@@ -292,6 +337,7 @@ int main(int argc, char** argv) {
         const size_t limit = std::strtoull(env, nullptr, 10);
         if (limit > 0 && limit < prefill_data.size()) {
             prefill_data.resize(limit);
+            prefill_was_capped = true;
             std::cout << "Capped prefill_data to " << limit << " records." << std::endl;
         }
     }

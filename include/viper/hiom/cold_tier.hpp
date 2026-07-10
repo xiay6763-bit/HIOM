@@ -83,6 +83,11 @@ class ColdTier {
     static constexpr std::uint64_t kTombstoneOffset = 0xFFFF'FFFF'FFFF'FFFFull;
     static constexpr std::uint64_t kNoOverflow = 0;  // 0 means "none" (idx 0 reserved)
 
+    // Small safety-net defaults — callers that know their key count MUST
+    // size via sizing_for() (fixtures, recovery_bm, probes all do). These
+    // exist only so a forgotten sizing surfaces as a fail-fast overflow
+    // abort rather than a huge pre-allocated file: kept intentionally
+    // small so no path silently over-allocates ~1 GiB of PM.
     static constexpr std::size_t kDefaultMainBuckets = 8192;
     static constexpr std::size_t kDefaultOverflowSlots = 16384;  // 2x main
 
@@ -122,10 +127,55 @@ class ColdTier {
     static_assert(sizeof(GlobalHeader) <= 4096,
                   "GlobalHeader must fit in first PAGE");
 
+    // Round up to the next power of two (>= 1). Local helper — the repo
+    // builds at C++17, so std::bit_ceil (C++20) isn't available.
+    static std::size_t next_pow2(std::size_t v) {
+        if (v <= 1) return 1;
+        return std::size_t{1} << (64 - __builtin_clzll(v - 1));
+    }
+
+    // Compute (main_buckets, overflow_slots) per region to hold roughly
+    // `expected_keys` total live entries at a target load factor, with
+    // headroom. main_buckets is the addressable table (must be pow2 —
+    // create() rounds anyway); overflow absorbs chain spill. Every
+    // caller that knows its key count should size through this so PM
+    // footprint tracks the workload instead of the safety-net default.
+    struct Sizing {
+        std::size_t main_buckets;
+        std::size_t overflow_slots;
+    };
+    static Sizing sizing_for(std::size_t expected_keys) {
+        // Slots needed per region at target load; +1 to round up.
+        constexpr double kTargetLoad = 0.5;
+        const double slots_per_region
+            = static_cast<double>(expected_keys)
+              / static_cast<double>(kNumRegions);
+        std::size_t main = static_cast<std::size_t>(
+            slots_per_region / (kEntriesPerBucket * kTargetLoad)) + 1;
+        main = next_pow2(std::max<std::size_t>(8192, main));
+        // Overflow pool sized to match main — generous, since chains
+        // only form under fingerprint clustering, not raw load.
+        return Sizing{main, main};
+    }
+
     static std::unique_ptr<ColdTier> create(
             const std::string& pool_file,
             std::size_t main_buckets_per_region = kDefaultMainBuckets,
             std::size_t overflow_slots_per_region = kDefaultOverflowSlots) {
+        // bucket_id_of() masks with (main_buckets - 1), so main_buckets
+        // MUST be a power of two or a large fraction of the table is
+        // unaddressable (silent load-factor blowup). Round both pools up
+        // to the next power of two here — one guard covers every caller
+        // (fixtures, recovery_bm, probes) regardless of the sizing
+        // arithmetic they used.
+        // Only main_buckets is masked (bucket_id_of uses & (main-1)), so
+        // ONLY it must be a power of two. The overflow pool is a linear
+        // bump allocator (next_overflow_alloc fetch_add) — rounding it up
+        // would just waste PM, so leave it exactly as requested.
+        main_buckets_per_region
+            = next_pow2(std::max<std::size_t>(1, main_buckets_per_region));
+        overflow_slots_per_region
+            = std::max<std::size_t>(1, overflow_slots_per_region);
         // Reserve overflow_idx=0 as "no chain" sentinel — actual indices
         // start at 1. So we reserve one extra Bucket slot at the bottom
         // of the overflow pool that's never allocated.

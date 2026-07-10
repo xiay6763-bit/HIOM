@@ -95,6 +95,24 @@ class HiOMFixture : public BaseFixture {
     // prefill_ycsb finishes (init thread only).
     void flush_post_prefill() final {
         if (hiom_) hiom_->flush_and_wait();
+        // Verify the authoritative ColdTier actually holds every prefilled
+        // key — "sized for N" (printed at create) is a capacity promise,
+        // this is the realised count. A shortfall means entries were lost
+        // on the write path (overflow, dropped upsert) and must fail fast
+        // before any read metric is reported. expected_cold_keys_ is the
+        // YCSB prefill size (via reserve_index_capacity); 0 on paths that
+        // didn't set it (skip the check there).
+        if (cold_ && expected_cold_keys_ > 0) {
+            const std::size_t got = cold_->approx_size();
+            if (got != expected_cold_keys_) {
+                std::cerr << "[HiOM FATAL] ColdTier size " << got
+                          << " != expected " << expected_cold_keys_
+                          << " after prefill — lost index entries" << std::endl;
+                std::abort();
+            }
+            std::cerr << "[HiOM] ColdTier post-prefill size " << got
+                      << " == expected " << expected_cold_keys_ << std::endl;
+        }
         warm_hot_if_requested();
     }
 
@@ -115,6 +133,9 @@ class HiOMFixture : public BaseFixture {
             const auto& stats = hiom_->stats();
             snap.hot_hits = stats.hot_hits.load(std::memory_order_relaxed);
             snap.cold_hits = stats.cold_hits.load(std::memory_order_relaxed);
+            snap.cold_misses = stats.cold_misses.load(std::memory_order_relaxed);
+            snap.cold_fp_collisions =
+                stats.cold_fp_collisions.load(std::memory_order_relaxed);
         }
         return snap;
     }
@@ -134,6 +155,13 @@ class HiOMFixture : public BaseFixture {
     // Optional knobs — call before InitMap to override defaults.
     void SetHotTierBuckets(std::size_t b) { hot_buckets_pow2_ = b; }
     void SetCheckpointCadence(std::uint64_t e) { checkpoint_cadence_ = e; }
+
+    // See BaseFixture::reserve_index_capacity. Stored here and consumed
+    // by InitMap to size the ColdTier for the YCSB prefill (whose count
+    // isn't visible via num_prefill_inserts on that path).
+    void reserve_index_capacity(std::size_t expected_keys) override {
+        expected_cold_keys_ = expected_keys;
+    }
 
   protected:
     // Warm the HotTier from the authoritative ColdTier so the timed read
@@ -185,6 +213,7 @@ class HiOMFixture : public BaseFixture {
     // Override via SetHotTierBuckets() to exercise eviction explicitly.
     std::size_t hot_buckets_pow2_ = (1ULL << 21);
     std::uint64_t checkpoint_cadence_ = 4096;
+    std::size_t expected_cold_keys_ = 0;  // set via reserve_index_capacity
 };
 
 template <typename KeyT, typename ValueT>
@@ -251,10 +280,13 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     }
     viper_ = ViperT::create(kHiomViperPoolDir, BM_POOL_SIZE, vcfg);
 
-    // 2. ColdTier (PM-resident hash index). Default sizing in
-    //    ColdTier::create handles up to ~256K main + 256K overflow per
-    //    region × 32 regions = 16M entries main capacity, plenty for
-    //    the 1M default and the 100M aspirational sweep.
+    // 2. ColdTier (PM-resident hash index), sized to the workload.
+    //    Key count source: reserve_index_capacity(prefill_data.size())
+    //    on the YCSB path (InitMap sees num_prefill_inserts=0 there), or
+    //    num_prefill_inserts on the all_ops path. If neither is known,
+    //    fall back to ColdTier's safety-net default (holds 10M).
+    //    sizing_for() targets ~0.5 load and rounds main buckets to a
+    //    power of two (bucket_id_of masks with main_buckets-1).
     //    HIOM_COLD_DIR can redirect this backing off PM (e.g. a node-1
     //    remote-DRAM tmpfs) to emulate a volatile CXL-DDR cold tier.
     const std::string cold_dir = hiom_cold_dir();
@@ -262,7 +294,21 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     if (std::getenv("HIOM_COLD_DIR")) {  // only chatter when redirected off PM
         std::cerr << "[HiOM] ColdTier+checkpoint backing = " << cold_dir << std::endl;
     }
-    cold_ = viper::hiom::ColdTier::create(cold_dir + "/cold.bin");
+    const std::size_t cold_keys =
+        expected_cold_keys_ ? expected_cold_keys_ : num_prefill_inserts;
+    if (cold_keys > 0) {
+        const auto sz = viper::hiom::ColdTier::sizing_for(cold_keys);
+        std::cerr << "[HiOM] ColdTier sized for " << cold_keys << " keys: "
+                  << sz.main_buckets << " main + " << sz.overflow_slots
+                  << " overflow /region (cap "
+                  << (viper::hiom::ColdTier::kNumRegions * sz.main_buckets
+                      * viper::hiom::ColdTier::kEntriesPerBucket)
+                  << " main slots)" << std::endl;
+        cold_ = viper::hiom::ColdTier::create(
+            cold_dir + "/cold.bin", sz.main_buckets, sz.overflow_slots);
+    } else {
+        cold_ = viper::hiom::ColdTier::create(cold_dir + "/cold.bin");
+    }
 
     // 3. Checkpoint (A/B record, same backing medium as ColdTier).
     chkpt_ = viper::hiom::Checkpoint::create(cold_dir + "/chkpt.bin");
@@ -272,7 +318,7 @@ void HiOMFixture<KeyT, ValueT>::InitMap(uint64_t num_prefill_inserts,
     //    matches HIOM.md §M5. FlusherConfig defaults to 5 ms / 1024
     //    high-watermark.
     typename HiOMT::FlusherConfig fcfg;
-    // HIOM_FLUSHERS (must divide CommitBuffer::kNumLanes=8; default 4):
+    // HIOM_FLUSHERS (must divide CommitBuffer::kNumLanes=8; default 2):
     // the 2026-07-07 split-probe showed background flusher PM writes poison
     // the foreground resolver's PM reads — fewer flushers => far faster
     // write path (INSERT t8 4.2× / t24 2.1× at f1 vs f4 in the microprobe).

@@ -144,15 +144,13 @@ void cleanup_all() {
 //     prefill cursor; M6 tail scan covers [frontier-1, current).
 void prefill(std::size_t N, std::uint64_t seed) {
     auto viper = ViperT::create(kPoolDir, pool_size_for(N));
-    constexpr std::size_t kNumRegions = 32;
-    constexpr std::size_t kEntriesPerBucket = 7;
-    const std::size_t main_buckets
-        = std::max<std::size_t>(
-            8192,
-            (N / kNumRegions / kEntriesPerBucket) * 3);
-    const std::size_t overflow_slots = main_buckets * 2;
+    // Size the ColdTier to N via the shared helper (targets ~0.5 load,
+    // rounds main buckets to a power of two — bucket_id_of masks with
+    // main_buckets-1, so non-pow2 sizing would leave most of the table
+    // unaddressable and blow up chain length).
+    const auto sz = viper::hiom::ColdTier::sizing_for(N);
     auto cold  = viper::hiom::ColdTier::create(
-        kColdPoolFile, main_buckets, overflow_slots);
+        kColdPoolFile, sz.main_buckets, sz.overflow_slots);
     auto chkpt = viper::hiom::Checkpoint::create(kCheckpointFile);
 
     auto vclient = viper->get_client();
@@ -163,7 +161,12 @@ void prefill(std::size_t N, std::uint64_t seed) {
         const std::uint64_t key = i + 1;
         vclient.put(key, rng());
         const auto off = vclient.hiom_peek_offset(key);
-        cold->upsert(viper::hiom::key_fingerprint64(key), off);
+        if (!cold->upsert(viper::hiom::key_fingerprint64(key), off)) {
+            std::fprintf(stderr,
+                "\n[HiOM FATAL] ColdTier overflow at key %zu/%zu during "
+                "prefill — index sizing too small\n", i, N);
+            std::abort();
+        }
         if ((i & ((1 << 20) - 1)) == 0 && i > 0) {
             std::printf("    prefilled %zu / %zu\r", i, N);
             std::fflush(stdout);

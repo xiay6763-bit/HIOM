@@ -74,6 +74,14 @@ class BaseFixture : public benchmark::Fixture {
     // doesn't contend with the background flusher for PMem bandwidth.
     virtual void flush_post_prefill() {}
 
+    // Hint the expected total number of live keys BEFORE InitMap, so an
+    // index-owning fixture can pre-size its persistent structures to the
+    // workload instead of a safety-net default. Called by ycsb_bm with
+    // prefill_data.size() (the ~10M YCSB prefill), which InitMap itself
+    // cannot see (it receives num_prefill_inserts=0 on the YCSB path).
+    // Default no-op — ViperFixture/DashFixture/CcehFixture ignore it.
+    virtual void reserve_index_capacity(std::size_t /*expected_keys*/) {}
+
     // Returns a memory snapshot for telemetry reporting. Default captures
     // process-wide RSS + the /pmem0 pool RSS share. HiOMFixture overrides
     // to additionally fill in HotTier size / capacity / evictions and

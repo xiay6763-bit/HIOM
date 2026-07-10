@@ -122,8 +122,8 @@ void run(const char* mode, int nt, std::size_t ops, std::size_t prefill) {
     const std::size_t distinct = upd ? prefill : (std::size_t)nt*ops;
     viper::ViperConfig cfg; cfg.cceh_init_cap = 1; cfg.resize_threshold = 1e9;
     auto viper = ViperT::create(kPool, gib((distinct + (std::size_t)nt*ops)*224*7/5), cfg);
-    const std::size_t main_buckets = std::max<std::size_t>(8192, (distinct/32/7)*3);
-    auto cold  = viper::hiom::ColdTier::create(kCold, main_buckets, main_buckets*2);
+    const auto sz = viper::hiom::ColdTier::sizing_for(distinct);
+    auto cold  = viper::hiom::ColdTier::create(kCold, sz.main_buckets, sz.overflow_slots);
     auto chkpt = viper::hiom::Checkpoint::create(kChkpt);
     HiOMT hiom(*viper, hot_buckets_for(distinct), cold.get(), fcfg(), chkpt.get());
 

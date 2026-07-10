@@ -27,6 +27,8 @@ struct MemSnapshot {
     std::uint64_t hot_evictions = 0;
     std::uint64_t hot_hits = 0;
     std::uint64_t cold_hits = 0;
+    std::uint64_t cold_misses = 0;        // key genuinely absent from ColdTier
+    std::uint64_t cold_fp_collisions = 0; // present but verify failed
     std::uint64_t hot_dram_bytes = 0;  // HotTier index struct DRAM (buckets+meta sizeof)
 };
 
@@ -124,10 +126,31 @@ inline void report_mem(benchmark::State& state,
     // white-box dram_bytes() metric.
     state.counters["hot_tier_index_dram_mb"] =
         static_cast<double>(loaded.hot_dram_bytes) * b_to_mb;
+    // Read-path accounting. Every get() terminates in exactly one of
+    // {hot_hits, cold_hits, cold_fp_collisions, cold_misses}, so their
+    // sum is the true number of gets. Report rates against that
+    // denominator — NOT hits-only, which inflates the hit rate by
+    // hiding absent-key lookups.
     const std::uint64_t total_hits = loaded.hot_hits + loaded.cold_hits;
-    if (total_hits > 0) {
+    const std::uint64_t total_gets =
+        total_hits + loaded.cold_misses + loaded.cold_fp_collisions;
+    if (total_gets > 0) {
+        const double denom = static_cast<double>(total_gets);
+        state.counters["read_success_rate"] =
+            static_cast<double>(total_hits) / denom;
         state.counters["hot_hit_rate"] =
-            static_cast<double>(loaded.hot_hits) / static_cast<double>(total_hits);
+            static_cast<double>(loaded.hot_hits) / denom;
+        state.counters["cold_hit_rate"] =
+            static_cast<double>(loaded.cold_hits) / denom;
+        state.counters["cold_miss_rate"] =
+            static_cast<double>(loaded.cold_misses) / denom;
+        // Legacy metric, renamed to what it actually is (hot's share of
+        // successful reads) so it can't be misread as a hit rate.
+        if (total_hits > 0) {
+            state.counters["hot_share_of_hits"] =
+                static_cast<double>(loaded.hot_hits)
+                / static_cast<double>(total_hits);
+        }
     }
 }
 

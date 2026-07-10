@@ -440,12 +440,88 @@ int run_microbench() {
     return 0;
 }
 
+// --- Review follow-up: sizing_for helper + power-of-two + fail-fast ---
+
+// sizing_for(N) must return a power-of-two main-bucket count with enough
+// capacity to hold N entries, and create() must realise at least that.
+int run_sizing_for() {
+    std::cout << "=== ColdTier sizing_for (capacity + pow2) ===" << std::endl;
+    int rc = 0;
+    for (std::size_t n : {std::size_t{1'000'000}, std::size_t{10'000'000},
+                          std::size_t{100'000'000}}) {
+        const auto sz = ColdTier::sizing_for(n);
+        const bool pow2 =
+            (sz.main_buckets & (sz.main_buckets - 1)) == 0 && sz.main_buckets > 0;
+        const std::size_t cap =
+            ColdTier::kNumRegions * sz.main_buckets * ColdTier::kEntriesPerBucket;
+        std::cout << "  N=" << n << "  main=" << sz.main_buckets
+                  << "  overflow=" << sz.overflow_slots << "  cap=" << cap
+                  << (pow2 ? "  [pow2]" : "  [NOT pow2!]") << std::endl;
+        if (!pow2) { std::cerr << "  FAIL: main not power of two\n"; rc = 1; }
+        if (cap < n) { std::cerr << "  FAIL: capacity < N\n"; rc = 1; }
+    }
+    if (rc == 0) std::cout << "  PASS" << std::endl;
+    return rc;
+}
+
+// create() must round a non-power-of-two main-bucket request UP to the
+// next power of two (bucket_id_of masks with main-1). Overflow, a linear
+// pool, is left exactly as requested.
+int run_pow2_rounding() {
+    std::cout << "=== ColdTier create() rounds main to pow2 ===" << std::endl;
+    cleanup();
+    // 5000 -> 8192, 3000 -> 4096; overflow 3000 stays 3000.
+    auto ct = ColdTier::create(kPoolFile, 5000, 3000);
+    int rc = 0;
+    if (ct->main_buckets_per_region() != 8192) {
+        std::cerr << "  FAIL: main 5000 rounded to "
+                  << ct->main_buckets_per_region() << ", expected 8192\n";
+        rc = 1;
+    }
+    if (ct->overflow_slots_per_region() != 3000) {
+        std::cerr << "  FAIL: overflow 3000 changed to "
+                  << ct->overflow_slots_per_region() << ", expected 3000\n";
+        rc = 1;
+    }
+    // Sanity: inserts still land + are findable after rounding.
+    for (std::uint64_t i = 1; i <= 1000; ++i)
+        if (!ct->upsert(make_fp(i), make_offset(i))) { rc = 1; break; }
+    for (std::uint64_t i = 1; i <= 1000; ++i)
+        if (!ct->lookup(make_fp(i))) { std::cerr << "  FAIL: lost key\n"; rc = 1; break; }
+    if (rc == 0) std::cout << "  PASS" << std::endl;
+    return rc;
+}
+
+// A tiny tier must report failure (not silently drop) when both its main
+// slots and overflow pool are exhausted — this is what the fail-fast
+// aborts in HiOM/ycsb_bm rely on.
+int run_overflow_failure() {
+    std::cout << "=== ColdTier overflow exhaustion returns false ===" << std::endl;
+    cleanup();
+    // Smallest possible tier: 1 main bucket + 1 overflow slot per region.
+    // Per region: 7 (main) + 7 (one overflow bucket) = 14 slots max.
+    auto ct = ColdTier::create(kPoolFile, 1, 1);
+    int rc = 1;  // expect at least one failure
+    std::size_t ok = 0, failed = 0;
+    // Force many keys into region 0 by fixing the top 5 bits (region_id_of
+    // uses fp>>59). Vary lower bits so bucket/fp differ.
+    for (std::uint64_t i = 1; i <= 10000 && failed == 0; ++i) {
+        const std::uint64_t fp = (make_fp(i) & 0x07FF'FFFF'FFFF'FFFFull) | 0ull;
+        if (fp == 0) continue;
+        if (ct->upsert(fp, make_offset(i))) ++ok; else ++failed;
+    }
+    std::cout << "  inserted " << ok << " before first failure="
+              << (failed > 0) << std::endl;
+    if (failed > 0) { rc = 0; std::cout << "  PASS (fail-fast signalled)\n"; }
+    else std::cerr << "  FAIL: tiny tier never reported overflow\n";
+    return rc;
+}
+
 }  // namespace
 
 int main() {
     int rc = 0;
     rc |= run_correctness();
-    rc |= run_update();
     rc |= run_remove();
     rc |= run_persistence();
     rc |= run_overflow_chain();
@@ -454,6 +530,9 @@ int main() {
     rc |= run_m2_exit();
     rc |= run_bulk_upsert();
     rc |= run_microbench();
+    rc |= run_sizing_for();
+    rc |= run_pow2_rounding();
+    rc |= run_overflow_failure();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

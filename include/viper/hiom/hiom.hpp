@@ -39,6 +39,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1592,7 +1594,18 @@ class HiOM {
         // winners by sorting them once into bucket-runs and
         // emitting two drains per run (instead of two per entry).
         if (!puts.empty()) {
-            cold_->bulk_upsert(puts);
+            const std::size_t wrote = cold_->bulk_upsert(puts);
+            if (wrote != puts.size()) {
+                // ColdTier overflow-pool exhausted: bulk_upsert stopped
+                // early and index entries were silently dropped. Under a
+                // benchmark this must fail hard, not corrupt results —
+                // size the tier via ColdTier::sizing_for(prefill).
+                std::fprintf(stderr,
+                    "[HiOM FATAL] ColdTier overflow in apply_batch: wrote "
+                    "%zu/%zu entries — index sizing too small\n",
+                    wrote, puts.size());
+                std::abort();
+            }
         }
 
         // Stage 2: HotTier state-machine drives. The CAS dance is
@@ -1745,7 +1758,12 @@ class HiOM {
                 viper_.hiom_visit_records(lo, hi,
                     [this, &local](const K& key, const V& /*value*/,
                                    KVOffset off) {
-                        cold_->upsert(key_fingerprint64(key), off);
+                        if (!cold_->upsert(key_fingerprint64(key), off)) {
+                            std::fprintf(stderr,
+                                "[HiOM FATAL] ColdTier overflow during "
+                                "recovery replay — index sizing too small\n");
+                            std::abort();
+                        }
                         ++local;
                     });
                 total.fetch_add(local, std::memory_order_relaxed);
