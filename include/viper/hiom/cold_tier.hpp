@@ -17,16 +17,29 @@
 // Persistence model:
 //   - Entry: 16 B = 8 B `fingerprint` + 8 B `offset` (full
 //     viper::KeyValueOffset).
-//   - Update: 8 B atomic CAS on the offset field — Optane ADR provides
-//     8 B atomic durability; we still issue clwb+sfence via
-//     viper::internal::pmem_persist for ordering.
+//   - Occupancy bit is the SOLE visibility authority. A slot is
+//     published (visible to lookup/remove/scan, update-in-place) iff its
+//     header occupancy bit is 1. A slot with bit 0 is invisible and
+//     reusable, WHETHER OR NOT its fingerprint is zero — a bit=0/fp!=0
+//     slot is crash residue (entry durable, header flip not reached) and
+//     is safely completed (same fp re-inserted → republish) or reclaimed
+//     (different fp → overwrite) by the next insert into that chain.
+//   - Update: 8 B store on the offset field of a PUBLISHED slot — Optane
+//     ADR provides 8 B atomic durability; clwb+sfence for ordering.
 //   - Insert: write entry first, persist; THEN flip occupancy bit and
-//     persist header. Crash with bit unset → slot treated as free.
+//     persist header. Crash with bit unset → slot invisible & reusable.
 //     Same pattern as Viper's VPage write-then-bitset
 //     (viper.hpp:1037-1054).
-//   - Delete: 8 B CAS the offset to kTombstoneOffset, persist. The
-//     fingerprint stays in place so re-insert finds the slot via
-//     match-and-update.
+//   - Delete: 8 B store the offset of a published slot to
+//     kTombstoneOffset, persist. The fingerprint stays in place so a
+//     re-insert finds the slot via match-and-update.
+//   - Concurrency: one publisher per region via region_mus_[rid], taken
+//     by every writer (upsert / remove / bulk_upsert). Readers are
+//     lock-free and rely only on the occupancy-bit-set-last ordering.
+//     This is the single-publisher invariant that makes reusing a bit=0
+//     residue slot safe. (Recovery replay is region-overlapping but each
+//     upsert takes the region lock; steady-state flushers own disjoint
+//     regions so the lock is uncontended.)
 //
 // PM layout:
 //   [0, 4096)                   GlobalHeader
@@ -52,12 +65,14 @@
 // chain end.
 
 #include <atomic>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <linux/mman.h>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <sys/mman.h>
@@ -257,83 +272,86 @@ class ColdTier {
         assert(fingerprint != kEmptyFp);
         assert(off.offset != kTombstoneOffset);
         const std::size_t rid = region_id_of(fingerprint);
+        // Writer isolation: one publisher per region. Recovery replay is
+        // block-sharded (region-overlapping) and direct-upsert stress
+        // tests collide fps across regions, so without this lock two
+        // threads could race to publish the same slot. Steady-state
+        // flushers own disjoint regions, so this lock is uncontended for
+        // them. Readers never take it.
+        std::lock_guard<std::mutex> lk(region_mus_[rid]);
         Bucket& head = main_bucket_of(rid, fingerprint);
 
-        // Single-pass walk of the chain: look for a matching fp (update
-        // path), and along the way remember the first empty slot we
-        // saw. If the chain ends without a match, we claim that slot;
-        // if the entire chain is full of distinct fps, we extend.
-        //
-        // Note: Phase B-1 stress tests use disjoint keys per thread, so
-        // duplicate-fp races during concurrent insert can't occur. If
-        // such workloads matter later, Phase B-2 will add a per-chain
-        // lock between "no match found" and "claim/attach".
-        Bucket* found_empty_bucket = nullptr;
-        std::size_t found_empty_idx = 0;
+        // Single-pass walk of the chain. Occupancy is authoritative:
+        //  - published (bit=1) + fp match  -> update offset in place.
+        //  - not published (bit=0)         -> reusable (empty OR crash
+        //    residue); remember the first one. We only claim it AFTER
+        //    confirming no published match exists anywhere in the chain
+        //    (else we'd create a duplicate fp).
+        Bucket* found_reusable_bucket = nullptr;
+        std::size_t found_reusable_idx = 0;
         Bucket* cur = &head;
         Bucket* tail = nullptr;
         while (cur != nullptr) {
+            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
             for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
-                const std::uint64_t fp = cur->entries[i].fingerprint.load(
-                    std::memory_order_acquire);
-                if (fp == fingerprint) {
-                    cur->entries[i].offset.store(off.offset,
-                                                 std::memory_order_release);
-                    viper::internal::pmem_persist(&cur->entries[i].offset,
-                                                  sizeof(std::uint64_t));
-                    return true;
-                }
-                if (fp == kEmptyFp && found_empty_bucket == nullptr) {
-                    found_empty_bucket = cur;
-                    found_empty_idx = i;
+                if (slot_published(hdr, i)) {
+                    const std::uint64_t fp = cur->entries[i].fingerprint.load(
+                        std::memory_order_acquire);
+                    if (fp == fingerprint) {
+                        cur->entries[i].offset.store(off.offset,
+                                                     std::memory_order_release);
+                        viper::internal::pmem_persist(&cur->entries[i].offset,
+                                                      sizeof(std::uint64_t));
+                        return true;
+                    }
+                } else if (found_reusable_bucket == nullptr) {
+                    found_reusable_bucket = cur;
+                    found_reusable_idx = i;
                 }
             }
-            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
             const std::uint64_t next_idx = hdr >> 8;
             if (next_idx == kNoOverflow) { tail = cur; break; }
             cur = overflow_bucket_of(rid, next_idx);
         }
 
-        // No match anywhere. Try to claim the first empty slot we found.
-        if (found_empty_bucket != nullptr) {
-            std::uint64_t expected = kEmptyFp;
-            if (found_empty_bucket->entries[found_empty_idx].fingerprint
-                    .compare_exchange_strong(
-                        expected, fingerprint,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire)) {
-                found_empty_bucket->entries[found_empty_idx].offset.store(
-                    off.offset, std::memory_order_release);
-                viper::internal::pmem_persist(
-                    &found_empty_bucket->entries[found_empty_idx], sizeof(Entry));
-                const std::uint64_t bit = std::uint64_t{1} << found_empty_idx;
-                found_empty_bucket->header.fetch_or(bit,
-                                                    std::memory_order_acq_rel);
-                viper::internal::pmem_persist(
-                    &found_empty_bucket->header,
-                    sizeof(found_empty_bucket->header));
-                region_at(rid).num_entries.fetch_add(
-                    1, std::memory_order_relaxed);
-                return true;
-            }
-            // Lost the slot to a concurrent inserter; retry the whole
-            // upsert (rare, no infinite-loop concern).
-            return upsert(fingerprint, off);
+        // No published match. Claim the first reusable slot. Under the
+        // region lock there is no concurrent publisher, so plain stores
+        // suffice (no CAS): write fp+offset, persist the entry, THEN set
+        // the occupancy bit and persist the header. A crash between the
+        // two persists leaves bit=0 -> invisible & reusable next time. A
+        // lock-free reader gates on the bit (set last, release), so it
+        // never observes the transient overwrite of a stale residue fp.
+        if (found_reusable_bucket != nullptr) {
+            Bucket* b = found_reusable_bucket;
+            const std::size_t idx = found_reusable_idx;
+            b->entries[idx].fingerprint.store(fingerprint,
+                                              std::memory_order_release);
+            b->entries[idx].offset.store(off.offset, std::memory_order_release);
+            viper::internal::pmem_persist(&b->entries[idx], sizeof(Entry));
+            const std::uint64_t bit = std::uint64_t{1} << idx;
+            b->header.fetch_or(bit, std::memory_order_acq_rel);
+            viper::internal::pmem_persist(&b->header, sizeof(b->header));
+            region_at(rid).num_entries.fetch_add(1, std::memory_order_relaxed);
+            return true;
         }
 
-        // Phase 3: extend chain. Allocate a fresh overflow bucket.
+        // Phase 3: extend chain with a fresh overflow bucket. Region lock
+        // held, so no concurrent extender — the CAS attach dance is not
+        // needed; `tail` is stable.
         const std::uint64_t new_idx
             = region_at(rid).next_overflow_alloc.fetch_add(
                   1, std::memory_order_acq_rel) + 1;  // 1-based
         if (new_idx > overflow_slots_per_region_) {
-            // Pool exhausted (Phase B-2 split would prevent this).
+            // Pool exhausted (online split would prevent this).
             region_at(rid).next_overflow_alloc.fetch_sub(
                 1, std::memory_order_acq_rel);
             return false;
         }
         Bucket* nb = overflow_bucket_of(rid, new_idx);
         // The new bucket starts zeroed (the file was memset on create);
-        // claim slot 0 for our entry.
+        // claim slot 0 for our entry, publish (bit 0), persist. The
+        // chain attach comes LAST so a crash before it leaves the new
+        // bucket unreachable = invisible (correct).
         nb->entries[0].fingerprint.store(fingerprint,
                                          std::memory_order_release);
         nb->entries[0].offset.store(off.offset,
@@ -342,54 +360,26 @@ class ColdTier {
         nb->header.store(0x1ull,  // bit 0 set in occupancy, no overflow yet
                          std::memory_order_release);
         viper::internal::pmem_persist(&nb->header, sizeof(nb->header));
-        viper::internal::pmem_persist(&nb->pad, sizeof(nb->pad));  // dummy
 
-        // Attach the new bucket to the chain tail. Use CAS to handle
-        // concurrent extenders: if we lose, rewalk from `tail` to find
-        // the new tail and try again.
-        const std::uint64_t attach_bits = (1ull << 7) | (new_idx << 8);
-        while (true) {
-            const std::uint64_t cur_hdr
-                = tail->header.load(std::memory_order_acquire);
-            if ((cur_hdr >> 8) != kNoOverflow) {
-                // Someone else already extended. Walk to new tail and
-                // retry chain-walk + claim there.
-                Bucket* deeper = overflow_bucket_of(rid, cur_hdr >> 8);
-                // Try to claim a slot in their bucket; if their bucket
-                // is also full, we'll recurse via tail-walking. We
-                // already wrote OUR own bucket and persisted it; we
-                // don't want to lose it. So instead, attach our bucket
-                // BELOW theirs by recursing down their chain.
-                tail = deeper;
-                continue;
-            }
-            const std::uint64_t desired = (cur_hdr & 0x7full) | attach_bits;
-            std::uint64_t expected = cur_hdr;
-            if (tail->header.compare_exchange_strong(
-                    expected, desired,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                viper::internal::pmem_persist(&tail->header,
-                                              sizeof(tail->header));
-                region_at(rid).num_entries.fetch_add(
-                    1, std::memory_order_relaxed);
-                return true;
-            }
-            // CAS failed — someone modified `tail->header`. Loop and
-            // re-read; if next_overflow_idx now non-zero, walk deeper.
-        }
+        // Attach to the tail (plain store under the lock). has_overflow
+        // flag (bit 7) + 1-based idx in bits [8..], occupancy preserved.
+        const std::uint64_t cur_hdr = tail->header.load(std::memory_order_acquire);
+        const std::uint64_t desired
+            = (cur_hdr & 0x7full) | (1ull << 7) | (new_idx << 8);
+        tail->header.store(desired, std::memory_order_release);
+        viper::internal::pmem_persist(&tail->header, sizeof(tail->header));
+        region_at(rid).num_entries.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     // -- M3 follow-up: bulk_upsert with amortised PM fence cost --------
     //
     // Same semantics as repeated calls to `upsert`, but groups entries
     // hitting the same bucket and emits ONE sfence per bucket-group
-    // (instead of two per entry). Contract: caller must hold an
-    // external mutex (e.g., HiOM::apply_mu_) so no concurrent writer
-    // hits the same chain. Concurrent readers and concurrent legacy
-    // `upsert` from threads that are NOT writers (e.g., the M6 tail-
-    // scan workers, which are gated by HiOM constructor sequencing) are
-    // safe.
+    // (instead of two per entry). Isolation: bulk_upsert takes the
+    // per-region lock internally (one publisher per region), so it is
+    // safe against concurrent upsert/remove/bulk_upsert on the same
+    // region and against lock-free readers. No external mutex required.
     //
     // Internally:
     //   1. Sort `entries` by (region, bucket).
@@ -434,16 +424,23 @@ class ColdTier {
         std::size_t i = 0;
         while (i < entries.size()) {
             const std::size_t rid = region_id_of(entries[i].fp);
-            const std::size_t bid = bucket_id_of(entries[i].fp);
-            // Find the run of entries hitting this (rid, bid).
-            std::size_t j = i + 1;
-            while (j < entries.size()
-                   && region_id_of(entries[j].fp) == rid
-                   && bucket_id_of(entries[j].fp) == bid) {
-                ++j;
+            // Hold the region lock across every bucket-run in this region
+            // (entries are sorted region-first, so they're contiguous).
+            // Single publisher per region — see upsert(). Uncontended for
+            // steady-state flushers (disjoint region ownership).
+            std::lock_guard<std::mutex> lk(region_mus_[rid]);
+            while (i < entries.size() && region_id_of(entries[i].fp) == rid) {
+                const std::size_t bid = bucket_id_of(entries[i].fp);
+                // Find the run of entries hitting this (rid, bid).
+                std::size_t j = i + 1;
+                while (j < entries.size()
+                       && region_id_of(entries[j].fp) == rid
+                       && bucket_id_of(entries[j].fp) == bid) {
+                    ++j;
+                }
+                total_written += apply_bucket_group(rid, bid, &entries[i], j - i);
+                i = j;
             }
-            total_written += apply_bucket_group(rid, bid, &entries[i], j - i);
-            i = j;
         }
         return total_written;
     }
@@ -454,7 +451,16 @@ class ColdTier {
         const std::size_t rid = region_id_of(fingerprint);
         const Bucket* cur = &main_bucket_of(rid, fingerprint);
         while (cur != nullptr) {
+            // Load the header once: occupancy is the sole visibility
+            // authority. A slot whose bit is 0 (empty OR crash residue
+            // with fp+offset durable but header not yet published) is
+            // invisible, even if its fingerprint happens to match. This
+            // keeps lookup consistent with scan_chain. Readers are
+            // lock-free — the publisher sets the bit last (release), so
+            // a matching fp under a set bit always has a durable entry.
+            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
             for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
+                if (!slot_published(hdr, i)) continue;
                 const std::uint64_t fp = cur->entries[i].fingerprint.load(
                     std::memory_order_acquire);
                 if (fp == fingerprint) {
@@ -465,7 +471,6 @@ class ColdTier {
                     return Offset{off};
                 }
             }
-            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
             const std::uint64_t next_idx = hdr >> 8;
             if (next_idx == kNoOverflow) break;
             cur = overflow_bucket_of(rid, next_idx);
@@ -476,9 +481,15 @@ class ColdTier {
     bool remove(std::uint64_t fingerprint) {
         assert(fingerprint != kEmptyFp);
         const std::size_t rid = region_id_of(fingerprint);
+        // Writer: serialize on the region so no other publisher mutates
+        // this chain concurrently (recovery replay + direct upsert both
+        // hit overlapping regions). Readers stay lock-free.
+        std::lock_guard<std::mutex> lk(region_mus_[rid]);
         Bucket* cur = &main_bucket_of(rid, fingerprint);
         while (cur != nullptr) {
+            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
             for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
+                if (!slot_published(hdr, i)) continue;  // only published slots
                 const std::uint64_t fp = cur->entries[i].fingerprint.load(
                     std::memory_order_acquire);
                 if (fp == fingerprint) {
@@ -489,7 +500,6 @@ class ColdTier {
                     return true;
                 }
             }
-            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
             const std::uint64_t next_idx = hdr >> 8;
             if (next_idx == kNoOverflow) break;
             cur = overflow_bucket_of(rid, next_idx);
@@ -579,6 +589,13 @@ class ColdTier {
     static std::size_t region_id_of(std::uint64_t fp) {
         return static_cast<std::size_t>(fp >> 59) & (kNumRegions - 1);
     }
+    // Occupancy bit i of a bucket header is the SOLE authority for slot
+    // visibility/reusability (bits 0..6 = per-slot occupancy). A slot is
+    // published (visible, update-in-place) iff its bit is 1; bit 0 means
+    // free OR crash residue (half-written) — invisible and reusable.
+    static bool slot_published(std::uint64_t hdr, std::size_t i) {
+        return ((hdr >> i) & 1ull) != 0;
+    }
     std::size_t bucket_id_of(std::uint64_t fp) const {
         std::uint64_t h = fp;
         h ^= h >> 17;
@@ -607,54 +624,11 @@ class ColdTier {
         return main_buckets_of(rid) + main_buckets_per_region_ + idx;
     }
 
-    bool chain_update_match(Bucket& head, std::uint64_t fingerprint,
-                            Offset off) {
-        Bucket* cur = &head;
-        while (cur != nullptr) {
-            for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
-                const std::uint64_t fp = cur->entries[i].fingerprint.load(
-                    std::memory_order_acquire);
-                if (fp == fingerprint) {
-                    cur->entries[i].offset.store(
-                        off.offset, std::memory_order_release);
-                    viper::internal::pmem_persist(
-                        &cur->entries[i].offset, sizeof(std::uint64_t));
-                    return true;
-                }
-            }
-            const std::uint64_t hdr = cur->header.load(std::memory_order_acquire);
-            const std::uint64_t next_idx = hdr >> 8;
-            if (next_idx == kNoOverflow) break;
-            cur = overflow_bucket_of(region_id_of(fingerprint), next_idx);
-        }
-        return false;
-    }
-
-    bool try_claim_empty(Bucket& b, std::uint64_t fingerprint, Offset off) {
-        for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
-            const std::uint64_t fp = b.entries[i].fingerprint.load(
-                std::memory_order_acquire);
-            if (fp != kEmptyFp) continue;
-            std::uint64_t expected = kEmptyFp;
-            if (!b.entries[i].fingerprint.compare_exchange_strong(
-                    expected, fingerprint,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) continue;
-            // We own the slot; finish writing.
-            b.entries[i].offset.store(off.offset, std::memory_order_release);
-            viper::internal::pmem_persist(&b.entries[i], sizeof(Entry));
-            const std::uint64_t bit = std::uint64_t{1} << i;
-            b.header.fetch_or(bit, std::memory_order_acq_rel);
-            viper::internal::pmem_persist(&b.header, sizeof(b.header));
-            return true;
-        }
-        return false;
-    }
-
     // Apply a contiguous run of `n` BulkEntry that all hash to
-    // (rid, bid). Caller (bulk_upsert) holds a logical writer lock —
-    // for our usage (HiOM::apply_batch under apply_mu_) no concurrent
-    // bulk_upsert / upsert from another writer hits the same chain.
+    // (rid, bid). Caller (bulk_upsert) already holds region_mus_[rid],
+    // so there is a single publisher for this region — no concurrent
+    // bulk_upsert / upsert / remove touches the same chain, and
+    // lock-free readers gate on the occupancy bit (flipped in Phase 2).
     // Returns the number of entries successfully written; partial
     // failure on overflow-pool exhaustion stops the rest of the group.
     //
@@ -694,6 +668,14 @@ class ColdTier {
             dirty.push_back({b, 0ull});
             return dirty.back();
         };
+        // Bits this batch has already claimed in `b` but not yet flipped
+        // into the persisted header (occupancy flip is deferred to Phase
+        // 2). A slot is reclaimable only if it is unpublished in the
+        // header AND not already claimed earlier in this same batch.
+        auto batch_claimed_bits = [&](Bucket* b) -> std::uint64_t {
+            for (auto& d : dirty) if (d.b == b) return d.add_bits;
+            return 0ull;
+        };
 
         std::size_t written = 0;
         for (std::size_t k = 0; k < n; ++k) {
@@ -702,70 +684,72 @@ class ColdTier {
             assert(fp != kEmptyFp);
             assert(off.offset != kTombstoneOffset);
 
-            // Walk the chain: look for fp match, remember first empty
-            // slot we see along the way.
+            // Walk the chain. Occupancy is authoritative:
+            //  - published (bit=1 in header, or claimed earlier in this
+            //    batch) + fp match -> update offset in place.
+            //  - unpublished + not-batch-claimed -> reusable (empty OR
+            //    crash residue); remember the first.
             Bucket* cur = &head;
             Bucket* tail = &head;
-            Bucket* found_empty_b = nullptr;
-            std::size_t found_empty_i = 0;
+            Bucket* found_reusable_b = nullptr;
+            std::size_t found_reusable_i = 0;
             bool matched = false;
             while (cur != nullptr) {
+                const std::uint64_t hdr
+                    = cur->header.load(std::memory_order_acquire);
+                const std::uint64_t claimed = batch_claimed_bits(cur);
+                const std::uint64_t live = (hdr | claimed) & 0x7full;
                 for (std::size_t i = 0; i < kEntriesPerBucket; ++i) {
-                    const std::uint64_t cfp
-                        = cur->entries[i].fingerprint.load(
-                              std::memory_order_acquire);
-                    if (cfp == fp) {
-                        // Update path: just rewrite the offset slot.
-                        cur->entries[i].offset.store(
-                            off.offset, std::memory_order_release);
-                        viper::internal::pmem_flush_range(
-                            &cur->entries[i].offset,
-                            sizeof(std::uint64_t));
-                        // Track the dirty bucket so the final drain
-                        // covers this line; no header bit needed.
-                        find_or_create_dirty(cur);
-                        matched = true;
-                        ++written;
-                        break;
-                    }
-                    if (cfp == kEmptyFp && found_empty_b == nullptr) {
-                        found_empty_b = cur;
-                        found_empty_i = i;
+                    const bool is_live = ((live >> i) & 1ull) != 0;
+                    if (is_live) {
+                        const std::uint64_t cfp
+                            = cur->entries[i].fingerprint.load(
+                                  std::memory_order_acquire);
+                        if (cfp == fp) {
+                            // Update path: rewrite the offset slot. Header
+                            // bit already set (or will be by this batch);
+                            // no new occupancy bit needed.
+                            cur->entries[i].offset.store(
+                                off.offset, std::memory_order_release);
+                            viper::internal::pmem_flush_range(
+                                &cur->entries[i].offset,
+                                sizeof(std::uint64_t));
+                            find_or_create_dirty(cur);
+                            matched = true;
+                            ++written;
+                            break;
+                        }
+                    } else if (found_reusable_b == nullptr) {
+                        found_reusable_b = cur;
+                        found_reusable_i = i;
                     }
                 }
                 if (matched) break;
                 tail = cur;
-                const std::uint64_t hdr
-                    = cur->header.load(std::memory_order_acquire);
                 const std::uint64_t next_idx = hdr >> 8;
                 if (next_idx == kNoOverflow) break;
                 cur = overflow_bucket_of(rid, next_idx);
             }
             if (matched) continue;
 
-            // Insert path. Try first remembered empty slot.
-            if (found_empty_b != nullptr) {
-                std::uint64_t expected = kEmptyFp;
-                if (found_empty_b->entries[found_empty_i].fingerprint
-                        .compare_exchange_strong(
-                            expected, fp,
-                            std::memory_order_acq_rel,
-                            std::memory_order_acquire)) {
-                    found_empty_b->entries[found_empty_i].offset.store(
-                        off.offset, std::memory_order_release);
-                    viper::internal::pmem_flush_range(
-                        &found_empty_b->entries[found_empty_i],
-                        sizeof(Entry));
-                    auto& d = find_or_create_dirty(found_empty_b);
-                    d.add_bits |= (std::uint64_t{1} << found_empty_i);
-                    region_at(rid).num_entries.fetch_add(
-                        1, std::memory_order_relaxed);
-                    ++written;
-                    continue;
-                }
-                // Lost the slot (concurrent inserter). Fall through to
-                // overflow allocation — preserves "every entry lands"
-                // contract and matches single-key upsert's recursion.
+            // Insert path. Claim the first reusable slot (region lock held
+            // by bulk_upsert -> single publisher, so plain store, no CAS).
+            // The occupancy bit is staged in add_bits and flipped+persisted
+            // in Phase 2, AFTER the entry data drain in Phase 1.
+            if (found_reusable_b != nullptr) {
+                found_reusable_b->entries[found_reusable_i].fingerprint.store(
+                    fp, std::memory_order_release);
+                found_reusable_b->entries[found_reusable_i].offset.store(
+                    off.offset, std::memory_order_release);
+                viper::internal::pmem_flush_range(
+                    &found_reusable_b->entries[found_reusable_i],
+                    sizeof(Entry));
+                auto& d = find_or_create_dirty(found_reusable_b);
+                d.add_bits |= (std::uint64_t{1} << found_reusable_i);
+                region_at(rid).num_entries.fetch_add(
+                    1, std::memory_order_relaxed);
+                ++written;
+                continue;
             }
 
             // Need to extend the chain with a fresh overflow bucket.
@@ -790,38 +774,19 @@ class ColdTier {
             // touching tail->header.
             auto& dnb = find_or_create_dirty(nb);
             dnb.add_bits |= 0x1ull;
-            // Attach: tail->header gets has_overflow + next_idx. We
-            // can't do this with fetch_or because the next-idx bits
-            // need to land atomically with the has_overflow flag; do
-            // a CAS loop that's normally one-shot under apply_mu_.
+            // Attach: tail->header gets has_overflow (bit 7) + next_idx.
+            // Region lock held -> single publisher -> no concurrent
+            // extender, so a plain load+store suffices (no CAS loop).
+            // Preserve the current occupancy bits; Phase 2's fetch_or
+            // layers this batch's add_bits on top, so we don't lose them.
             const std::uint64_t attach_bits = (1ull << 7) | (alloc_idx << 8);
-            while (true) {
-                const std::uint64_t cur_hdr
-                    = tail->header.load(std::memory_order_acquire);
-                if ((cur_hdr >> 8) != kNoOverflow) {
-                    // Some other writer (legacy single-key upsert from a
-                    // recovery worker, say) already attached. Walk down
-                    // to the new tail and retry the attach there.
-                    tail = overflow_bucket_of(rid, cur_hdr >> 8);
-                    continue;
-                }
-                const std::uint64_t desired
-                    = (cur_hdr & 0x7full) | attach_bits;
-                std::uint64_t expected = cur_hdr;
-                if (tail->header.compare_exchange_strong(
-                        expected, desired,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire)) {
-                    // Don't pmem_persist tail->header here — defer to
-                    // Phase 2's batched flush.
-                    auto& dt = find_or_create_dirty(tail);
-                    // No new occupancy bits on tail; the attach bits
-                    // are already applied via the CAS itself.
-                    (void)dt;
-                    break;
-                }
-                // Lost the CAS, retry.
-            }
+            const std::uint64_t cur_hdr
+                = tail->header.load(std::memory_order_acquire);
+            tail->header.store((cur_hdr & 0x7full) | attach_bits,
+                               std::memory_order_release);
+            // Record tail as dirty so Phase 2 flushes its header line
+            // (attach bits + any staged occupancy add_bits).
+            find_or_create_dirty(tail);
             region_at(rid).num_entries.fetch_add(
                 1, std::memory_order_relaxed);
             ++written;
@@ -880,6 +845,12 @@ class ColdTier {
     std::size_t region_buckets_total_;  // main + overflow + 1 sentinel
     std::size_t region_size_;
     char* regions_base_;
+    // Publisher isolation: one writer per region. Writers (upsert /
+    // remove / bulk_upsert) lock region_mus_[region_id_of(fp)]; readers
+    // never lock. Guarantees no two publishers race to make a bit=0 slot
+    // visible, which is what lets occupancy be the sole visibility
+    // boundary and lets half-written residue be safely reused/completed.
+    std::array<std::mutex, kNumRegions> region_mus_;
 };
 
 }  // namespace viper::hiom
