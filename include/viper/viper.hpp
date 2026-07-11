@@ -609,6 +609,38 @@ class Viper {
         }
     }
 
+    // HiOM hook (Claim 4D — real crash recovery): clear stale page write
+    // locks left by a process killed mid-put. A put locks the VPage
+    // version (odd = locked), writes+persists the record, then unlocks
+    // (even). A SIGKILL between lock and unlock can leave the page
+    // durably locked; every record already on that page is valid but the
+    // read path (hiom_read_at_offset / get_value_from_offset) treats a
+    // locked page as version-torn and refuses it — silently hiding whole
+    // pages of recovered data. At open there are no in-flight writers, so
+    // any set lock bit is stale: clear it (preserve USED_BIT + version)
+    // and persist. Ranged to the tail so recovery stays O(tail).
+    void hiom_clear_stale_page_locks(block_size_t block_lo,
+                                     block_size_t block_hi) {
+        const block_size_t cap
+            = static_cast<block_size_t>(v_blocks_.size());
+        if (block_hi > cap) block_hi = cap;
+        for (block_size_t bn = block_lo; bn < block_hi; ++bn) {
+            VPageBlock* block = v_blocks_[bn];
+            if (block == nullptr) continue;
+            for (page_size_t pn = 0; pn < num_pages_per_block; ++pn) {
+                VPage& page = block->v_pages[pn];
+                const version_lock_t lv = page.version_lock.load(LOAD_ORDER);
+                if (!IS_BIT_SET(lv, USED_BIT)) continue;
+                if (!IS_LOCKED(lv)) continue;
+                page.version_lock.store(
+                    static_cast<version_lock_t>(lv & UNLOCKED_BIT),
+                    STORE_ORDER);
+                internal::pmem_persist(&page.version_lock,
+                                       sizeof(page.version_lock));
+            }
+        }
+    }
+
     // HiOM hook (M6.5 full): resolver callback that maps a key to its
     // current KVOffset via HiOM (ColdTier authoritative; mirrors M3
     // Phase D's read-path retirement). Installed by HiOM's

@@ -1736,6 +1736,17 @@ class HiOM {
             = KVOffset{viper_.hiom_vpage_frontier()}.block_number;
         if (current_block <= start_block) return 0;
 
+        // Clear stale VPage write-locks in the tail BEFORE replay/reads.
+        // A process killed mid-put leaves its page durably locked; every
+        // acknowledged record on that page is valid but hiom_read_at_offset
+        // rejects a locked page as version-torn, hiding whole pages of
+        // recovered data. At open there are no writers, so a set lock bit
+        // is stale. A locked page can only be at a crash-time writer's
+        // position, which is within [start_block, current_block), so this
+        // stays O(tail). (Cooperative in-process crash tests never locked
+        // a page, which is why this only surfaces under a real SIGKILL.)
+        viper_.hiom_clear_stale_page_locks(start_block, current_block);
+
         const std::size_t num_blocks
             = static_cast<std::size_t>(current_block - start_block);
         const std::size_t num_threads
