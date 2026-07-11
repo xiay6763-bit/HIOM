@@ -10,6 +10,12 @@ option(VIPER_BUILD_BENCHMARKS "Set OM if benchmarks should be built." OFF)
 
 option(VIPER_BUILD_TESTS "Set ON to build HiOM integration tests under test/" OFF)
 
+option(VIPER_BUILD_DESTRUCTIVE_TESTS
+       "Set ON to register destructive tests (real SIGKILL crash recovery:
+        removes /pmem0/hiom/sigkill_test, creates a 1 GiB pool, SIGKILLs
+        child processes) with ctest. The target still builds under
+        VIPER_BUILD_TESTS; only the ctest registration is gated." OFF)
+
 option(VIPER_CONCURRENT_QUEUE_PROVIDED "Set ON if the concurrentqueue dependency is provided and should not be
                                         downloaded by Viper." OFF)
 
@@ -80,9 +86,23 @@ if (${VIPER_BUILD_TESTS})
     endif()
     target_link_libraries(hot_tier_test viper pthread)
 
+    add_executable(hiom_sigkill_test test/hiom_sigkill_test.cpp)
+    target_compile_options(hiom_sigkill_test PRIVATE -mclwb -pthread)
+    if (CMAKE_BUILD_TYPE MATCHES Release)
+        target_compile_options(hiom_sigkill_test PRIVATE -O3 -mtune=native)
+    endif()
+    target_link_libraries(hiom_sigkill_test viper pthread)
+
     # One-stop regression entry: `ctest` runs the whole HiOM suite.
     enable_testing()
     add_test(NAME cold_tier COMMAND cold_tier_test)
     add_test(NAME hot_tier COMMAND hot_tier_test)
     add_test(NAME hiom_integration COMMAND hiom_integration_test)
+    # Destructive: wipes /pmem0/hiom/sigkill_test, 1 GiB pool, real
+    # SIGKILLs. Opt-in so a plain `ctest` in an unknown environment never
+    # runs it by accident; run manually or configure with
+    # -DVIPER_BUILD_DESTRUCTIVE_TESTS=ON.
+    if (${VIPER_BUILD_DESTRUCTIVE_TESTS})
+        add_test(NAME hiom_sigkill COMMAND hiom_sigkill_test)
+    endif()
 endif()
