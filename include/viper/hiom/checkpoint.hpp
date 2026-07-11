@@ -51,14 +51,22 @@ namespace viper::hiom {
 
 struct CheckpointRecord {
     static constexpr std::uint64_t kMagic = 0x484f4d5f43485054ull;  // "HOM_CHPT"
+    // Frontier protocol version, stored in reserved[0] (proto_version()).
+    // v0 (== absent, old pools): vpage_frontier was min(writer positions),
+    //   NOT the durable ColdTier frontier — unsafe, ignore it on recovery.
+    // v2 (Claim 5): vpage_frontier is a proven durable frontier — every
+    //   live record below it is durably in ColdTier. Trusted on recovery.
+    static constexpr std::uint64_t kProtoDurableFrontier = 2;
 
     std::uint64_t magic{0};
     std::uint64_t seq{0};
     std::uint64_t flushed_count{0};
     std::uint64_t vpage_frontier{0};
     std::uint64_t cold_size{0};
-    std::uint64_t reserved[2]{0, 0};
+    std::uint64_t reserved[2]{0, 0};  // reserved[0] = frontier proto version
     std::uint64_t summary_hash{0};
+
+    std::uint64_t proto_version() const { return reserved[0]; }
 };
 static_assert(sizeof(CheckpointRecord) == 64,
               "CheckpointRecord must fit a single cache line");

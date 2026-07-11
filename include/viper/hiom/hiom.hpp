@@ -505,6 +505,21 @@ class HiOM {
         }
 
         bool put(const K& key, const V& value, bool assume_new = false) {
+            // Durable-frontier (Claim 5B): publish a conservative in-flight
+            // block lower bound BEFORE the VPage write. put lands in this
+            // block or a fresh higher one, so it is always <= the block
+            // that becomes durable. This closes the window between
+            // viper_.put returning durable and mirror_write registering the
+            // block: a crash in that window still leaves the frontier <= the
+            // just-written block. Only meaningful when a checkpoint is
+            // attached (else no frontier). See note_client_block for the
+            // post-write update.
+            if (slot_idx_ != HiOM::kInvalidSlotIdx
+                    && hiom_.checkpoint_ != nullptr) {
+                hiom_.note_inflight_block(
+                    slot_idx_,
+                    static_cast<std::uint64_t>(viper_.hiom_client_block()));
+            }
             // Step 1: viper does the PM-side write (data + bitset persisted)
             // and updates its own CCEH. Persistence ordering is unchanged
             // from the original Viper put path (viper.hpp ~1037-1054).
@@ -697,6 +712,23 @@ class HiOM {
 
         template <typename UpdateFn>
         bool update(const K& key, UpdateFn fn) {
+            // 5B for the RELOCATING path only: a std::string update may
+            // move the value to a NEW offset, which is durable before the
+            // mirror_write below registers it — the same window put()
+            // closes by publishing inflight_block first. Fixed-size V is
+            // updated IN-PLACE (offset unchanged, no commit entry pushed),
+            // so no bound is needed there — and publishing one anyway
+            // would pin the frontier at this block until the client's
+            // next put, needlessly inflating the recovery tail.
+            if constexpr (std::is_same_v<V, std::string>) {
+                if (slot_idx_ != HiOM::kInvalidSlotIdx
+                        && hiom_.checkpoint_ != nullptr) {
+                    hiom_.note_inflight_block(
+                        slot_idx_,
+                        static_cast<std::uint64_t>(
+                            viper_.hiom_client_block()));
+                }
+            }
             if (!viper_.update(key, std::move(fn))) return false;
             // Viper's fixed-size update is IN-PLACE: the value is
             // overwritten at the same VPage slot and persisted by
@@ -937,6 +969,21 @@ class HiOM {
                     = std::make_unique<moodycamel::ProducerToken>(
                         hiom_.commit_buf_->make_producer_token(lane));
             }
+            // Durable-frontier tracking (Claim 5A): register this entry's
+            // block as pending-unflushed BEFORE it enters the buffer, so a
+            // checkpoint can never publish a frontier past a block that
+            // still has buffered (crash-losable) entries. Only needed when
+            // a checkpoint is attached (else there is no frontier to
+            // protect). kRemove entries carry a dummy/tombstone offset (no
+            // real VPage block to protect — a remove's recovery is handled
+            // by the freed VPage slot), so only kPut with a real offset is
+            // tracked. Retired after the ColdTier drain in apply_batch.
+            if (hiom_.checkpoint_ != nullptr
+                    && e.op == CommitEntry::Op::kPut
+                    && !e.off.is_tombstone()) {
+                hiom_.pending_register(
+                    static_cast<std::uint64_t>(e.off.block_number));
+            }
             // push() returns this lane's post-enqueue depth. Wake the
             // flushers on the RISING EDGE through a per-lane watermark
             // (depth == high_watermark/kNumLanes), and ONLY that edge.
@@ -1013,6 +1060,20 @@ class HiOM {
     Client get_client() {
         Client c{*this, viper_.get_client()};
         c.slot_idx_ = reserve_client_slot();
+        // Fail-fast (Claim 5B): with a checkpoint attached, an untracked
+        // client (no slot) could write into blocks the frontier then
+        // advances past, silently losing those records on a crash. The
+        // slot pool (kMaxClientSlots=256) is far above any real per-process
+        // thread count, so exhaustion means a Client leak, not legitimate
+        // load — abort rather than run unsafe.
+        if (c.slot_idx_ == kInvalidSlotIdx && checkpoint_ != nullptr) {
+            std::fprintf(stderr,
+                "[HiOM FATAL] client slot pool exhausted (%zu) with a "
+                "checkpoint attached — cannot track the durable frontier "
+                "safely; likely a Client leak\n",
+                kMaxClientSlots);
+            std::abort();
+        }
         return c;
     }
 
@@ -1218,10 +1279,160 @@ class HiOM {
         = std::numeric_limits<std::uint64_t>::max();
 
     struct alignas(64) ClientSlot {
+        // last_block: the block of this client's most recent completed
+        // mirror_write. inflight_block: a conservative lower bound on the
+        // block this client is ABOUT to write, published BEFORE viper_.put
+        // so a client killed between the durable VPage write and the
+        // commit-buffer register still constrains the checkpoint frontier
+        // (5B). The frontier uses min(last_block, inflight_block) per slot.
         std::atomic<std::uint64_t> last_block{kNoActiveBlock};
+        std::atomic<std::uint64_t> inflight_block{kNoActiveBlock};
         std::atomic<bool> active{false};
     };
     std::array<ClientSlot, kMaxClientSlots> client_slots_{};
+
+    // -- Durable-frontier pending-block tracker (Claim 5A, v2) ----------
+    //
+    // Tracks, per VPage block, how many commit-buffer entries reference it
+    // that are NOT yet durably applied to ColdTier. A checkpoint frontier
+    // must never advance past the earliest such block, or a crash (which
+    // drops the DRAM buffer) loses those acknowledged records — the P0 bug
+    // the SIGKILL test caught. register on push_commit, retire after the
+    // ColdTier bulk_upsert drain returns durable.
+    //
+    // v2 design — tagged-slot ring (an exact bounded multiset). The v1
+    // modulo-count ring (count[b % W] + a racy advancing `base`) had no
+    // slot identity: a register below base was lost forever, base could
+    // advance over an in-progress register, generations aliased after
+    // wrap, and reopen mis-initialised base to 0. All of those were one
+    // root cause — the ring forgot WHICH block a count belonged to.
+    //
+    // Here every slot is a single packed atomic u64:
+    //
+    //     [63:32] block  — the ABSOLUTE block number this slot tracks
+    //     [31:0]  count  — pending (registered, un-retired) entries
+    //
+    // count==0 means the slot is FREE (block field is then meaningless).
+    // All transitions are CAS-validated against the full packed word, so
+    // a count can never be attributed to the wrong block:
+    //   register(b): free slot        -> claim {b, 1}
+    //                slot tagged b    -> {b, count+1}
+    //                slot tagged b'≠b -> two live blocks ≥ kWindow apart
+    //                                    alias one slot: EXACT window-
+    //                                    overflow detection -> fail fast
+    //                                    (a backlog spanning ≥ kWindow
+    //                                    blocks ≈ 1.5 GB of unflushed
+    //                                    VPages means the flusher is
+    //                                    pathologically behind; this is
+    //                                    also the hard cap on the unsafe
+    //                                    suffix, hence on recovery cost).
+    //   retire(b):   slot must be tagged b with count>0 (else a fatal
+    //                accounting bug), -> {b, count-1}; count hitting 0
+    //                frees the slot for any future block.
+    // There is no `base` to advance and nothing to initialise on reopen:
+    // an all-zero ring simply means "nothing pending", which is correct
+    // (recovery replay runs synchronously before flushers start).
+    //
+    // earliest_pending(): one relaxed pass over all kWindow slots taking
+    // the min tagged block among count>0 slots; empty -> kNoActiveBlock
+    // (NO constraint — v1 wrongly returned max_seen+1, which pinned a
+    // fresh post-recovery frontier back to ~block 1 and destroyed the
+    // O(tail) property). 2^16 sequential u64 loads ≈ 512 KB ≈ tens of µs,
+    // and it runs only inside try_write_checkpoint (per-cadence, ~ms), so
+    // the scan cost is noise.
+    struct PendingBlocks {
+        static constexpr std::size_t kWindow = 1u << 16;  // 65536 slots
+        static constexpr std::size_t kMask = kWindow - 1;
+        static constexpr std::uint64_t kCountMask = 0xFFFF'FFFFull;
+        static std::uint64_t pack(std::uint64_t block, std::uint64_t count) {
+            return (block << 32) | count;
+        }
+        static std::uint64_t block_of(std::uint64_t s) { return s >> 32; }
+        static std::uint64_t count_of(std::uint64_t s) { return s & kCountMask; }
+        std::array<std::atomic<std::uint64_t>, kWindow> slot{};
+    };
+    PendingBlocks pending_{};
+
+    void pending_register(std::uint64_t b) {
+        // block:32 packing headroom: 2^32 blocks × 24 KiB = 96 TiB of
+        // VPages — far beyond any pool this code addresses. Guarded so a
+        // corrupt offset fails loudly instead of aliasing the tag.
+        if (b > PendingBlocks::kCountMask) {
+            std::fprintf(stderr,
+                "[HiOM FATAL] pending_register: block %llu exceeds 32-bit "
+                "tag range — corrupt offset?\n",
+                (unsigned long long)b);
+            std::abort();
+        }
+        auto& s = pending_.slot[b & PendingBlocks::kMask];
+        std::uint64_t cur = s.load(std::memory_order_acquire);
+        for (;;) {
+            std::uint64_t desired;
+            if (PendingBlocks::count_of(cur) == 0) {
+                desired = PendingBlocks::pack(b, 1);          // claim free slot
+            } else if (PendingBlocks::block_of(cur) == b) {
+                desired = cur + 1;                            // same block: +1
+            } else {
+                std::fprintf(stderr,
+                    "[HiOM FATAL] pending-block window overflow: blocks %llu "
+                    "and %llu (both pending) alias ring slot %llu (window %zu)"
+                    " — flusher fell ≥ window behind\n",
+                    (unsigned long long)PendingBlocks::block_of(cur),
+                    (unsigned long long)b,
+                    (unsigned long long)(b & PendingBlocks::kMask),
+                    PendingBlocks::kWindow);
+                std::abort();
+            }
+            if (s.compare_exchange_weak(cur, desired,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+                return;
+            }
+            // cur reloaded on failure; re-classify.
+        }
+    }
+
+    void pending_retire(std::uint64_t b) {
+        auto& s = pending_.slot[b & PendingBlocks::kMask];
+        std::uint64_t cur = s.load(std::memory_order_acquire);
+        for (;;) {
+            if (PendingBlocks::block_of(cur) != b
+                    || PendingBlocks::count_of(cur) == 0) {
+                // Register/retire are strictly paired (kPut-with-offset
+                // only, both sides use the same guard), so this is an
+                // accounting bug, not a recoverable state.
+                std::fprintf(stderr,
+                    "[HiOM FATAL] pending_retire(%llu): slot holds "
+                    "{block=%llu, count=%llu} — register/retire imbalance\n",
+                    (unsigned long long)b,
+                    (unsigned long long)PendingBlocks::block_of(cur),
+                    (unsigned long long)PendingBlocks::count_of(cur));
+                std::abort();
+            }
+            if (s.compare_exchange_weak(cur, cur - 1,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+                return;
+            }
+        }
+    }
+
+    // Min tagged block over all slots with count>0, or kNoActiveBlock if
+    // nothing is pending (= no constraint on the frontier). Exact w.r.t.
+    // the interleaving proof in try_write_checkpoint: every load is a
+    // whole-slot snapshot, so a block is either seen pending or has been
+    // durably retired — never misattributed.
+    std::uint64_t earliest_pending_block() const {
+        std::uint64_t min_b = kNoActiveBlock;
+        for (std::size_t i = 0; i < PendingBlocks::kWindow; ++i) {
+            const std::uint64_t s
+                = pending_.slot[i].load(std::memory_order_acquire);
+            if (PendingBlocks::count_of(s) == 0) continue;
+            const std::uint64_t b = PendingBlocks::block_of(s);
+            if (b < min_b) min_b = b;
+        }
+        return min_b;
+    }
 
     // -- Read-path telemetry shards (per-Client, contention-free) ------
     //
@@ -1281,10 +1492,25 @@ class HiOM {
     }
     // ------------------------------------------------------------------
 
-    // Reserve a slot. Returns the index, or kInvalidSlotIdx if all
-    // slots are taken (Client falls back to "no tracking" — its
-    // writes still go through, but they don't constrain the
-    // checkpoint frontier).
+    // Reserve a slot. Returns the index, or kInvalidSlotIdx if all slots
+    // are taken. When a checkpoint is attached, an untracked client would
+    // let the frontier advance past its unflushed writes (silent data loss
+    // on crash), so the caller (get_client) fail-fasts instead — see there.
+    //
+    // Publish-order safety (CAS active=true FIRST, then reset the block
+    // fields): a checkpoint that reads the slot in the window between the
+    // claim and the resets sees active=true with the PREVIOUS owner's
+    // stale fields. Both possible stale values are safe:
+    //   - a stale finite block: at most it drags the frontier LOWER than
+    //     necessary (over-covers) — conservative, never unsound;
+    //   - kNoActiveBlock (no constraint): sound because the NEW owner has
+    //     no durable-but-untracked record yet — its first put publishes
+    //     inflight_block (t0) before the record can become durable (t1,
+    //     see the proof in try_write_checkpoint), so by the time this
+    //     client has anything to protect, its fields do constrain.
+    // The reverse order (reset fields BEFORE the claim CAS) would be
+    // UNSOUND: a losing claimant's straggling kNoActiveBlock store could
+    // clobber the winner's already-published real inflight bound.
     std::size_t reserve_client_slot() {
         for (std::size_t i = 0; i < kMaxClientSlots; ++i) {
             bool expected = false;
@@ -1294,29 +1520,28 @@ class HiOM {
                     std::memory_order_relaxed)) {
                 client_slots_[i].last_block.store(
                     kNoActiveBlock, std::memory_order_release);
+                client_slots_[i].inflight_block.store(
+                    kNoActiveBlock, std::memory_order_release);
                 return i;
             }
         }
         return kInvalidSlotIdx;
     }
 
-    // Release a slot. Note: we do NOT reset last_block to kNoActiveBlock
-    // synchronously here. The Client's pending pushes may still be in
-    // the commit buffer at the moment of release; if we cleared
-    // last_block, an immediate try_write_checkpoint would compute a
-    // min that excludes this client's last block, and recovery would
-    // miss the unflushed entries. Instead we keep last_block intact
-    // and clear `active` only — min_active_writer_block skips
-    // inactive slots, so once the buffer drains and the next checkpoint
-    // fires, the slot no longer constrains the frontier. The slot is
-    // immediately reusable; reserve_client_slot resets last_block
-    // when it claims it.
-    //
-    // This means there's a brief window after release where a
-    // checkpoint that fires before the released client's entries
-    // drain could capture a stale-too-low frontier — but that just
-    // means recovery scans a slightly larger range than necessary,
-    // which is harmless (idempotent re-upserts).
+    // Release a slot. Clears `active` only. The old code relied on
+    // last_block staying intact after release to keep the frontier from
+    // advancing past a departed client's still-buffered entries — but that
+    // reasoning was WRONG (the real SIGKILL test disproved it): last_block
+    // tracks only the client's LATEST block, not the earlier blocks it left
+    // with entries still in the commit buffer, so a released (or even still
+    // active) client could not, by itself, hold the frontier back correctly.
+    // The authoritative guard is now the pending-block tracker (Claim 5A):
+    // every buffered entry is registered against its block and only retired
+    // after ColdTier durably applies it, so earliest_pending_block() — not
+    // last_block — is what pins the frontier. min_active_writer_block is a
+    // secondary bound that also covers the pre-register window (5B) for
+    // active clients; on release we simply stop counting this slot, which
+    // is safe because any entry it already pushed is tracked by pending_.
     void release_client_slot(std::size_t idx) {
         if (idx >= kMaxClientSlots) return;
         client_slots_[idx].active.store(false, std::memory_order_release);
@@ -1328,24 +1553,33 @@ class HiOM {
                                             std::memory_order_release);
     }
 
-    // Min over all active slots' last_block. Returns kNoActiveBlock
-    // if no slot is active (or all are at their initial state). The
-    // caller (try_write_checkpoint) then takes min(this, viper's
-    // current_block_page_) to compose a safe frontier.
-    //
-    // Read order: last_block FIRST, then active. If a slot is in the
-    // middle of being released (active=false, last_block stale), we
-    // see stale last_block and active=false, and skip — the slot's
-    // last value would have constrained the frontier, but since the
-    // client is gone, its entries are either drained (no constraint
-    // needed) or in the buffer (next non-skipped slot's last_block
-    // covers the same range, OR no client survives → frontier falls
-    // back to current_block_page_, which over-scans).
+    // Publish a conservative in-flight block lower bound BEFORE a put's
+    // VPage write (Claim 5B). Monotonic guard: never raise inflight above
+    // an already-lower value we might still owe a register for — actually
+    // the reverse: we store the CURRENT owned block, which only ever moves
+    // forward as the client fills blocks, and is always <= the block the
+    // imminent put lands in. The frontier takes the min of this and
+    // last_block, so a torn put (durable VPage, not-yet-registered) is
+    // still covered.
+    void note_inflight_block(std::size_t idx, std::uint64_t block_number) {
+        if (idx >= kMaxClientSlots) return;
+        client_slots_[idx].inflight_block.store(block_number,
+                                                std::memory_order_release);
+    }
+
+    // Min over all active slots of min(last_block, inflight_block).
+    // last_block is the last completed write; inflight_block is a
+    // pre-write lower bound. Together they bound the lowest block any
+    // active client may have durable-but-unflushed. Returns kNoActiveBlock
+    // if no slot is active. Composed by try_write_checkpoint with
+    // earliest_pending_block() and viper_next into the safe frontier.
     std::uint64_t min_active_writer_block() const {
         std::uint64_t m = kNoActiveBlock;
         for (auto& s : client_slots_) {
-            const auto b = s.last_block.load(std::memory_order_acquire);
             if (!s.active.load(std::memory_order_acquire)) continue;
+            const auto lb = s.last_block.load(std::memory_order_acquire);
+            const auto ib = s.inflight_block.load(std::memory_order_acquire);
+            const auto b = std::min(lb, ib);
             if (b < m) m = b;
         }
         return m;
@@ -1608,6 +1842,26 @@ class HiOM {
             }
         }
 
+        // Durable-frontier retire (Claim 5C): every entry in this batch is
+        // now durable in ColdTier — winners via bulk_upsert above (or
+        // cold_->remove for kRemove), and coalesced losers will NEVER get
+        // their own ColdTier write (the winner's offset supersedes them),
+        // so both are safe to retire. Retiring only winners would leak the
+        // losers' pending counts forever, pinning the frontier. Runs after
+        // the ColdTier drains and BEFORE the checkpoint hook below, so the
+        // frontier this batch may publish already reflects these retires.
+        if (checkpoint_ != nullptr) {
+            for (std::size_t k = 0; k < batch.size(); ++k) {
+                // Symmetric with push_commit's register guard: only kPut
+                // with a real offset was registered.
+                if (batch[k].op == CommitEntry::Op::kPut
+                        && !batch[k].off.is_tombstone()) {
+                    pending_retire(
+                        static_cast<std::uint64_t>(batch[k].off.block_number));
+                }
+            }
+        }
+
         // Stage 2: HotTier state-machine drives. The CAS dance is
         // unchanged from M4 Phase C — we walk every entry's slot
         // ref. CAS failures are benign:
@@ -1675,23 +1929,72 @@ class HiOM {
         CheckpointRecord rec{};
         rec.seq = seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
         rec.flushed_count = flushed_count_.load(std::memory_order_acquire);
-        // M4 Phase E: vpage_frontier is the min over (a) Viper's
-        // current next-to-claim block and (b) the lowest block any
-        // active HiOM client has recently written into. Capturing
-        // only (a) is unsafe with concurrent writers — when client_X
-        // is still pushing into block 30 while the global frontier
-        // has advanced to block 50, recovery's tail-scan starts at
-        // block 49 and silently drops client_X's unflushed entries.
-        // Using the min ensures every block with potentially
-        // unflushed entries is in the tail-scan range.
+        // Claim 5: vpage_frontier is a DURABLE frontier — every live record
+        // in a block below it is guaranteed already persisted in ColdTier.
+        // It is the min of three bounds:
+        //   (a) viper_next — Viper's next-to-claim block (nothing above
+        //       exists yet);
+        //   (b) min_active_writer_block — per active client, min(last_block,
+        //       inflight_block); covers the pre-register window (5B) where a
+        //       durable VPage write hasn't reached the commit buffer yet;
+        //   (c) earliest_pending_block — the earliest block with a commit-
+        //       buffer entry not yet durably applied to ColdTier (5A). This
+        //       is the load-bearing bound the old min(writer,viper) LACKED:
+        //       a writer can be far past a block whose entries are still
+        //       buffered, and only (c) holds the frontier back to it.
+        // The old code used only min(a,b) — writer positions, not flush
+        // progress — which the real-SIGKILL test proved loses records.
+        //
+        // ---- Linearization proof (why these three racy snapshots compose
+        // ---- into a sound frontier; x86-TSO + the fences already present):
+        //
+        // Per put, in the writing client's program order:
+        //   t0: inflight_block := B0 (release store), B0 <= B where B is
+        //       the block the record lands in (the client writes its owned
+        //       block or claims a fresh HIGHER one);
+        //   t1: viper_.put persists the record — its pmem_persist issues
+        //       SFENCE, which drains the store buffer, so the t0 store is
+        //       GLOBALLY VISIBLE no later than the record is durable;
+        //   t2: pending_register(B) — a LOCKED RMW, globally visible
+        //       immediately, and TSO keeps it ordered before any later
+        //       store of this thread;
+        //   t0': the NEXT put's inflight store (t2 < t0' by program order).
+        // So the record's coverage is gapless: inflight covers [t0, t0'),
+        // pending covers [t2, retire), and t2 < t0' — from before the
+        // record can be durable until its ColdTier apply is durable (only
+        // apply_batch retires, strictly after the bulk_upsert drain), at
+        // least one bound covers block B.
+        //
+        // The checkpoint must therefore observe at least one cover. It
+        // reads the client slots FIRST and the pending ring LAST (loads
+        // are not reordered on TSO). Case split on its slot read at Ts:
+        //   - Ts sees inflight <= B: bound (b) covers B. Done.
+        //   - Ts misses it (reads a later inflight > B): then Ts >= t0'
+        //     in visibility order, and t2 < t0' <= Ts < Tr (the ring
+        //     read), so Tr observes the registered count — unless it was
+        //     already retired, which by the retire ordering means the
+        //     record is durable in ColdTier and needs no cover. Done.
+        // Reading the ring BEFORE the slots would break this case split —
+        // do not reorder (a)/(b) below after (c).
+        //
+        // Portability caveat: the argument leans on TSO (total store
+        // order + no load-load reordering) and on put's internal SFENCE.
+        // This codebase is x86-only (clwb); a port to a weaker memory
+        // model must add an explicit fence between t0 and t1 and make the
+        // checkpoint's three reads a seq_cst sequence.
         const std::uint64_t client_min = min_active_writer_block();
         const std::uint64_t viper_next
             = KVOffset{viper_.hiom_vpage_frontier()}.block_number;
-        const std::uint64_t safe_block = std::min(client_min, viper_next);
+        const std::uint64_t pending_min = earliest_pending_block();
+        const std::uint64_t safe_block
+            = std::min(std::min(client_min, viper_next), pending_min);
         rec.vpage_frontier = KVOffset{
             static_cast<viper::block_size_t>(safe_block), 0, 0
         }.offset;
         rec.cold_size = (cold_ != nullptr) ? cold_->approx_size() : 0;
+        // 5D: stamp the durable-frontier protocol version so a future open
+        // knows this frontier is trustworthy (old v0 pools are not).
+        rec.reserved[0] = CheckpointRecord::kProtoDurableFrontier;
         checkpoint_->write(rec);
         stats_.checkpoints_written.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1713,8 +2016,17 @@ class HiOM {
         viper::block_size_t frontier_block = 0;
         if (checkpoint_ != nullptr) {
             if (auto rec = checkpoint_->read_valid()) {
-                frontier_block
-                    = KVOffset{rec->vpage_frontier}.block_number;
+                // 5D: only trust the stored frontier if it was written by
+                // the durable-frontier protocol (v2). Older pools (v0)
+                // recorded min(writer positions), which is NOT a durable
+                // frontier — a record below it may never have reached
+                // ColdTier. For those, recover conservatively from block 0
+                // (frontier_block stays 0) so nothing is missed.
+                if (rec->proto_version()
+                        == CheckpointRecord::kProtoDurableFrontier) {
+                    frontier_block
+                        = KVOffset{rec->vpage_frontier}.block_number;
+                }
             }
         }
         // current_block_page_.block_number semantics: the *next* block

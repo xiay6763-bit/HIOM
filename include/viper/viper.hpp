@@ -507,6 +507,13 @@ class Viper {
         // mirror_write doesn't have to peek CCEH for the offset.
         inline KVOffset last_put_offset() const { return last_put_offset_; }
 
+        // HiOM helper (Claim 5B): the VPageBlock this client currently owns
+        // and will write its next put into (or a fresh higher block if this
+        // one fills). Published as a conservative frontier lower bound
+        // BEFORE the put persists, so a crash between the durable VPage
+        // write and the commit-buffer register still constrains recovery.
+        inline block_size_t hiom_client_block() const { return v_block_number_; }
+
         bool get(const K& key, V* value);
         bool get(const K& key, V* value) const;
 
