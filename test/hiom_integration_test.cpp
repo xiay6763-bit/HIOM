@@ -33,6 +33,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+#include <signal.h>
+
 namespace {
 
 constexpr const char* kRootDir = "/pmem0/hiom/integration_test";
@@ -1908,6 +1912,42 @@ int run_p0_update_heavy_multi_thread() {
 
 }  // namespace
 
+// Claim 5 boundary: HiOM must refuse to attach when Viper reclamation
+// is enabled — block reuse breaks both the durable-frontier proof
+// (B0 <= B monotonicity) and stale-offset verification on reads. The
+// constructor aborts, so run the attach in a fork()ed child and demand
+// SIGABRT; a child that exits normally means the guard silently
+// disappeared.
+int run_reclamation_fail_fast() {
+    std::cout << "\n=== reclamation fail-fast (Claim 5 boundary) ===" << std::endl;
+    cleanup_pool();
+    cleanup_cold_pool();
+
+    const pid_t pid = fork();
+    if (pid < 0) { std::perror("fork"); return 1; }
+    if (pid == 0) {
+        // Child: silence the expected FATAL message, then attach HiOM
+        // to a reclamation-enabled Viper. Must abort inside the ctor.
+        if (std::freopen("/dev/null", "w", stderr) == nullptr) {}
+        viper::ViperConfig vcfg;
+        vcfg.enable_reclamation = true;
+        auto viper_db = ViperT::create(kPoolDir, kPoolSize, vcfg);
+        auto cold = viper::hiom::ColdTier::create(kColdPoolFile);
+        HiOMT hiom(*viper_db, kHotBuckets, cold.get());
+        std::_Exit(0);  // reached only if the guard is gone
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) { std::perror("waitpid"); return 1; }
+    if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)) {
+        std::cerr << "  FAIL: expected SIGABRT from the reclamation guard, "
+                  << "child status=0x" << std::hex << status << std::dec
+                  << std::endl;
+        return 1;
+    }
+    std::cout << "  constructor aborted as required. PASS" << std::endl;
+    return 0;
+}
+
 int main() {
     int rc = 0;
     rc |= run_p0_skip_counter_sanity();
@@ -1921,6 +1961,7 @@ int main() {
     rc |= run_p0_update_heavy_multi_thread();
     rc |= run_multi_producer_correctness();
     rc |= run_recovery_stress();
+    rc |= run_reclamation_fail_fast();
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

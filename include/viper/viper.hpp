@@ -583,6 +583,26 @@ class Viper {
         return current_block_page_.load(std::memory_order_acquire);
     }
 
+    // HiOM hook: whether this Viper instance may reclaim (and later
+    // REUSE) VPage blocks. HiOM is incompatible with block reuse on two
+    // independent axes and must refuse to attach when it is enabled:
+    //   - reads: ColdTier/HotTier store raw KVOffsets and verify them
+    //     against the record still living at that offset (see
+    //     hiom_read_at_offset); a reclaimed-then-reused slot silently
+    //     invalidates every stale offset pointing at it.
+    //   - checkpoints: the durable-frontier proof in HiOM's
+    //     try_write_checkpoint assumes block numbers only grow (a new
+    //     record lands in the writer's current block or a fresh HIGHER
+    //     one). reclaim() feeds old LOW blocks back through free_blocks_
+    //     (get_new_block dequeues them first), so a record could land
+    //     BELOW an already-published frontier and be skipped forever by
+    //     tail-scan recovery.
+    // Supporting reuse would need a persistent dirty-block log or a
+    // persisted frontier lowering before reuse — out of scope for now.
+    bool hiom_reclamation_enabled() const {
+        return v_config_.enable_reclamation;
+    }
+
     // HiOM hook (M6 recovery): visit every live record in VPages
     // [block_lo, block_hi). Mirrors recover_database()'s iteration
     // (USED_BIT on the page's version_lock, free_slots bitset for

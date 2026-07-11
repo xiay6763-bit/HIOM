@@ -262,6 +262,21 @@ class HiOM {
           checkpoint_(checkpoint),
           ccfg_(ccfg)
     {
+        // HiOM does not support Viper block reuse, in ANY mode that
+        // attaches a ColdTier: stale ColdTier/HotTier offsets into a
+        // reused block break read verification, and the checkpoint
+        // frontier proof assumes monotonically growing block numbers
+        // (see viper.hpp hiom_reclamation_enabled for the full
+        // argument). Refuse loudly rather than corrupt silently.
+        if (cold_ != nullptr && viper_.hiom_reclamation_enabled()) {
+            std::fprintf(stderr,
+                "[HiOM FATAL] ViperConfig::enable_reclamation is on — "
+                "HiOM does not support VPage block reuse (breaks offset "
+                "verification and the durable checkpoint frontier). "
+                "Disable reclamation to attach HiOM.\n");
+            std::abort();
+        }
+
         // Step 1: prime cumulative counters from any existing
         // checkpoint so the monotonic invariant survives reopen.
         // read_valid() returns nullopt on a fresh PM file (or one
@@ -1317,15 +1332,23 @@ class HiOM {
     // a count can never be attributed to the wrong block:
     //   register(b): free slot        -> claim {b, 1}
     //                slot tagged b    -> {b, count+1}
-    //                slot tagged b'≠b -> two live blocks ≥ kWindow apart
-    //                                    alias one slot: EXACT window-
-    //                                    overflow detection -> fail fast
-    //                                    (a backlog spanning ≥ kWindow
-    //                                    blocks ≈ 1.5 GB of unflushed
-    //                                    VPages means the flusher is
-    //                                    pathologically behind; this is
-    //                                    also the hard cap on the unsafe
-    //                                    suffix, hence on recovery cost).
+    //                slot tagged b'≠b -> two live blocks with the same
+    //                                    residue mod kWindow alias one
+    //                                    slot -> fail fast. NOTE what
+    //                                    this does and does NOT bound:
+    //                                    the ring tracks at most kWindow
+    //                                    DISTINCT pending blocks and
+    //                                    aborts on residue collision; it
+    //                                    does NOT cap the SPREAD
+    //                                    max−min of pending blocks
+    //                                    (blocks 0 and kWindow+1 occupy
+    //                                    slots 0 and 1 — no collision,
+    //                                    spread > window). So the unsafe
+    //                                    suffix / recovery scan length
+    //                                    is frontier − earliest_pending:
+    //                                    O(actual backlog), empirically
+    //                                    small, but NOT hard-capped at
+    //                                    kWindow blocks.
     //   retire(b):   slot must be tagged b with count>0 (else a fatal
     //                accounting bug), -> {b, count-1}; count hitting 0
     //                frees the slot for any future block.
@@ -1371,6 +1394,17 @@ class HiOM {
             if (PendingBlocks::count_of(cur) == 0) {
                 desired = PendingBlocks::pack(b, 1);          // claim free slot
             } else if (PendingBlocks::block_of(cur) == b) {
+                if (PendingBlocks::count_of(cur) == PendingBlocks::kCountMask) {
+                    // cur+1 would carry into the block tag. 2^32 pending
+                    // entries for one block cannot happen legitimately
+                    // (a block holds far fewer records) — fail fast like
+                    // every other accounting violation here.
+                    std::fprintf(stderr,
+                        "[HiOM FATAL] pending_register(%llu): count "
+                        "saturated — register/retire imbalance?\n",
+                        (unsigned long long)b);
+                    std::abort();
+                }
                 desired = cur + 1;                            // same block: +1
             } else {
                 std::fprintf(stderr,
@@ -1951,7 +1985,10 @@ class HiOM {
         // Per put, in the writing client's program order:
         //   t0: inflight_block := B0 (release store), B0 <= B where B is
         //       the block the record lands in (the client writes its owned
-        //       block or claims a fresh HIGHER one);
+        //       block or claims a fresh HIGHER one — this monotonicity is a
+        //       PRECONDITION, enforced by the constructor's reclamation
+        //       fail-fast: with block reuse, get_new_block can hand out a
+        //       reclaimed LOW block and B0 <= B is false);
         //   t1: viper_.put persists the record — its pmem_persist issues
         //       SFENCE, which drains the store buffer, so the t0 store is
         //       GLOBALLY VISIBLE no later than the record is durable;
