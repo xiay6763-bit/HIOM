@@ -64,9 +64,25 @@ if (${VIPER_BUILD_TESTS})
     target_link_libraries(hiom_integration_test viper pthread)
 
     add_executable(cold_tier_test test/cold_tier_test.cpp)
-    target_compile_options(cold_tier_test PRIVATE -mclwb -pthread)
+    # Fault injection: compile the crash-point hooks (guarded by
+    # VIPER_COLD_FAULT_INJECT in cold_tier.hpp) into this test ONLY — the
+    # steady write path in every other TU carries no injection branch.
+    target_compile_options(cold_tier_test PRIVATE -mclwb -pthread -DVIPER_COLD_FAULT_INJECT)
     if (CMAKE_BUILD_TYPE MATCHES Release)
         target_compile_options(cold_tier_test PRIVATE -O3 -mtune=native)
     endif()
     target_link_libraries(cold_tier_test viper pthread)
+
+    add_executable(hot_tier_test test/hot_tier_test.cpp)
+    target_compile_options(hot_tier_test PRIVATE -mclwb -pthread)
+    if (CMAKE_BUILD_TYPE MATCHES Release)
+        target_compile_options(hot_tier_test PRIVATE -O3 -mtune=native)
+    endif()
+    target_link_libraries(hot_tier_test viper pthread)
+
+    # One-stop regression entry: `ctest` runs the whole HiOM suite.
+    enable_testing()
+    add_test(NAME cold_tier COMMAND cold_tier_test)
+    add_test(NAME hot_tier COMMAND hot_tier_test)
+    add_test(NAME hiom_integration COMMAND hiom_integration_test)
 endif()

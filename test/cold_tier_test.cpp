@@ -62,6 +62,15 @@ std::uint64_t make_fp(std::uint64_t i) {
     return fp;
 }
 
+// Fingerprint forced into region 0 (top 5 bits zero: region_id_of = fp>>59
+// & 31). Used by fault-injection tests that need a deterministic single
+// region + (with main=1) a single bucket so chains form predictably.
+std::uint64_t make_fp_r0(std::uint64_t i) {
+    std::uint64_t fp = make_fp(i) & 0x07FF'FFFF'FFFF'FFFFull;
+    if (fp == 0) fp = 1;
+    return fp;
+}
+
 int run_correctness() {
     std::cout << "=== ColdTier correctness ===" << std::endl;
     cleanup();
@@ -517,11 +526,135 @@ int run_overflow_failure() {
     return rc;
 }
 
+#ifdef VIPER_COLD_FAULT_INJECT
+// 4C: precise crash-point injection. Arm a fault point, issue one upsert
+// that stops mid-write leaving PM torn, reopen the tier, and assert the
+// occupancy bit — not the fingerprint — governs visibility.
+int run_fault_injection() {
+    std::cout << "=== ColdTier crash-point fault injection ===" << std::endl;
+    int rc = 0;
+
+    auto reopen_lookup = [](std::uint64_t fp) -> std::optional<Offset> {
+        auto ct = ColdTier::open(kPoolFile);
+        return ct->lookup(fp);
+    };
+
+    // --- Point 1: fp persisted, entry (offset) + occupancy not ---------
+    {
+        cleanup();
+        const std::uint64_t fp = make_fp_r0(1);
+        {
+            auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
+            ColdTier::arm_fault(ColdTier::FaultPoint::kAfterFpBeforeEntry);
+            ct->upsert(fp, make_offset(111));
+            ColdTier::disarm_fault();
+        }
+        if (reopen_lookup(fp).has_value()) {
+            std::cerr << "  FAIL P1: torn fp-only slot visible\n"; rc = 1;
+        } else std::cout << "  P1 (fp only) invisible: OK\n";
+    }
+
+    // --- Point 2: entry persisted, occupancy bit not; replay completes -
+    {
+        cleanup();
+        const std::uint64_t fp = make_fp_r0(2);
+        {
+            auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
+            ColdTier::arm_fault(ColdTier::FaultPoint::kAfterEntryBeforeBit);
+            ct->upsert(fp, make_offset(222));
+            ColdTier::disarm_fault();
+        }
+        if (reopen_lookup(fp).has_value()) {
+            std::cerr << "  FAIL P2: entry-no-bit slot visible\n"; rc = 1;
+        } else std::cout << "  P2 (entry, no bit) invisible pre-replay: OK\n";
+        // Tail-scan replay re-inserts the same key -> must complete the
+        // half-write and become visible with the correct offset.
+        {
+            auto ct = ColdTier::open(kPoolFile);
+            if (!ct->upsert(fp, make_offset(222))) { std::cerr << "  FAIL P2 replay upsert\n"; rc = 1; }
+        }
+        auto v = reopen_lookup(fp);
+        if (!v || v->offset != make_offset(222).offset) {
+            std::cerr << "  FAIL P2: replay did not republish residue\n"; rc = 1;
+        } else std::cout << "  P2 replay -> visible, correct offset: OK\n";
+    }
+
+    // --- Point 3: occupancy persisted -> visible, correct offset -------
+    {
+        cleanup();
+        const std::uint64_t fp = make_fp_r0(3);
+        {
+            auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
+            ct->upsert(fp, make_offset(333));  // full, no fault
+        }
+        auto v = reopen_lookup(fp);
+        if (!v || v->offset != make_offset(333).offset) {
+            std::cerr << "  FAIL P3: published slot lost across reopen\n"; rc = 1;
+        } else std::cout << "  P3 (published) visible, correct offset: OK\n";
+    }
+
+    // --- Point 4/5: overflow bucket persisted but not chained ----------
+    // main=1 forces every region-0 fp into one bucket -> 8th distinct fp
+    // must extend into an overflow bucket. Arm the pre-chain fault on it.
+    {
+        cleanup();
+        std::vector<std::uint64_t> fps;
+        for (std::uint64_t i = 1; fps.size() < 8; ++i) {
+            const std::uint64_t f = make_fp_r0(1000 + i);
+            fps.push_back(f);
+        }
+        {
+            auto ct = ColdTier::create(kPoolFile, /*main=*/1, /*overflow=*/16);
+            for (std::size_t k = 0; k < 7; ++k) ct->upsert(fps[k], make_offset(k));
+            ColdTier::arm_fault(ColdTier::FaultPoint::kAfterOverflowBeforeChain);
+            ct->upsert(fps[7], make_offset(7));  // extends, stops pre-chain
+            ColdTier::disarm_fault();
+        }
+        if (reopen_lookup(fps[7]).has_value()) {
+            std::cerr << "  FAIL P4: unchained overflow bucket visible\n"; rc = 1;
+        } else std::cout << "  P4 (overflow, unchained) invisible: OK\n";
+        // First 7 (in the main bucket) must still be visible.
+        for (std::size_t k = 0; k < 7; ++k)
+            if (!reopen_lookup(fps[k]).has_value()) {
+                std::cerr << "  FAIL P4: main-bucket entry " << k << " lost\n"; rc = 1;
+            }
+        // Replay the 8th -> chains the bucket -> becomes visible (P5).
+        { auto ct = ColdTier::open(kPoolFile); ct->upsert(fps[7], make_offset(7)); }
+        if (!reopen_lookup(fps[7]).has_value()) {
+            std::cerr << "  FAIL P5: replay did not chain overflow bucket\n"; rc = 1;
+        } else std::cout << "  P5 replay -> overflow chained + visible: OK\n";
+    }
+
+    // --- Point 6: tombstone then reinsert survives reopen --------------
+    {
+        cleanup();
+        const std::uint64_t fp = make_fp_r0(6);
+        {
+            auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
+            ct->upsert(fp, make_offset(600));
+            if (!ct->remove(fp)) { std::cerr << "  FAIL P6 remove\n"; rc = 1; }
+        }
+        if (reopen_lookup(fp).has_value()) {
+            std::cerr << "  FAIL P6: tombstoned key visible after reopen\n"; rc = 1;
+        }
+        { auto ct = ColdTier::open(kPoolFile); ct->upsert(fp, make_offset(666)); }
+        auto v = reopen_lookup(fp);
+        if (!v || v->offset != make_offset(666).offset) {
+            std::cerr << "  FAIL P6: reinsert-after-tombstone not visible\n"; rc = 1;
+        } else std::cout << "  P6 tombstone->reinsert visible, correct: OK\n";
+    }
+
+    if (rc == 0) std::cout << "  PASS" << std::endl;
+    return rc;
+}
+#endif  // VIPER_COLD_FAULT_INJECT
+
 }  // namespace
 
 int main() {
     int rc = 0;
     rc |= run_correctness();
+    rc |= run_update();
     rc |= run_remove();
     rc |= run_persistence();
     rc |= run_overflow_chain();
@@ -533,6 +666,9 @@ int main() {
     rc |= run_sizing_for();
     rc |= run_pow2_rounding();
     rc |= run_overflow_failure();
+#ifdef VIPER_COLD_FAULT_INJECT
+    rc |= run_fault_injection();
+#endif
     if (rc != 0) {
         std::cerr << "\nFAIL" << std::endl;
         return 1;

@@ -106,6 +106,23 @@ class ColdTier {
     static constexpr std::size_t kDefaultMainBuckets = 8192;
     static constexpr std::size_t kDefaultOverflowSlots = 16384;  // 2x main
 
+#ifdef VIPER_COLD_FAULT_INJECT
+    // Test-only crash-point injection (compiled ONLY into cold_tier_test
+    // via -DVIPER_COLD_FAULT_INJECT — the steady write path carries no
+    // permanent branch). Arm a point, issue one upsert; the write persists
+    // up to that point then returns early, leaving PM in the partial state
+    // a real crash would. The test reopens and asserts visibility.
+    enum class FaultPoint {
+        kNone,
+        kAfterFpBeforeEntry,        // fp persisted; offset + occupancy not
+        kAfterEntryBeforeBit,       // entry persisted; occupancy bit not set
+        kAfterOverflowBeforeChain,  // overflow bucket persisted; not linked
+    };
+    static inline thread_local FaultPoint fault_point_ = FaultPoint::kNone;
+    static void arm_fault(FaultPoint p) { fault_point_ = p; }
+    static void disarm_fault() { fault_point_ = FaultPoint::kNone; }
+#endif
+
     struct Entry {
         std::atomic<std::uint64_t> fingerprint;
         std::atomic<std::uint64_t> offset;
@@ -326,8 +343,22 @@ class ColdTier {
             const std::size_t idx = found_reusable_idx;
             b->entries[idx].fingerprint.store(fingerprint,
                                               std::memory_order_release);
+#ifdef VIPER_COLD_FAULT_INJECT
+            if (fault_point_ == FaultPoint::kAfterFpBeforeEntry) {
+                // fp durable, offset + occupancy bit not.
+                viper::internal::pmem_persist(&b->entries[idx].fingerprint,
+                                              sizeof(std::uint64_t));
+                return false;
+            }
+#endif
             b->entries[idx].offset.store(off.offset, std::memory_order_release);
             viper::internal::pmem_persist(&b->entries[idx], sizeof(Entry));
+#ifdef VIPER_COLD_FAULT_INJECT
+            if (fault_point_ == FaultPoint::kAfterEntryBeforeBit) {
+                // entry durable, occupancy bit not set.
+                return false;
+            }
+#endif
             const std::uint64_t bit = std::uint64_t{1} << idx;
             b->header.fetch_or(bit, std::memory_order_acq_rel);
             viper::internal::pmem_persist(&b->header, sizeof(b->header));
@@ -360,6 +391,13 @@ class ColdTier {
         nb->header.store(0x1ull,  // bit 0 set in occupancy, no overflow yet
                          std::memory_order_release);
         viper::internal::pmem_persist(&nb->header, sizeof(nb->header));
+#ifdef VIPER_COLD_FAULT_INJECT
+        if (fault_point_ == FaultPoint::kAfterOverflowBeforeChain) {
+            // overflow bucket fully written + published, but the tail's
+            // next_overflow link is not stored -> bucket unreachable.
+            return false;
+        }
+#endif
 
         // Attach to the tail (plain store under the lock). has_overflow
         // flag (bit 7) + 1-based idx in bits [8..], occupancy preserved.
