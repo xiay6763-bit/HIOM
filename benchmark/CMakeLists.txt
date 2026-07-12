@@ -222,6 +222,50 @@ target_compile_options(hiom_recovery_bm PRIVATE -mclwb -pthread)
 target_link_libraries(hiom_recovery_bm viper pthread)
 set_target_properties(hiom_recovery_bm PROPERTIES LINKER_LANGUAGE CXX)
 
+# E3 real process-kill recovery harness (evaluation-only; does NOT touch the
+# frozen core headers/fixtures). K8/V200, fork+SIGKILL at random moments,
+# per-crash CSV with phase-split timing + the two distinct tail lengths
+# (unsafe_suffix vs scan). Pulls benchmark.hpp for the K8/V200 record types
+# and BM_POOL_SIZE, so it links the benchmark lib for that header's include.
+add_executable(hiom_crash_recovery_bm hiom_crash_recovery_bm.cpp)
+target_compile_options(hiom_crash_recovery_bm PRIVATE -mclwb -pthread)
+target_link_libraries(hiom_crash_recovery_bm viper pthread benchmark)
+set_target_properties(hiom_crash_recovery_bm PROPERTIES LINKER_LANGUAGE CXX)
+
+# Regression guard for the old-page in-place-update crash bug (2026-07-11):
+# a SIGKILL mid update left a VPage below the durable frontier locked, and the
+# tail-only lock clear never visited it => whole page of records hidden
+# (lost=19 at K8/V200). Real-crash ycsb_a at t1/t4/t8 asserts lost==0 via the
+# bench's correctness gate (exit code). Destructive (wipes
+# /pmem0/hiom/crash_recovery, real SIGKILLs) — same opt-in as hiom_sigkill.
+if (${VIPER_BUILD_DESTRUCTIVE_TESTS})
+    foreach(T 1 4 8)
+        add_test(NAME hiom_crash_update_t${T}
+                 COMMAND hiom_crash_recovery_bm)
+        set_tests_properties(hiom_crash_update_t${T} PROPERTIES
+            ENVIRONMENT "HIOM_CR_N=100000;HIOM_CR_THREADS=${T};\
+HIOM_CR_ITERS=3;HIOM_CR_WORKLOAD=ycsb_a;HIOM_CR_MIN_MS=15;HIOM_CR_MAX_MS=45;\
+HIOM_HOT_BUCKETS_LOG2=16;HIOM_CR_CSV=/tmp/hiom_crash_update_t${T}.csv")
+    endforeach()
+
+    # Regression guard for the frontier-overshoot crash bug (2026-07-12):
+    # num_used_blocks was a fetch_add(1) COUNT used by recovery as the scan
+    # ceiling; under concurrent block claim it lagged the highest block a writer
+    # had already durably written a page into, so a SIGKILL in that window left
+    # that whole page ABOVE the recovered ceiling and lost (lost=19 = one
+    # K8/V200 VPage). Fixed by making num_used_blocks a persisted fetch_max HWM.
+    # This is INSERT-specific (only inserts move the frontier) and needs
+    # CONCURRENCY to trigger, so guard it at t8 with a fresh-block-churning
+    # insert workload — the ycsb_a guards above (in-place update, ~0 suffix)
+    # would not catch a regression here. Higher iters: the race is rare per
+    # crash, so more crash cycles raise the odds of re-exposing a regression.
+    add_test(NAME hiom_crash_insert_t8 COMMAND hiom_crash_recovery_bm)
+    set_tests_properties(hiom_crash_insert_t8 PROPERTIES
+        ENVIRONMENT "HIOM_CR_N=200000;HIOM_CR_THREADS=8;\
+HIOM_CR_ITERS=10;HIOM_CR_WORKLOAD=insert;HIOM_CR_MIN_MS=8;HIOM_CR_MAX_MS=40;\
+HIOM_HOT_BUCKETS_LOG2=18;HIOM_CR_CSV=/tmp/hiom_crash_insert_t8.csv")
+endif()
+
 add_executable(reclaim_bm reclaim_bm.cpp ${BASE_BENCHMARK_FILES})
 target_link_libraries(reclaim_bm viper ${PMEM_LIBS})
 target_link_libraries(reclaim_bm benchmark hdr_histogram_static)

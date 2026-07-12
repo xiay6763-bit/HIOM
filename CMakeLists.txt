@@ -57,6 +57,11 @@ endif()
 
 # VIPER BENCHMARKS
 if (${VIPER_BUILD_BENCHMARKS})
+    # Enable CTest at top level BEFORE the benchmark subdir so the
+    # destructive crash-recovery regression tests registered there
+    # (hiom_crash_update_t*) attach to this project. Idempotent with the
+    # enable_testing() in the HIOM TESTS block below.
+    enable_testing()
     add_subdirectory(benchmark)
 endif()
 
