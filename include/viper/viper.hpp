@@ -489,6 +489,18 @@ class Viper {
         // so HiOM can verify a 4-byte fingerprint match against the real
         // PM-side key.
         inline bool hiom_read_at_offset(KVOffset offset, K* key_out, V* value_out) const;
+        // Status-returning variant so HiOM's read path can distinguish a
+        // TRANSIENT failure (the page was momentarily locked by a concurrent
+        // in-place update, or its version changed across the read) from a
+        // TERMINAL one (the slot is logically free). Only the transient case is
+        // worth retrying — a concurrent updater holds the VPage lock for a few
+        // instructions, so a bounded spin rides through it instead of failing
+        // the get (the read-vs-update visibility race). A free slot never
+        // becomes occupied for the same key under reclaim-off, so it is not
+        // retryable here.
+        enum class ReadStatus { kOk, kTransient, kSlotFree };
+        inline ReadStatus hiom_read_at_offset_status(KVOffset offset, K* key_out,
+                                                     V* value_out) const;
         // HiOM group-prefetching (Chen et al. SIGMOD'04): issue a software
         // prefetch for the PM record at `offset` without touching (loading)
         // it, so a subsequent hiom_read_at_offset finds the line warm. Used
@@ -2421,6 +2433,14 @@ Viper<K, V>::Client::hiom_peek_offset(const K& key) {
 template <typename K, typename V>
 inline bool Viper<K, V>::ReadOnlyClient::hiom_read_at_offset(
         KVOffset offset, K* key_out, V* value_out) const {
+    return hiom_read_at_offset_status(offset, key_out, value_out)
+           == ReadStatus::kOk;
+}
+
+template <typename K, typename V>
+inline typename Viper<K, V>::ReadOnlyClient::ReadStatus
+Viper<K, V>::ReadOnlyClient::hiom_read_at_offset_status(
+        KVOffset offset, K* key_out, V* value_out) const {
     const auto [block, page, slot] = offset.get_offsets();
     const VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
     // M4 Phase C: free_slots[slot] = true means the slot is logically
@@ -2429,14 +2449,22 @@ inline bool Viper<K, V>::ReadOnlyClient::hiom_read_at_offset(
     // even after the bit is set, so a naive read would return stale
     // (key, value). Bail before touching the data so callers
     // (verify_and_read in HotTier path, alive checks in apply_batch)
-    // treat freed slots as if they don't exist.
-    if (v_page.free_slots[slot]) return false;
+    // treat freed slots as if they don't exist. Terminal, not retryable:
+    // an in-place update never frees the slot, so a set bit is a genuine
+    // free (or a reclaim, which HiOM forbids), not a transient window.
+    if (v_page.free_slots[slot]) return ReadStatus::kSlotFree;
     const std::atomic<version_lock_t>& page_lock = v_page.version_lock;
     version_lock_t lock_val = page_lock.load(LOAD_ORDER);
-    if (IS_LOCKED(lock_val)) return false;
+    // Locked = a concurrent writer holds the page (in-place update / put).
+    // Transient: the lock is released in a few instructions, so a bounded
+    // retry by the caller rides through it rather than failing the read.
+    if (IS_LOCKED(lock_val)) return ReadStatus::kTransient;
     *key_out = v_page.data[slot].first;
     *value_out = v_page.data[slot].second;
-    return lock_val == page_lock.load(LOAD_ORDER);
+    // Version changed across the read ⇒ a writer mutated the slot mid-copy
+    // (torn). Also transient — retry with the settled value.
+    if (lock_val != page_lock.load(LOAD_ORDER)) return ReadStatus::kTransient;
+    return ReadStatus::kOk;
 }
 
 template <typename K, typename V>

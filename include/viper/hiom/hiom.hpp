@@ -178,6 +178,10 @@ class HiOM {
         std::atomic<std::uint64_t> cold_hits{0};
         std::atomic<std::uint64_t> cold_misses{0};
         std::atomic<std::uint64_t> cold_fp_collisions{0};
+        // Transient read retries (folded from per-Client shards): gets that
+        // spun over a concurrent in-place update's VPage lock rather than
+        // failing. Diagnostic; nonzero is healthy.
+        std::atomic<std::uint64_t> cold_read_retries{0};
         std::atomic<std::uint64_t> commits_flushed{0};
         std::atomic<std::uint64_t> checkpoints_written{0};
         std::atomic<std::uint64_t> recovery_replayed{0};
@@ -826,16 +830,45 @@ class HiOM {
         }
 
         // ColdTier-side verify: KVOffset comes back full-width, no codec.
+        // Rides through the read-vs-in-place-update visibility race: a
+        // concurrent Client::update takes the VPage version lock for a few
+        // instructions, during which hiom_read_at_offset would see the page
+        // LOCKED or version-torn. Treating that transient state as a hard miss
+        // spuriously failed ~1-in-a-million contended gets under YCSB-A (50%
+        // update) — a real read_success_rate < 1.0 with NO true fp64 collision
+        // (proven offline). Retry a bounded number of times on the transient
+        // status; only a genuine key mismatch or a freed slot is terminal.
         bool verify_and_read_offset(const K& key, KVOffset off, V* value) {
             if (off.is_tombstone()) return false;
+            using RS = typename ViperT::ReadOnlyClient::ReadStatus;
+            // A page lock is held for only a handful of instructions, so a
+            // short bounded spin covers many overlapping updaters without
+            // livelocking. The cap is generous (the lock is never held long
+            // in steady state); exhausting it means something is genuinely
+            // wrong (e.g. a stuck writer), so fall through to a miss rather
+            // than spin forever.
+            constexpr int kMaxRetries = 1024;
             K pm_key;
             V pm_val;
-            if (!viper_.hiom_read_at_offset(off, &pm_key, &pm_val)) {
-                return false;  // locked or version-torn
+            for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
+                const RS st =
+                    viper_.hiom_read_at_offset_status(off, &pm_key, &pm_val);
+                if (st == RS::kOk) {
+                    if (!(pm_key == key)) return false;  // genuine fp collision
+                    *value = std::move(pm_val);
+                    return true;
+                }
+                if (st == RS::kSlotFree) return false;   // terminal: freed slot
+                // kTransient: a concurrent in-place update holds the lock or
+                // bumped the version mid-read. Pause briefly and retry; the
+                // lock is released within a few instructions, so a single
+                // pause per attempt suffices to avoid hammering the cacheline.
+                HIOM_RSTAT_INC(cold_read_retries);
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
             }
-            if (!(pm_key == key)) return false;  // fp collision
-            *value = std::move(pm_val);
-            return true;
+            return false;  // retries exhausted — treat as miss (surfaced by gate)
         }
 
         // Look up the current KVOffset for `key` via Viper's CCEH and
@@ -1646,6 +1679,11 @@ class HiOM {
         std::uint64_t cold_misses{0};
         std::uint64_t cold_fp_collisions{0};
         std::uint64_t hot_warmups{0};
+        // Transient read retries: a get() that spun over a concurrent in-place
+        // update's VPage lock window rather than failing. Diagnostic only —
+        // nonzero is healthy (the retry is doing its job); it does NOT count
+        // as a read failure. Kept in the shard so it stays contention-free.
+        std::uint64_t cold_read_retries{0};
     };
     static_assert(sizeof(ReadStatShard) == 64,
                   "ReadStatShard should occupy exactly one cache line");
@@ -1661,12 +1699,13 @@ class HiOM {
     // single-threaded between op batches — so the plain-uint64 loads
     // race with nothing. O(kMaxClientSlots): negligible, off the hot path.
     void fold_read_shards_() {
-        std::uint64_t hh = 0, hm = 0, hfc = 0, ch = 0, cm = 0, cfc = 0, hw = 0;
+        std::uint64_t hh = 0, hm = 0, hfc = 0, ch = 0, cm = 0, cfc = 0, hw = 0,
+                      crr = 0;
         for (const auto& s : read_shards_) {
             hh += s.hot_hits;            hm  += s.hot_misses;
             hfc += s.hot_fp_collisions;  ch  += s.cold_hits;
             cm += s.cold_misses;         cfc += s.cold_fp_collisions;
-            hw += s.hot_warmups;
+            hw += s.hot_warmups;         crr += s.cold_read_retries;
         }
         stats_.hot_hits.store(hh, std::memory_order_relaxed);
         stats_.hot_misses.store(hm, std::memory_order_relaxed);
@@ -1675,6 +1714,7 @@ class HiOM {
         stats_.cold_misses.store(cm, std::memory_order_relaxed);
         stats_.cold_fp_collisions.store(cfc, std::memory_order_relaxed);
         stats_.hot_warmups.store(hw, std::memory_order_relaxed);
+        stats_.cold_read_retries.store(crr, std::memory_order_relaxed);
     }
     // ------------------------------------------------------------------
 
