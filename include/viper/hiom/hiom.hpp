@@ -186,6 +186,15 @@ class HiOM {
         // locks a page below the durable frontier). Separate from
         // recovery_replayed (the O(tail) suffix replay count).
         std::atomic<std::uint64_t> recovery_locks_cleared{0};
+        // Pending-ring backpressure (Claim 5A, bounded producer-consumer
+        // window). pending_ring_stalls = number of pending_register calls that
+        // had to block because the target ring slot was still occupied by an
+        // older, not-yet-retired block (flusher behind); pending_ring_wait_ns =
+        // total nanoseconds producers spent waiting on that backpressure. In a
+        // healthy run these are ~0; a nonzero stall count in a TIMED phase must
+        // be folded into the throughput story (the producer really did wait).
+        std::atomic<std::uint64_t> pending_ring_stalls{0};
+        std::atomic<std::uint64_t> pending_ring_wait_ns{0};
         // TEMP debug Step 3
         std::atomic<std::uint64_t> debug_flusher_iters{0};
         std::atomic<std::uint64_t> debug_drain_calls{0};
@@ -1233,6 +1242,20 @@ class HiOM {
         commit_buf_.reset();
     }
 
+    // Test hooks for the bounded pending-ring backpressure (Claim 5A). These
+    // drive pending_register/pending_retire directly so a unit test can force a
+    // residue collision deterministically — reproducing the "flusher fell
+    // >= kWindow behind" condition in-process without a multi-GiB insert storm
+    // whose exact scheduling is hard to pin. Test-only; not on any steady path.
+    void pending_register_for_test(std::uint64_t block) { pending_register(block); }
+    void pending_retire_for_test(std::uint64_t block) { pending_retire(block); }
+    static constexpr std::size_t pending_window_for_test() {
+        return PendingBlocks::kWindow;
+    }
+    std::uint64_t pending_ring_stalls_for_test() const {
+        return stats_.pending_ring_stalls.load(std::memory_order_relaxed);
+    }
+
     // Block until the commit buffer is fully drained (all pending
     // writes have been applied to ColdTier and corresponding HotTier
     // pins released). Used by tests and graceful shutdown sequences;
@@ -1406,6 +1429,38 @@ class HiOM {
     };
     PendingBlocks pending_{};
 
+    // Backpressure for the bounded pending ring (Claim 5A). When
+    // pending_register hits a slot still tagged by an OLDER block (a residue
+    // collision — the flusher is >= kWindow blocks behind), the producer must
+    // WAIT for that slot to drain rather than abort: the ring is a bounded
+    // producer-consumer window, and a full window means "slow down", not "bug".
+    // The waiter blocks on pending_cv_ (a DEDICATED mutex, never flusher_mus_ —
+    // pending_retire runs under flusher_mus_[id] inside apply_batch, so reusing
+    // it would deadlock); pending_retire notifies after a slot count reaches 0.
+    // pending_retire_gen_ is bumped on every slot-freeing retire so a waiter
+    // that missed the notify still makes progress (wait_for on the generation).
+    std::mutex pending_cv_mu_;
+    std::condition_variable pending_cv_;
+    std::atomic<std::uint64_t> pending_retire_gen_{0};
+    // Fail-fast backstop: if a producer waits this long, a flusher is genuinely
+    // dead/stuck (not merely behind), so abort with full diagnostics rather than
+    // hang forever. Generous — real backpressure clears in ms.
+    static constexpr std::uint64_t kPendingStallTimeoutNs = 60ull * 1000000000ull;
+
+    // Monotonic nanosecond clock for backpressure wait accounting.
+    static std::uint64_t now_ns() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    // Wake flushers so a backpressured producer can make progress. Thin wrapper
+    // over wake_all_flushers() named for intent at the pending_register call
+    // site (declared before wake_all_flushers, defined out of line below is
+    // unnecessary — wake_all_flushers is a member already in scope).
+    void hiom_wake_flushers_for_backpressure() { wake_all_flushers(); }
+
     void pending_register(std::uint64_t b) {
         // block:32 packing headroom: 2^32 blocks × 24 KiB = 96 TiB of
         // VPages — far beyond any pool this code addresses. Guarded so a
@@ -1419,6 +1474,8 @@ class HiOM {
         }
         auto& s = pending_.slot[b & PendingBlocks::kMask];
         std::uint64_t cur = s.load(std::memory_order_acquire);
+        std::uint64_t stall_start_ns = 0;  // 0 until we first stall
+        bool counted_stall = false;
         for (;;) {
             std::uint64_t desired;
             if (PendingBlocks::count_of(cur) == 0) {
@@ -1437,19 +1494,69 @@ class HiOM {
                 }
                 desired = cur + 1;                            // same block: +1
             } else {
-                std::fprintf(stderr,
-                    "[HiOM FATAL] pending-block window overflow: blocks %llu "
-                    "and %llu (both pending) alias ring slot %llu (window %zu)"
-                    " — flusher fell ≥ window behind\n",
-                    (unsigned long long)PendingBlocks::block_of(cur),
-                    (unsigned long long)b,
-                    (unsigned long long)(b & PendingBlocks::kMask),
-                    PendingBlocks::kWindow);
-                std::abort();
+                // Residue collision: slot still tagged by an OLDER block b'≠b
+                // whose entries have not yet been retired (flusher >= kWindow
+                // blocks behind). This is NOT an accounting bug — the ring is a
+                // bounded window and it is momentarily full for this residue.
+                // Back off: wake the flushers and WAIT for slot b' to drain,
+                // then retry the CAS. The colliding older block was registered
+                // (and therefore enqueued) strictly before this call, so a
+                // flusher can drain it independently of this producer — no
+                // cycle. See the register-before-enqueue ordering in
+                // push_commit and the dedicated-mutex note on pending_cv_mu_.
+                if (!counted_stall) {
+                    stats_.pending_ring_stalls.fetch_add(
+                        1, std::memory_order_relaxed);
+                    counted_stall = true;
+                    stall_start_ns = now_ns();
+                }
+                hiom_wake_flushers_for_backpressure();
+                {
+                    std::unique_lock<std::mutex> lk(pending_cv_mu_);
+                    const std::uint64_t gen_before
+                        = pending_retire_gen_.load(std::memory_order_acquire);
+                    // Re-check under the lock: the retire may have already
+                    // fired (and bumped the gen) between our CAS-fail and here.
+                    if (s.load(std::memory_order_acquire) == cur
+                        && pending_retire_gen_.load(std::memory_order_acquire)
+                               == gen_before) {
+                        pending_cv_.wait_for(
+                            lk, std::chrono::milliseconds(50),
+                            [&] {
+                                return pending_retire_gen_.load(
+                                           std::memory_order_acquire)
+                                       != gen_before;
+                            });
+                    }
+                }
+                const std::uint64_t waited_ns = now_ns() - stall_start_ns;
+                if (waited_ns > kPendingStallTimeoutNs) {
+                    // A flusher is genuinely stuck/dead, not merely behind:
+                    // fail fast with full diagnostics rather than hang forever.
+                    std::fprintf(stderr,
+                        "[HiOM FATAL] pending-ring backpressure TIMEOUT after "
+                        "%.1fs: new block %llu vs stuck block %llu at ring slot "
+                        "%llu (window %zu), commit-buffer depth ~%zu, flushers "
+                        "%zu — flusher stalled/dead, not just behind\n",
+                        waited_ns / 1e9,
+                        (unsigned long long)b,
+                        (unsigned long long)PendingBlocks::block_of(cur),
+                        (unsigned long long)(b & PendingBlocks::kMask),
+                        PendingBlocks::kWindow,
+                        commit_buf_ ? commit_buf_->size_hint() : 0,
+                        fcfg_.num_flushers);
+                    std::abort();
+                }
+                cur = s.load(std::memory_order_acquire);      // retry classify
+                continue;
             }
             if (s.compare_exchange_weak(cur, desired,
                                         std::memory_order_acq_rel,
                                         std::memory_order_acquire)) {
+                if (counted_stall) {
+                    stats_.pending_ring_wait_ns.fetch_add(
+                        now_ns() - stall_start_ns, std::memory_order_relaxed);
+                }
                 return;
             }
             // cur reloaded on failure; re-classify.
@@ -1476,6 +1583,21 @@ class HiOM {
             if (s.compare_exchange_weak(cur, cur - 1,
                                         std::memory_order_acq_rel,
                                         std::memory_order_acquire)) {
+                // If this retire FREED the slot (count hit 0), a producer may be
+                // backpressured waiting for exactly this residue. Bump the
+                // generation and notify. Done under pending_cv_mu_ so a waiter
+                // that is between its slot-recheck and its wait_for cannot miss
+                // the wakeup (the mutex serialises the gen bump with the wait).
+                // pending_cv_mu_ is NOT flusher_mus_[id] (which this call holds
+                // via apply_batch), so there is no lock-order inversion.
+                if (PendingBlocks::count_of(cur - 1) == 0) {
+                    {
+                        std::lock_guard<std::mutex> lk(pending_cv_mu_);
+                        pending_retire_gen_.fetch_add(
+                            1, std::memory_order_acq_rel);
+                    }
+                    pending_cv_.notify_all();
+                }
                 return;
             }
         }

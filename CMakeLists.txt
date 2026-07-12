@@ -98,11 +98,24 @@ if (${VIPER_BUILD_TESTS})
     endif()
     target_link_libraries(hiom_sigkill_test viper pthread)
 
+    add_executable(hiom_backpressure_test test/hiom_backpressure_test.cpp)
+    target_compile_options(hiom_backpressure_test PRIVATE -mclwb -pthread)
+    if (CMAKE_BUILD_TYPE MATCHES Release)
+        target_compile_options(hiom_backpressure_test PRIVATE -O3 -mtune=native)
+    endif()
+    target_link_libraries(hiom_backpressure_test viper pthread)
+
     # One-stop regression entry: `ctest` runs the whole HiOM suite.
     enable_testing()
     add_test(NAME cold_tier COMMAND cold_tier_test)
     add_test(NAME hot_tier COMMAND hot_tier_test)
     add_test(NAME hiom_integration COMMAND hiom_integration_test)
+    # Bounded pending-ring backpressure: writes ~12M keys to /pmem0/hiom/
+    # backpressure_test with a deliberately lazy flusher, forcing the residue
+    # collision that used to abort. Not destructive (no SIGKILL) but writes a
+    # multi-GiB pool and takes ~30-60s, so it runs in the default suite as the
+    # guard that a fast producer + slow consumer completes instead of aborting.
+    add_test(NAME hiom_backpressure COMMAND hiom_backpressure_test)
     # Destructive: wipes /pmem0/hiom/sigkill_test, 1 GiB pool, real
     # SIGKILLs. Opt-in so a plain `ctest` in an unknown environment never
     # runs it by accident; run manually or configure with
