@@ -105,6 +105,13 @@ if (${VIPER_BUILD_TESTS})
     endif()
     target_link_libraries(hiom_backpressure_test viper pthread)
 
+    add_executable(hiom_read_update_race_test test/hiom_read_update_race_test.cpp)
+    target_compile_options(hiom_read_update_race_test PRIVATE -mclwb -pthread)
+    if (CMAKE_BUILD_TYPE MATCHES Release)
+        target_compile_options(hiom_read_update_race_test PRIVATE -O3 -mtune=native)
+    endif()
+    target_link_libraries(hiom_read_update_race_test viper pthread)
+
     # One-stop regression entry: `ctest` runs the whole HiOM suite.
     enable_testing()
     add_test(NAME cold_tier COMMAND cold_tier_test)
@@ -116,6 +123,12 @@ if (${VIPER_BUILD_TESTS})
     # multi-GiB pool and takes ~30-60s, so it runs in the default suite as the
     # guard that a fast producer + slow consumer completes instead of aborting.
     add_test(NAME hiom_backpressure COMMAND hiom_backpressure_test)
+    # Read-vs-in-place-update visibility race: concurrent updaters + readers on
+    # a hot keyspace; every contended get() must succeed (the read path retries
+    # across an updater's VPage lock window instead of failing). Not destructive
+    # (no SIGKILL); ~10-20s. Guards read_success_rate==1.0 under YCSB-A-like
+    # update contention.
+    add_test(NAME hiom_read_update_race COMMAND hiom_read_update_race_test)
     # Destructive: wipes /pmem0/hiom/sigkill_test, 1 GiB pool, real
     # SIGKILLs. Opt-in so a plain `ctest` in an unknown environment never
     # runs it by accident; run manually or configure with
