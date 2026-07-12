@@ -268,6 +268,8 @@ void ycsb_run(benchmark::State& state, BaseFixture& fixture, std::vector<ycsb::R
         mem_loaded.cold_hits = mem_final.cold_hits;
         mem_loaded.cold_misses = mem_final.cold_misses;
         mem_loaded.cold_fp_collisions = mem_final.cold_fp_collisions;
+        mem_loaded.pending_ring_stalls = mem_final.pending_ring_stalls;
+        mem_loaded.pending_ring_wait_ns = mem_final.pending_ring_wait_ns;
         mem_loaded.rss_kb = mem_final.rss_kb;
         mem_loaded.pool_rss_kb = mem_final.pool_rss_kb;
         report_mem(state, mem_baseline, mem_loaded, fixture.fixture_dram_bytes());

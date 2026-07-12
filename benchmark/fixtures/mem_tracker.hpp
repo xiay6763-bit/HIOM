@@ -30,6 +30,11 @@ struct MemSnapshot {
     std::uint64_t cold_misses = 0;        // key genuinely absent from ColdTier
     std::uint64_t cold_fp_collisions = 0; // present but verify failed
     std::uint64_t hot_dram_bytes = 0;  // HotTier index struct DRAM (buckets+meta sizeof)
+    // Pending-ring backpressure (bounded producer-consumer window). Nonzero
+    // stalls in a TIMED phase mean producers waited on the flusher; fold into
+    // the throughput story rather than treating the run as clean.
+    std::uint64_t pending_ring_stalls = 0;
+    std::uint64_t pending_ring_wait_ns = 0;
 };
 
 inline std::uint64_t parse_vmrss_kb() {
@@ -121,6 +126,13 @@ inline void report_mem(benchmark::State& state,
     state.counters["hot_tier_size"]  = static_cast<double>(loaded.hot_size);
     state.counters["hot_capacity"]   = static_cast<double>(loaded.hot_capacity);
     state.counters["hot_evictions"]  = static_cast<double>(loaded.hot_evictions);
+    // Pending-ring backpressure: producers that had to wait on the flusher
+    // during the timed phase, and total ns spent waiting. 0/0 = clean run;
+    // nonzero means the throughput number includes real producer stall time.
+    state.counters["pending_ring_stalls"] =
+        static_cast<double>(loaded.pending_ring_stalls);
+    state.counters["pending_ring_wait_ns"] =
+        static_cast<double>(loaded.pending_ring_wait_ns);
     // HotTier index-structure DRAM (buckets+meta sizeof, NOT process RSS).
     // Authoritative x-axis for the C2 capacity sweep; consistent with C1's
     // white-box dram_bytes() metric.

@@ -136,6 +136,10 @@ class HiOMFixture : public BaseFixture {
             snap.cold_misses = stats.cold_misses.load(std::memory_order_relaxed);
             snap.cold_fp_collisions =
                 stats.cold_fp_collisions.load(std::memory_order_relaxed);
+            snap.pending_ring_stalls =
+                stats.pending_ring_stalls.load(std::memory_order_relaxed);
+            snap.pending_ring_wait_ns =
+                stats.pending_ring_wait_ns.load(std::memory_order_relaxed);
         }
         return snap;
     }
