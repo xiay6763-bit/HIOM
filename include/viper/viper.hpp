@@ -218,6 +218,25 @@ inline void pmem_drain() {
     _mm_sfence();
 }
 
+// Monotonic max for the block high-water mark. std::atomic has no fetch_max
+// before C++26, so CAS it up: only ever raises the value, never lowers it, so
+// concurrent callers with different `value`s converge on the maximum regardless
+// of arrival order (commutative + idempotent). Returns the previous value.
+// Used for num_used_blocks, which recovery reads as a HIGH-WATER MARK (the scan
+// ceiling) — a plain fetch_add(1) counter can lag the highest block a
+// concurrent writer has already claimed and durably written into, so a crash
+// in that window strands that block below the recovered ceiling (whole-page
+// data loss). fetch_max keyed on the claimed block number closes it.
+template <typename T>
+inline T atomic_fetch_max(std::atomic<T>& a, T value,
+                          std::memory_order order = std::memory_order_acq_rel) {
+    T prev = a.load(std::memory_order_acquire);
+    while (prev < value && !a.compare_exchange_weak(prev, value, order,
+                                                    std::memory_order_acquire)) {
+    }
+    return prev;
+}
+
 inline void pmem_memcpy_persist(void* dest, const void* src, const size_t len) {
     memcpy(dest, src, len);
     pmem_persist(dest, len);
@@ -646,11 +665,27 @@ class Viper {
     // pages of recovered data. At open there are no in-flight writers, so
     // any set lock bit is stale: clear it (preserve USED_BIT + version)
     // and persist. Ranged to the tail so recovery stays O(tail).
-    void hiom_clear_stale_page_locks(block_size_t block_lo,
-                                     block_size_t block_hi) {
+    // Clear durable-but-stale VPage write-locks over [block_lo, block_hi).
+    // Returns the number of locks cleared. At open there is no concurrent
+    // writer, so any set lock bit is the residue of a process killed mid-put;
+    // hiom_read_at_offset rejects a locked page as version-torn, so a stale
+    // lock hides every acknowledged record on that page until it is cleared.
+    //
+    // Correctness precondition (documented for the general update path): the
+    // record write that took the lock must have persisted an atomic,
+    // self-consistent value before this scan runs. For HiOM's fixed-size V
+    // that holds — an in-place update overwrites a single 8-byte-aligned field
+    // (or a fresh slot for put) and persists it before the caller observes
+    // completion, so clearing the lock never exposes a torn multi-cacheline
+    // value. A general update callback that mutates many bytes in place must
+    // itself guarantee atomic+persistent application; simply clearing the lock
+    // does NOT make an arbitrary partial in-place write consistent.
+    std::size_t hiom_clear_stale_page_locks(block_size_t block_lo,
+                                            block_size_t block_hi) {
         const block_size_t cap
             = static_cast<block_size_t>(v_blocks_.size());
         if (block_hi > cap) block_hi = cap;
+        std::size_t cleared = 0;
         for (block_size_t bn = block_lo; bn < block_hi; ++bn) {
             VPageBlock* block = v_blocks_[bn];
             if (block == nullptr) continue;
@@ -664,8 +699,57 @@ class Viper {
                     STORE_ORDER);
                 internal::pmem_persist(&page.version_lock,
                                        sizeof(page.version_lock));
+                ++cleared;
             }
         }
+        return cleared;
+    }
+
+    // Full-scan variant: clear stale locks over all USED VPages, i.e.
+    // [0, current_block_page_) — the write frontier is the count of blocks
+    // ever claimed, and a used (hence lockable) page can only exist below it.
+    // Bounding to the frontier (NOT v_blocks_.size(), the full preallocated
+    // pool capacity) keeps this O(P) in the *used* page count, not O(pool
+    // size) — critical on a large sparse pool where most blocks are untouched.
+    //
+    // Required for HiOM recovery correctness — an in-place fixed-size update
+    // locks a page BELOW the durable frontier (it does not move the frontier),
+    // so a tail-only lock scan [frontier-1, current) misses it and strands the
+    // whole page's records (see hiom.hpp recover_tail_into_cold). This scan is
+    // O(P) in the number of used VPages, independent of the O(U) tail replay;
+    // the caller times it separately so the recovery-complexity claim can be
+    // stated honestly as O(P) lock scan + O(U) replay.
+    //
+    // Parallelised over `threads` workers: each version_lock probe is an
+    // independent random PM read (~µs/page single-threaded), so block-range
+    // sharding scales near-linearly, same as recover_tail_into_cold's replay.
+    std::size_t hiom_clear_all_stale_page_locks(std::size_t threads = 1) {
+        const block_size_t used_blocks
+            = KVOffset{current_block_page_.load(LOAD_ORDER)}.block_number;
+        if (used_blocks == 0) return 0;
+        const std::size_t num_threads = std::max<std::size_t>(
+            1, std::min<std::size_t>(threads, used_blocks));
+        if (num_threads == 1) {
+            return hiom_clear_stale_page_locks(0, used_blocks);
+        }
+        const std::size_t per_thread
+            = (used_blocks + num_threads - 1) / num_threads;
+        std::atomic<std::size_t> total{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (std::size_t t = 0; t < num_threads; ++t) {
+            const block_size_t lo
+                = static_cast<block_size_t>(t * per_thread);
+            const block_size_t hi = static_cast<block_size_t>(
+                std::min<std::size_t>(lo + per_thread, used_blocks));
+            if (lo >= hi) continue;
+            workers.emplace_back([this, lo, hi, &total] {
+                total.fetch_add(hiom_clear_stale_page_locks(lo, hi),
+                                std::memory_order_relaxed);
+            });
+        }
+        for (auto& w : workers) w.join();
+        return total.load(std::memory_order_relaxed);
     }
 
     // HiOM hook (M6.5 full): resolver callback that maps a key to its
@@ -1398,7 +1482,16 @@ void Viper<K, V>::get_new_var_size_access_information(Client* client) {
     get_new_access_information(client);
     client->v_page_->next_insert_offset = 0;
 
-    v_base_.v_metadata->num_used_blocks.fetch_add(1);
+    // get_block_based_access (called via get_new_access_information above)
+    // already raised num_used_blocks to max(claimed_block+1) and persisted it.
+    // Keep this site as an idempotent fetch_max on the SAME claimed block (the
+    // old fetch_add(1) here double-counted every var-size block, inflating the
+    // recovery ceiling — harmless over-scan, but not a true high-water mark).
+    // Same value as the bump inside get_block_based_access ⇒ a no-op second
+    // pass, so num_used_blocks stays an exact HWM for var-size too.
+    internal::atomic_fetch_max<block_size_t>(
+        v_base_.v_metadata->num_used_blocks,
+        static_cast<block_size_t>(client->v_block_number_) + 1);
     internal::pmem_persist(v_base_.v_metadata, sizeof(ViperFileMetadata));
 }
 
@@ -1434,7 +1527,18 @@ void Viper<K, V>::get_block_based_access(Client* client) {
     client->v_block_->v_pages[0].version_lock |= CLIENT_BIT;
 
 #ifndef VIPER_ALLOC_ABLATE
-    v_base_.v_metadata->num_used_blocks.fetch_add(1, std::memory_order_relaxed);
+    // Recovery reads num_used_blocks as the scan CEILING (viper.hpp open path
+    // sets current_block_page_ from it). It must therefore be a true high-water
+    // mark over claimed block numbers, not a running count: a fetch_add(1) here
+    // can be reordered/delayed past a concurrent writer that already claimed a
+    // HIGHER block and durably wrote a page into it, leaving that page above the
+    // recovered ceiling and lost. Persist the max(claimed_block+1) BEFORE any
+    // record is written into client_block (the record write happens later, in
+    // put()), so a durable record in block B implies the ceiling already
+    // covers B+1. Serial path: max(block+1) == the old +1, so no regression.
+    internal::atomic_fetch_max<block_size_t>(
+        v_base_.v_metadata->num_used_blocks,
+        static_cast<block_size_t>(client_block) + 1);
     internal::pmem_persist(v_base_.v_metadata, sizeof(ViperFileMetadata));
 #endif
     // VIPER_ALLOC_ABLATE (L2a): drop the per-block shared-cacheline atomic +

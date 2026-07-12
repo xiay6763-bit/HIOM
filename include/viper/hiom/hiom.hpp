@@ -181,6 +181,11 @@ class HiOM {
         std::atomic<std::uint64_t> commits_flushed{0};
         std::atomic<std::uint64_t> checkpoints_written{0};
         std::atomic<std::uint64_t> recovery_replayed{0};
+        // O(P) stale-lock scan at open: number of durably-locked VPages
+        // cleared (residue of a process killed mid in-place update, which
+        // locks a page below the durable frontier). Separate from
+        // recovery_replayed (the O(tail) suffix replay count).
+        std::atomic<std::uint64_t> recovery_locks_cleared{0};
         // TEMP debug Step 3
         std::atomic<std::uint64_t> debug_flusher_iters{0};
         std::atomic<std::uint64_t> debug_drain_calls{0};
@@ -296,12 +301,31 @@ class HiOM {
         // frontier. Done before the flusher / commit-buffer come up
         // so no concurrent writes interleave with replay.
         if (rcfg.tail_scan && cold_ != nullptr) {
-            // Time the tail scan in isolation (recovery-sensitivity
-            // benchmark, P1). HotTier alloc happens in the init-list above,
-            // and viper/cold/checkpoint open before the ctor, so this window
-            // is the pure O(tail) replay term. Single-threaded write here
-            // (recover_tail_into_cold joins its workers before returning),
-            // so a plain double suffices — no atomic needed.
+            // Step 1 (correctness-first, O(P)): clear stale VPage write-locks
+            // over ALL used pages, not just the tail. A process killed mid
+            // in-place update leaves a page BELOW the durable frontier locked
+            // (fixed-size update does not move the frontier), so a tail-only
+            // clear misses it and hiom_read_at_offset then hides that whole
+            // page's records as version-torn. There is no concurrent writer at
+            // open, so every set lock bit is stale. Timed separately from the
+            // O(tail) replay so the recovery complexity can be reported
+            // honestly as O(P) lock scan + O(U) replay (NOT pure O(U)).
+            const auto ls_start = std::chrono::steady_clock::now();
+            const std::size_t locks_cleared
+                = viper_.hiom_clear_all_stale_page_locks(rcfg.recovery_threads);
+            const auto ls_end = std::chrono::steady_clock::now();
+            recovery_lock_scan_ms_
+                = std::chrono::duration<double, std::milli>(
+                      ls_end - ls_start).count();
+            stats_.recovery_locks_cleared.fetch_add(
+                locks_cleared, std::memory_order_relaxed);
+
+            // Step 2 (O(tail)): replay the unsafe suffix into ColdTier. Time it
+            // in isolation (recovery-sensitivity benchmark, P1). HotTier alloc
+            // happens in the init-list above, and viper/cold/checkpoint open
+            // before the ctor, so this window is the pure O(tail) replay term.
+            // Single-threaded write here (recover_tail_into_cold joins its
+            // workers before returning), so a plain double suffices.
             const auto ts_start = std::chrono::steady_clock::now();
             const std::uint64_t replayed
                 = recover_tail_into_cold(rcfg.recovery_threads);
@@ -1113,6 +1137,12 @@ class HiOM {
     // separate from fixed open overhead (HotTier alloc + viper/cold/chkpt
     // open, all outside this window).
     double recovery_tail_scan_ms() const { return recovery_tail_scan_ms_; }
+
+    // Wall-clock of the O(P) stale-lock scan (hiom_clear_all_stale_page_locks)
+    // over all used VPages, set once by the ctor when tail_scan=true. Reported
+    // alongside recovery_tail_scan_ms so the end-to-end recovery cost is
+    // stated as O(P) lock scan + O(U) replay, not pure O(unsafe suffix).
+    double recovery_lock_scan_ms() const { return recovery_lock_scan_ms_; }
 
     // White-box DRAM footprint of the HiOM index tiers. HotTier (DRAM hash
     // table) is the dominant term; ColdTier lives in a PMem mmap (≈0 DRAM);
@@ -2085,16 +2115,11 @@ class HiOM {
             = KVOffset{viper_.hiom_vpage_frontier()}.block_number;
         if (current_block <= start_block) return 0;
 
-        // Clear stale VPage write-locks in the tail BEFORE replay/reads.
-        // A process killed mid-put leaves its page durably locked; every
-        // acknowledged record on that page is valid but hiom_read_at_offset
-        // rejects a locked page as version-torn, hiding whole pages of
-        // recovered data. At open there are no writers, so a set lock bit
-        // is stale. A locked page can only be at a crash-time writer's
-        // position, which is within [start_block, current_block), so this
-        // stays O(tail). (Cooperative in-process crash tests never locked
-        // a page, which is why this only surfaces under a real SIGKILL.)
-        viper_.hiom_clear_stale_page_locks(start_block, current_block);
+        // (Stale VPage write-locks are cleared by the ctor's O(P)
+        // hiom_clear_all_stale_page_locks() BEFORE this replay — a locked
+        // page can sit BELOW start_block after an in-place update, so the
+        // clear must cover all used pages, not this [start_block,
+        // current_block) tail. See the ctor's Step 1.)
 
         const std::size_t num_blocks
             = static_cast<std::size_t>(current_block - start_block);
@@ -2225,6 +2250,8 @@ class HiOM {
     Stats stats_;
     // Set once by the ctor's Step 2 tail-scan timing; read-only thereafter.
     double recovery_tail_scan_ms_{0.0};
+    // Set once by the ctor's Step 1 O(P) stale-lock scan; read-only thereafter.
+    double recovery_lock_scan_ms_{0.0};
     FlusherConfig fcfg_;
     // Per-lane flusher-wake watermark = high_watermark / kNumLanes.
     // push_commit wakes on the RISING EDGE through this depth
