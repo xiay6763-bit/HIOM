@@ -9,9 +9,11 @@
 # per point.
 #
 # Frozen configuration (recorded verbatim into the run manifest):
-#   CORE_COMMIT   48a394e  (pending-ring backpressure; also incl. num_used_blocks
-#                 durable HWM fix 70e88e3 and stale-lock fix)
-#   EVAL_COMMIT   459ba6e  (pending-ring stall telemetry + this frozen harness)
+#   CORE_COMMIT   b11c861  (read-path retry across in-place-update lock window;
+#                 also incl. pending-ring backpressure 48a394e, num_used_blocks
+#                 durable HWM 70e88e3, and the stale-lock fix)
+#   EVAL_COMMIT   296e86c  (read-update race regression + fp64 scanner; also
+#                 incl. pending-ring stall telemetry + this frozen harness)
 #   K/V           KeyType8 / ValueType200
 #   prefill       full 10M (YCSB_SIZE_TAG=10M => ycsb_prefill_10M.dat)
 #   threads       1,2,4,8,16,24   (READ_ARGS for 100r; A/B use GENERAL_ARGS
@@ -48,8 +50,8 @@ SIZE=10
 THREAD_FILTER='threads:(1|2|4|8|16|24)$'
 PER_CELL_TIMEOUT_S="${FR_PER_CELL_TIMEOUT_S:-5400}"
 
-CORE_COMMIT="48a394e"
-EVAL_COMMIT="459ba6e"
+CORE_COMMIT="b11c861"
+EVAL_COMMIT="296e86c"
 
 IFS=' ' read -ra FIXTURES  <<< "${FR_FIXTURES:-ViperFixture HiOMFixture DashFixture CcehFixture}"
 IFS=' ' read -ra WORKLOADS <<< "${FR_WORKLOADS:-100r a b}"
