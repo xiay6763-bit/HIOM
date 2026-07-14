@@ -24,6 +24,12 @@ a ~320 ms floor throughout (4-5x slower than HiOM). The 100M Halo point is a
 resize blow-up (16 GB CLHT, 12% load) — hollow, excluded from the trend.
 
 Measured 2026-06-15 via the Halo harness (halo_recovery_smoke / viper_recovery_smoke).
+
+NOTE (2026-07-14): the paper's main C3 figure (recovery_vs_n.pdf) is now the
+fresh-process cold-vs-cold real-SIGKILL figure at K8/V200
+(eval/recovery_vs_n_crash_plot.py). THIS script is the alternative same-V8
+apples-to-apples cut that ALSO includes Halo; it writes recovery_vs_n_v8_halo.pdf
+and feeds the E3 prose (Halo ~320 ms floor; Viper V200 25× point).
 """
 import os
 import matplotlib
@@ -31,8 +37,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 BW = os.environ.get("BW") == "1"
-OUT = ("/root/viper/paper/figures/recovery_vs_n.pdf" if BW
-       else "/root/viper/eval/charts/recovery_vs_n.pdf")
+OUT = ("/root/viper/paper/figures/recovery_vs_n_v8_halo.pdf" if BW
+       else "/root/viper/eval/charts/recovery_vs_n_v8_halo.pdf")
 
 HIOM_MS = 87.0                            # O(tail), constant, value-independent
 N_HALO  = [1, 10, 33]                     # V8, normal 78-82% load
