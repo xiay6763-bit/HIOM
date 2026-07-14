@@ -22,7 +22,11 @@
 #                 --benchmark_repetitions, it would override the registration)
 #   HIOM_FLUSHERS 2
 #   prefault      OFF (VIPER_PREFAULT unset)
-#   GET_BATCH     OFF (HIOM_GET_BATCH unset)
+#   GET_BATCH     16 (HIOM_GET_BATCH=16 — the group-prefetch read path is part
+#                 of HiOM's method, so HiOM's frozen config runs with it ON.
+#                 The env is read only by HiOMFixture; baselines ignore it.
+#                 HiOM cells measured with GET_BATCH OFF are archived under
+#                 archive_get_batch_off/ as the ablation.)
 #
 # The core/eval implementation is frozen; this driver only *selects and runs*
 # already-registered benchmarks. It writes nothing into include/viper/**.
@@ -50,8 +54,8 @@ SIZE=10
 THREAD_FILTER='threads:(1|2|4|8|16|24)$'
 PER_CELL_TIMEOUT_S="${FR_PER_CELL_TIMEOUT_S:-5400}"
 
-CORE_COMMIT="b11c861"
-EVAL_COMMIT="296e86c"
+CORE_COMMIT="220fb60"
+EVAL_COMMIT="1c660d6"
 
 IFS=' ' read -ra FIXTURES  <<< "${FR_FIXTURES:-ViperFixture HiOMFixture DashFixture CcehFixture}"
 IFS=' ' read -ra WORKLOADS <<< "${FR_WORKLOADS:-100r a b}"
@@ -97,7 +101,7 @@ MANIFEST="${OUT_DIR}/run_manifest.txt"
   echo "repetitions=3 (registered)"
   echo "hiom_flushers=${HIOM_FLUSHERS:-2}"
   echo "prefault=${VIPER_PREFAULT:-OFF}"
-  echo "get_batch=${HIOM_GET_BATCH:-OFF}"
+  echo "get_batch=${HIOM_GET_BATCH:-16}"
   echo "fixtures=${FIXTURES[*]}"
   echo "workloads=${WORKLOADS[*]}"
   echo "dists=${DISTS[*]}"
@@ -111,7 +115,7 @@ echo
 # change the run out from under the recorded config).
 export HIOM_FLUSHERS="${HIOM_FLUSHERS:-2}"
 unset VIPER_PREFAULT
-unset HIOM_GET_BATCH
+export HIOM_GET_BATCH="${HIOM_GET_BATCH:-16}"
 
 total=0; skip=0; run=0
 for workload in "${WORKLOADS[@]}"; do
