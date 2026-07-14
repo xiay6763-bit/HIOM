@@ -1,8 +1,9 @@
 // HiOM real process-kill recovery benchmark (E3 / Claim 3, 4, 5).
 //
-// This is an EVALUATION harness — it lives outside the core (frozen at
-// CORE_COMMIT=323f564) and does NOT modify include/viper/** or any fixture
-// runtime semantics. It only *drives* the public HiOM/Viper/ColdTier/
+// This is an EVALUATION harness — it lives outside the core (the frozen core
+// implementation; CORE_COMMIT is recorded in benchmark/run_frozen_ycsb.sh's
+// manifest, currently b11c861) and does NOT modify include/viper/** or any
+// fixture runtime semantics. It only *drives* the public HiOM/Viper/ColdTier/
 // Checkpoint API. The paper artefact records two hashes: CORE_COMMIT and
 // EVAL_COMMIT (this file's commit).
 //
@@ -112,6 +113,27 @@ struct Shared {
 
 enum class Workload { kInsert, kYcsbA, kYcsbB };
 
+// Which system's crash-recovery we measure. The fork/SIGKILL/random-delay/
+// verify skeleton is shared; only the write path (child) and the reopen path
+// (parent) differ. kHiom is the default (existing behaviour, unchanged).
+//   kHiom  : child writes through HiOM (ColdTier authoritative), parent reopens
+//            viper skip_recovery + cold + checkpoint + HiOM tail_scan.
+//   kViper : child writes through a plain Viper client (no HiOM/cold/chkpt),
+//            parent reopens with a REAL recover_database() (32-thread CCEH
+//            rebuild, skip_recovery=false) and times it as total_recovery_ms.
+//            This is the honest Viper true-SIGKILL baseline for E3.
+enum class System { kHiom, kViper };
+
+System parse_system(const char* s) {
+    if (!s || std::strcmp(s, "hiom") == 0) return System::kHiom;
+    if (std::strcmp(s, "viper") == 0) return System::kViper;
+    std::fprintf(stderr, "unknown HIOM_CR_SYSTEM='%s' (want hiom|viper)\n", s);
+    std::exit(2);
+}
+const char* system_name(System s) {
+    return s == System::kHiom ? "hiom" : "viper";
+}
+
 Workload parse_workload(const char* s) {
     if (!s || std::strcmp(s, "insert") == 0) return Workload::kInsert;
     if (std::strcmp(s, "ycsb_a") == 0) return Workload::kYcsbA;
@@ -145,6 +167,67 @@ std::size_t env_size(const char* name, std::size_t dflt) {
 }
 
 // ---- child: prefill, checkpoint, then run workload until SIGKILLed --------
+
+// Viper-only child: identical keyspace / watermark protocol as the HiOM child,
+// but every op goes straight through a plain Viper client. No HiOM, ColdTier,
+// or Checkpoint exist — the parent will lean on Viper's own recover_database()
+// to rebuild the CCEH index from the durable VPages. Prefill is quiesced with
+// a fence so it is durable before the runtime workload opens the unsafe suffix.
+[[noreturn]] void child_run_viper(Shared* sh, std::size_t N, int nthreads,
+                                  Workload wl) {
+    auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+
+    // 1. Prefill [1, N] single-threaded, then persist. Viper's put already
+    //    persists the VPage slot; a store fence before publishing prefill_top
+    //    mirrors the HiOM child's flush_and_wait ordering.
+    {
+        auto cl = viper_db->get_client();
+        for (std::uint64_t k = 1; k <= N; ++k) {
+            if (!cl.put(make_key(k), make_val(k)))
+                std::abort();
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    sh->prefill_top.store(N, std::memory_order_release);
+
+    // 2. Runtime workload — same striping / watermark discipline as HiOM child.
+    std::vector<std::thread> workers;
+    for (int t = 0; t < nthreads; ++t) {
+        workers.emplace_back([t, nthreads, N, sh, wl, &viper_db] {
+            auto cl = viper_db->get_client();
+            std::mt19937_64 rng(0xC0FFEE ^ (static_cast<std::uint64_t>(t) << 20));
+            std::uniform_int_distribution<std::uint64_t> pick(1, N);
+            std::uniform_real_distribution<double> coin(0.0, 1.0);
+            std::uint64_t done = 0;
+            for (std::uint64_t i = 0;; ++i) {
+                bool ok;
+                if (wl == Workload::kInsert) {
+                    const std::uint64_t key =
+                        N + 1 + static_cast<std::uint64_t>(t) +
+                        static_cast<std::uint64_t>(nthreads) * i;
+                    ok = cl.put(make_key(key), make_val(key));
+                } else {
+                    const double u = coin(rng);
+                    const double upd_frac = (wl == Workload::kYcsbA) ? 0.5 : 0.05;
+                    const std::uint64_t key = pick(rng);
+                    if (u < upd_frac) {
+                        auto fn = [key](ValueT* v) { *v = make_val(key); };
+                        ok = cl.update(make_key(key), fn);
+                    } else {
+                        ValueT got;
+                        ok = cl.get(make_key(key), &got);
+                    }
+                }
+                if (!ok) std::abort();
+                done = i + 1;
+                sh->completed[t].store(done, std::memory_order_release);
+            }
+        });
+    }
+    sh->child_ready.store(1, std::memory_order_release);
+    for (auto& w : workers) w.join();   // unreachable; parent SIGKILLs us
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+}
 
 [[noreturn]] void child_run(Shared* sh, std::size_t N, int nthreads,
                             std::size_t hot_buckets, Workload wl) {
@@ -235,6 +318,7 @@ std::size_t env_size(const char* name, std::size_t dflt) {
 // ---- parent: reopen, time each phase, verify, emit one CSV row -----------
 
 struct Row {
+    const char* system;
     const char* workload;
     int iteration;
     long kill_delay_ms;
@@ -266,7 +350,7 @@ struct Row {
 
 void csv_header(std::FILE* f) {
     std::fprintf(f,
-        "workload,iteration,kill_delay_ms,completed_reads,completed_updates,"
+        "system,workload,iteration,kill_delay_ms,completed_reads,completed_updates,"
         "completed_inserts,checkpoint_seq,checkpoint_version,"
         "durable_frontier_block,current_block,unsafe_suffix_blocks,scan_blocks,"
         "recovery_replayed,recovery_locks_cleared,viper_open_ms,cold_open_ms,"
@@ -277,9 +361,9 @@ void csv_header(std::FILE* f) {
 
 void csv_row(std::FILE* f, const Row& r) {
     std::fprintf(f,
-        "%s,%d,%ld,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+        "%s,%s,%d,%ld,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
         "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%llu,%llu,%llu,%zu\n",
-        r.workload, r.iteration, r.kill_delay_ms,
+        r.system, r.workload, r.iteration, r.kill_delay_ms,
         (unsigned long long)r.completed_reads,
         (unsigned long long)r.completed_updates,
         (unsigned long long)r.completed_inserts,
@@ -307,6 +391,167 @@ double ms_between(clk::time_point a, clk::time_point b) {
 // Reopen + recover, populate timing/frontier fields of `row`. Returns the
 // live HiOM so the caller can verify; also fills durable_frontier_block,
 // current_block, both tail lengths.
+// Viper-only reopen: a REAL post-crash Viper recovery. Open with the default
+// config (skip_recovery=false, num_recovery_threads=32) so recover_database()
+// rebuilds the whole CCEH index from the durable VPages — Viper's actual O(N)
+// crash path, not the skip_recovery mmap the HiOM reopen uses. The rebuild is
+// reported as BOTH viper_open_ms and total_recovery_ms (there are no other
+// phases); every HiOM-specific column stays 0 so the two systems' CSVs share
+// one schema.
+int reopen_recover_verify_viper(Shared* sh, std::size_t N, int nthreads,
+                                Workload wl, Row& row) {
+    const auto t0 = clk::now();
+    viper::ViperConfig vcfg;   // defaults: full recovery, 32 threads
+    auto viper_db = ViperT::open(kPoolDir, vcfg);
+    const auto t1 = clk::now();
+    // FINDING (2026-07-13, live): stock Viper's crash recovery is incomplete.
+    // recover_database() rebuilds the CCEH index but never repairs VPage
+    // write-locks left odd by a mid-put SIGKILL — the paper's recovery
+    // experiment only measures CLEAN-shutdown restarts (recovery_bm.cpp:
+    // InitMap -> DeInitMap -> open), where every lock is even, so this can't
+    // show up there. Post-SIGKILL, any read of a page that was mid-put at
+    // kill time spins FOREVER in the seqlock retry (observed: verify pinned a
+    // core for 19 min inside ReadOnlyClient::get until we killed it).
+    // To make the baseline measurable at all (and its lost=0 verifiable), run
+    // the same stale-lock repair pass HiOM's recovery performs — same core
+    // API, same parallelism as the rebuild — and charge it to Viper's total
+    // (reported under lock_scan_ms). Strictly generous to the baseline.
+    const std::size_t locks_cleared =
+        viper_db->hiom_clear_all_stale_page_locks(vcfg.num_recovery_threads);
+    const auto t2 = clk::now();
+
+    row.viper_open_ms = ms_between(t0, t1);      // = recover_database rebuild
+    row.lock_scan_ms = ms_between(t1, t2);       // = stale-lock repair pass
+    row.recovery_locks_cleared = locks_cleared;
+    row.total_recovery_ms = ms_between(t0, t2);
+    row.current_block =
+        viper::KeyValueOffset{viper_db->hiom_vpage_frontier()}.block_number;
+
+    // ---- verify every confirmed op is recoverable (same sets as HiOM) -----
+    auto cl = viper_db->get_read_only_client();
+    std::uint64_t expected = 0, recovered = 0, lost = 0, mismatch = 0;
+    std::vector<std::uint64_t> lost_keys;
+    constexpr std::size_t kMaxLostKeys = 20000;
+    // Reservoir-ish: keep every Kth lost key so the sample spans the whole
+    // id range, not just the first 4096 (which are all low-id prefill and
+    // biased the above/below-ceiling classification).
+    std::uint64_t lost_seen = 0;
+    auto note_lost = [&](std::uint64_t key) {
+        ++lost_seen;
+        if (lost_keys.size() < kMaxLostKeys) lost_keys.push_back(key);
+        else if ((lost_seen & 0x3f) == 0 && !lost_keys.empty())
+            lost_keys[(lost_seen >> 6) % lost_keys.size()] = key;
+    };
+    for (std::uint64_t k = 1; k <= N; ++k) {
+        ++expected;
+        ValueT got;
+        if (!cl.get(make_key(k), &got)) {
+            ++lost;
+            note_lost(k);
+            continue;
+        }
+        if (got != make_val(k)) ++mismatch; else ++recovered;
+    }
+    row.completed_reads = 0;
+    row.completed_updates = 0;
+    row.completed_inserts = 0;
+    for (int t = 0; t < nthreads; ++t) {
+        const std::uint64_t done =
+            sh->completed[t].load(std::memory_order_acquire);
+        if (wl == Workload::kInsert) {
+            row.completed_inserts += done;
+            for (std::uint64_t i = 0; i < done; ++i) {
+                const std::uint64_t key =
+                    N + 1 + static_cast<std::uint64_t>(t) +
+                    static_cast<std::uint64_t>(nthreads) * i;
+                ++expected;
+                ValueT got;
+                if (!cl.get(make_key(key), &got)) {
+                    ++lost;
+                    note_lost(key);
+                    continue;
+                }
+                if (got != make_val(key)) ++mismatch; else ++recovered;
+            }
+        } else {
+            if (wl == Workload::kYcsbA) {
+                row.completed_updates += done / 2;
+                row.completed_reads += done - done / 2;
+            } else {  // ycsb_b: 5% update
+                row.completed_updates += done / 20;
+                row.completed_reads += done - done / 20;
+            }
+        }
+    }
+    row.expected = expected;
+    row.recovered = recovered;
+    row.lost = lost;
+    row.mismatch = mismatch;
+    row.cold_size_after = 0;
+
+    // Forensic: classify each lost Viper record relative to the recovery
+    // ceiling (current_block = hiom_vpage_frontier's block). Distinguishes a
+    // harness watermark race (record physically ABOVE the ceiling => the put
+    // persisted but recover_database's num_used_blocks HWM hadn't advanced to
+    // cover it at kill time => never a real durability loss, the confirmed set
+    // is the watermark) from a genuine below-ceiling loss (a page recovery
+    // SHOULD have rebuilt but didn't). Same predicate as the HiOM forensic;
+    // uses only public visit API. Env HIOM_CR_FORENSIC=1.
+    if (lost > 0 && std::getenv("HIOM_CR_FORENSIC")) {
+        std::unordered_map<std::uint64_t, viper::KeyValueOffset> found;
+        std::unordered_set<std::uint64_t> want;
+        for (std::uint64_t id : lost_keys)
+            want.insert(make_key(id).get_key());
+        constexpr viper::block_size_t kScanAll =
+            std::numeric_limits<viper::block_size_t>::max();
+        viper_db->hiom_visit_records(
+            0, kScanAll,
+            [&](const KeyT& k, const ValueT&, viper::KeyValueOffset off) {
+                const std::uint64_t enc = k.get_key();
+                if (want.count(enc)) found[enc] = off;
+            });
+        const std::uint64_t ceiling = row.current_block;
+        std::size_t above = 0, at_or_below = 0, not_on_pm = 0;
+        std::unordered_set<std::uint64_t> above_blocks;
+        // Block-number histogram of lost-yet-on-PM records, so we see WHERE in
+        // the pool recovery missed them (not just above/below the ceiling).
+        std::uint64_t min_lost_blk = ~0ull, max_lost_blk = 0;
+        for (std::uint64_t id : lost_keys) {
+            auto it = found.find(make_key(id).get_key());
+            if (it == found.end()) { ++not_on_pm; continue; }
+            const auto bn = static_cast<std::uint64_t>(it->second.block_number);
+            if (bn < min_lost_blk) min_lost_blk = bn;
+            if (bn > max_lost_blk) max_lost_blk = bn;
+            if (bn >= ceiling) { ++above; above_blocks.insert(bn); }
+            else ++at_or_below;
+        }
+        std::fprintf(stderr,
+            "  ==== VIPER FORENSIC: %llu lost (sampled %zu) | ceiling(block)=%llu | "
+            "on-PM lost blocks span [%llu, %llu] | above=%zu at_or_below=%zu "
+            "not_on_pm=%zu ====\n",
+            (unsigned long long)lost, lost_keys.size(),
+            (unsigned long long)ceiling,
+            (unsigned long long)(min_lost_blk==~0ull?0:min_lost_blk),
+            (unsigned long long)max_lost_blk,
+            above, at_or_below, not_on_pm);
+        // (Block-span histogram above localizes where recovery missed;
+    }
+
+    bool pass = true;
+    if (lost != 0 || mismatch != 0) {
+        std::fprintf(stderr, "  GATE FAIL: lost=%llu mismatch=%llu\n",
+                     (unsigned long long)lost, (unsigned long long)mismatch);
+        pass = false;
+    }
+    if (recovered != expected) {
+        std::fprintf(stderr, "  GATE FAIL: recovered=%llu != expected=%llu\n",
+                     (unsigned long long)recovered,
+                     (unsigned long long)expected);
+        pass = false;
+    }
+    return pass ? 0 : 1;
+}
+
 int reopen_recover_verify(Shared* sh, std::size_t N, int nthreads,
                           std::size_t hot_buckets, Workload wl, Row& row) {
     const auto t0 = clk::now();
@@ -345,7 +590,17 @@ int reopen_recover_verify(Shared* sh, std::size_t N, int nthreads,
 
     HiOMT::RecoveryConfig rcfg;
     rcfg.tail_scan = true;
-    rcfg.recovery_threads = 8;
+    // Recovery parallelism: default 32 = ViperConfig::num_recovery_threads's
+    // default, so BOTH systems get the same repair/rebuild thread budget (the
+    // Viper baseline runs recover_database + its stale-lock repair at 32).
+    // Overridable for sensitivity runs via HIOM_CR_REC_THREADS.
+    rcfg.recovery_threads =
+        static_cast<std::size_t>(env_size("HIOM_CR_REC_THREADS", 32));
+    // O(P) stale-lock scan A/B: default OFF — the bounded-lock-set protocol
+    // (lock-intent registry + lazy repair, viper.hpp) replaces it; recovery
+    // is O(tail) again. HIOM_CR_LOCK_SCAN=1 re-enables the scan for the
+    // ablation column.
+    rcfg.stale_lock_scan = env_size("HIOM_CR_LOCK_SCAN", 0) != 0;
     HiOMT hiom(*viper_db, hot_buckets, cold.get(), HiOMT::FlusherConfig{},
                chkpt.get(), HiOMT::CheckpointConfig{}, rcfg);
     const auto t4 = clk::now();
@@ -525,6 +780,10 @@ int reopen_recover_verify(Shared* sh, std::size_t N, int nthreads,
 
 
     bool pass = true;
+    // Lazy-repair telemetry: with the scan off, every crash-stale lock is
+    // repaired on first touch during replay/verify; nonzero here is the
+    // registry doing the scan's job for O(threads) pages instead of O(P).
+    std::printf("  lazy_lock_repairs=%zu\n", viper_db->hiom_lazy_lock_repairs());
     if (row.checkpoint_version != viper::hiom::CheckpointRecord::kProtoDurableFrontier) {
         std::fprintf(stderr, "  GATE FAIL: checkpoint version=%llu != 2\n",
                      (unsigned long long)row.checkpoint_version);
@@ -550,9 +809,96 @@ int reopen_recover_verify(Shared* sh, std::size_t N, int nthreads,
 }
 
 // One crash cycle. Returns 0 on a clean, gate-passing recovery.
+// Viper baseline recovery, measured on its OWN paper's terms: a CLEAN restart
+// (create → prefill → graceful close → timed reopen with recover_database).
+// Rationale (2026-07-13, option (a)): Viper [VLDB'21]'s recovery experiment is
+// clean-shutdown rebuild timing (recovery_bm.cpp: InitMap → DeInitMap → open),
+// NOT process-kill. Its recovery cost is O(N) CCEH rebuild either way, so this
+// gives the honest, apples-to-its-own-paper O(N) baseline for the C3 speed
+// comparison against HiOM's O(unsafe suffix). Subjecting Viper to real SIGKILL
+// exposes a rare pre-existing Viper recovery race (acknowledged-write reindex
+// loss — see the Viper-baseline crash-recovery note) that is tangential to the
+// recovery-TIME axis; we do not rely on it. The real-SIGKILL Viper path is
+// still available via HIOM_CR_VIPER_SIGKILL=1 for reproducing that finding.
+int run_one_viper_clean(Shared* /*sh*/, int iter, std::size_t N, int nthreads,
+                        Workload wl, std::FILE* csv) {
+    guarded_cleanup();
+    // 1. FORK: child creates + prefills N + GRACEFULLY closes (destructor
+    //    flushes/marks clean) + exits 0. The parent — which never touches the
+    //    pool — then reopens it COLD. This mirrors HiOM's fork+SIGKILL exactly
+    //    (parent always reopens a pool built by a now-dead child), so both
+    //    systems' recovery is measured on an identically-cold pool; only the
+    //    child's exit differs (graceful close vs SIGKILL). Without the fork the
+    //    same-process reopen was cache/PM-warm and understated Viper's rebuild
+    //    (observed 8.6s cold iter0 vs 2.3s warm iter1) — an unfair asymmetry.
+    const pid_t pid = fork();
+    if (pid < 0) { std::perror("fork"); return 1; }
+    if (pid == 0) {
+        auto db = ViperT::create(kPoolDir, kPoolSize);
+        auto cl = db->get_client();
+        for (std::uint64_t k = 1; k <= N; ++k)
+            if (!cl.put(make_key(k), make_val(k))) std::_Exit(3);
+        db.reset();               // explicit clean shutdown before exit
+        std::_Exit(0);            // graceful — no SIGKILL, pool marked clean
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) { std::perror("waitpid"); return 1; }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::fprintf(stderr, "  child clean-prefill failed (0x%x)\n", status);
+        return 1;
+    }
+
+    Row row{};
+    row.system = "viper";
+    row.workload = "clean_restart";
+    row.iteration = iter;
+    row.kill_delay_ms = 0;
+    row.cold_size_before = static_cast<std::size_t>(-1);
+
+    // 2. Parent reopens COLD == O(N) CCEH rebuild (num_recovery_threads = 32).
+    const auto t0 = clk::now();
+    viper::ViperConfig vcfg;
+    auto db = ViperT::open(kPoolDir, vcfg);
+    const auto t1 = clk::now();
+    row.viper_open_ms = ms_between(t0, t1);
+    row.total_recovery_ms = row.viper_open_ms;
+    row.current_block =
+        viper::KeyValueOffset{db->hiom_vpage_frontier()}.block_number;
+
+    // 3. Verify every prefilled key is present. Clean shutdown => lost MUST be
+    //    0; this asserts the clean-restart is genuinely clean (no torn tail).
+    auto cl = db->get_read_only_client();
+    std::uint64_t lost = 0, mismatch = 0, recovered = 0;
+    for (std::uint64_t k = 1; k <= N; ++k) {
+        ValueT got;
+        if (!cl.get(make_key(k), &got)) { ++lost; continue; }
+        if (!(got == make_val(k))) ++mismatch; else ++recovered;
+    }
+    row.completed_inserts = 0;
+    row.expected = N;
+    row.recovered = recovered;
+    row.lost = lost;
+    row.mismatch = mismatch;
+    row.cold_size_after = 0;
+    (void)nthreads; (void)wl;
+
+    csv_row(csv, row);
+    const bool pass = (lost == 0 && mismatch == 0);
+    std::printf("  iter %d [viper/clean_restart] N=%zu rebuild=%.1fms "
+                "recovered=%llu/%llu %s\n",
+                iter, N, row.total_recovery_ms,
+                (unsigned long long)recovered, (unsigned long long)N,
+                pass ? "OK" : "GATE-FAIL");
+    if (!pass)
+        std::fprintf(stderr, "  GATE FAIL (clean restart should never lose): "
+                     "lost=%llu mismatch=%llu\n",
+                     (unsigned long long)lost, (unsigned long long)mismatch);
+    return pass ? 0 : 1;
+}
+
 int run_one(Shared* sh, int iter, std::size_t N, int nthreads,
-            std::size_t hot_buckets, Workload wl, long kill_delay_ms,
-            std::FILE* csv) {
+            std::size_t hot_buckets, System sys, Workload wl,
+            long kill_delay_ms, std::FILE* csv) {
     guarded_cleanup();
     for (int t = 0; t < nthreads; ++t)
         sh->completed[t].store(0, std::memory_order_relaxed);
@@ -562,7 +908,10 @@ int run_one(Shared* sh, int iter, std::size_t N, int nthreads,
 
     const pid_t pid = fork();
     if (pid < 0) { std::perror("fork"); return 1; }
-    if (pid == 0) child_run(sh, N, nthreads, hot_buckets, wl);  // [[noreturn]]
+    if (pid == 0) {
+        if (sys == System::kViper) child_run_viper(sh, N, nthreads, wl);
+        child_run(sh, N, nthreads, hot_buckets, wl);  // [[noreturn]]
+    }
 
     const auto wait_for = [&](auto&& pred, int timeout_ms, const char* what) {
         const auto deadline = clk::now() + std::chrono::milliseconds(timeout_ms);
@@ -597,16 +946,20 @@ int run_one(Shared* sh, int iter, std::size_t N, int nthreads,
     if (::waitpid(pid, &status, 0) < 0) { std::perror("waitpid"); return 1; }
 
     Row row{};
+    row.system = system_name(sys);
     row.workload = workload_name(wl);
     row.iteration = iter;
     row.kill_delay_ms = kill_delay_ms;
     row.cold_size_before = static_cast<std::size_t>(-1);  // pre-kill, in child
-    const int rc = reopen_recover_verify(sh, N, nthreads, hot_buckets, wl, row);
+    const int rc =
+        sys == System::kViper
+            ? reopen_recover_verify_viper(sh, N, nthreads, wl, row)
+            : reopen_recover_verify(sh, N, nthreads, hot_buckets, wl, row);
     csv_row(csv, row);
-    std::printf("  iter %d [%s] delay=%ldms suffix=%llu scan=%llu replayed=%llu "
+    std::printf("  iter %d [%s/%s] delay=%ldms suffix=%llu scan=%llu replayed=%llu "
                 "locks=%llu lockscan=%.2fms tail=%.1fms total=%.1fms "
                 "recovered=%llu/%llu %s\n",
-                iter, row.workload, kill_delay_ms,
+                iter, row.system, row.workload, kill_delay_ms,
                 (unsigned long long)row.unsafe_suffix_blocks,
                 (unsigned long long)row.scan_blocks,
                 (unsigned long long)row.recovery_replayed,
@@ -625,6 +978,8 @@ int main(int argc, char** argv) {
     //   HIOM_CR_N          distinct prefill keys       (default 100000)
     //   HIOM_CR_THREADS    runtime writer threads      (default 4)
     //   HIOM_CR_ITERS      crash iterations            (default 3)
+    //   HIOM_CR_SYSTEM     hiom|viper                  (default hiom; viper =
+    //                      real recover_database() rebuild as the baseline)
     //   HIOM_CR_WORKLOAD   insert|ycsb_a|ycsb_b        (default insert)
     //   HIOM_CR_MIN_MS     min kill delay              (default 5)
     //   HIOM_CR_MAX_MS     max kill delay              (default 60)
@@ -634,6 +989,7 @@ int main(int argc, char** argv) {
     const std::size_t N = env_size("HIOM_CR_N", 100'000);
     const int nthreads = static_cast<int>(env_size("HIOM_CR_THREADS", 4));
     const int iters = static_cast<int>(env_size("HIOM_CR_ITERS", 3));
+    const System sys = parse_system(std::getenv("HIOM_CR_SYSTEM"));
     const Workload wl = parse_workload(std::getenv("HIOM_CR_WORKLOAD"));
     const long min_ms = static_cast<long>(env_size("HIOM_CR_MIN_MS", 5));
     const long max_ms = static_cast<long>(env_size("HIOM_CR_MAX_MS", 60));
@@ -655,18 +1011,23 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("HIOM_CR_CSV")) {
         csv_path = e;
     } else {
-        csv_path = std::string("results/recovery/crash_") + workload_name(wl)
-                   + ".csv";
+        csv_path = std::string("results/recovery/crash_") + system_name(sys)
+                   + "_" + workload_name(wl) + ".csv";
     }
     std::error_code ec;
     std::filesystem::create_directories(
         std::filesystem::path(csv_path).parent_path(), ec);
 
-    std::printf("=== HiOM crash-recovery bench (K8/V200) ===\n");
-    std::printf("N=%zu threads=%d iters=%d workload=%s delay=[%ld,%ld]ms "
-                "hot_buckets=2^%zu csv=%s\n",
-                N, nthreads, iters, workload_name(wl), min_ms, max_ms,
-                hot_log2, csv_path.c_str());
+    std::printf("=== %s crash-recovery bench (K8/V200) ===\n",
+                sys == System::kViper
+                    ? (env_size("HIOM_CR_VIPER_SIGKILL", 0) != 0
+                           ? "Viper (real SIGKILL — reproduces recovery race)"
+                           : "Viper (clean restart — paper methodology)")
+                    : "HiOM");
+    std::printf("N=%zu threads=%d iters=%d system=%s workload=%s "
+                "delay=[%ld,%ld]ms hot_buckets=2^%zu csv=%s\n",
+                N, nthreads, iters, system_name(sys), workload_name(wl),
+                min_ms, max_ms, hot_log2, csv_path.c_str());
 
     Shared* sh = static_cast<Shared*>(
         ::mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
@@ -681,10 +1042,20 @@ int main(int argc, char** argv) {
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<long> delay(min_ms, max_ms);
 
+    // Option (a) (2026-07-13): the Viper baseline is measured by CLEAN restart
+    // (its own paper's methodology) unless HIOM_CR_VIPER_SIGKILL=1 opts into the
+    // real-SIGKILL path (which reproduces the pre-existing Viper recovery race).
+    // HiOM always uses real SIGKILL — that IS HiOM's crash-consistency claim.
+    const bool viper_sigkill = env_size("HIOM_CR_VIPER_SIGKILL", 0) != 0;
+    const bool viper_clean = (sys == System::kViper) && !viper_sigkill;
+
     int failures = 0;
     for (int i = 0; i < iters; ++i) {
         const long d = delay(rng);
-        failures += run_one(sh, i, N, nthreads, hot_buckets, wl, d, csv);
+        if (viper_clean)
+            failures += run_one_viper_clean(sh, i, N, nthreads, wl, csv);
+        else
+            failures += run_one(sh, i, N, nthreads, hot_buckets, sys, wl, d, csv);
     }
 
     std::fclose(csv);
