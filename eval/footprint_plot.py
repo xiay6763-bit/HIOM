@@ -16,9 +16,13 @@ PM-resident end (DRAM ~0) but pays it back in read throughput (see E2).
 Data provenance (10 M records, K8/V200 = 216 B):
   - DRAM (index): WHITE-BOX measured via fixture_dram_bytes()
       Viper 2052, CCEH 2052, Halo 247, HiOM 272, Dash ~0 MB.
-      (Halo: total bucket bytes = total_slot/3 * 64 B, primary + overflow,
-       measured 2026-06-15 via the Halo hash_api harness. At 10M Halo < HiOM —
-       the strategies cross near 11M; see footprint_vs_n_plot.py for the trend.)
+      (Viper 2052 + HiOM 272 RE-MEASURED 2026-07-14 under the re-frozen core
+       CORE=220fb60 — identical to prior. HiOM control structs beyond the
+       HotTier audited immaterial: pending ring 512 KiB + commit lanes +
+       checkpoint ~= KB, ~0.2%. Halo: total bucket bytes = total_slot/3 * 64 B,
+       primary + overflow, measured 2026-06-15 via the Halo hash_api harness.
+       At 10M Halo < HiOM — the strategies cross near 11M; see
+       footprint_vs_n_plot.py for the trend.)
   - PMem data: ANALYTICAL. raw = N*216B = 2.16 GB. VPage layout (Viper/HiOM)
       packs ~= raw (Viper paper: 21.2 GB @100M vs raw 21.6 GB). Per-entry PMDK
       allocation (CCEH/Dash) carries ~+10% (Viper paper: Dash 23.8 GB @100M).

@@ -22,7 +22,7 @@ OUT="${OUT_DIR:-/tmp/dram_matrix}"
 PER_CELL_TIMEOUT_S="${PER_CELL_TIMEOUT_S:-900}"
 mkdir -p "$OUT"
 
-SIZES="5M 10M 16M 33M 50M"
+SIZES="1M 10M 33M 50M"
 SUMMARY="$OUT/summary.txt"
 : >"$SUMMARY"
 

@@ -19,7 +19,20 @@ Viper) and never OOMs.
 
 Halo DRAM is WHITE-BOX measured (total bucket bytes = total_slot/3 * 64 B,
 primary array + overflow chain) via the Halo hash_api harness, 2026-06-15.
-HiOM 272 / Viper 2052 from fixture_dram_bytes() (matches footprint_plot.py).
+
+HiOM / Viper RE-MEASURED 2026-07-14 under the re-frozen core (CORE=220fb60)
+via fixture_dram_bytes(), confirming the numbers hold:
+  Viper : 2052 (1M) = 2052 (10M) -> 2053 (33M) -> 2065 (50M) MB. The depth-17
+          (131072-segment) CCEH directory is pre-allocated and pinned; occupancy
+          only adds a handful of segment splits (+0.6% at 50M), NOT a resize
+          doubling. 100M ~= 2100 MB (mild split growth, still one directory at
+          ~75% load) — the qualitative contrast with Halo's step-doubling.
+  HiOM  : 272.02 MB at 1M, 10M, AND 33M — exactly constant (dram_bytes is
+          capacity-bound, independent of occupancy). Control structures beyond
+          the HotTier were audited and are immaterial: pending ring 2^16 * 8 B =
+          512 KiB, 8 commit lanes + A/B checkpoint ~= KB — ~0.2% of 272 MB,
+          constant in N and bounded by thread count. ColdTier index is PMem-
+          resident (DRAM ~= 0 by design).
 """
 import os
 import matplotlib
@@ -33,11 +46,15 @@ OUT = ("/root/viper/paper/figures/footprint_vs_n.pdf" if BW
 # --- MEASURED Halo index DRAM (MB): exact bucket bytes, 2026-06-15 ---
 # 100M is NOT a linear extrapolation: the CLHT resize-doubled (268M buckets,
 # 12.4% load) -> 16 GB, a step jump that overshoots even Viper.
-N_meas  = [1, 5, 10, 16, 33, 100]
-HALO_MB = [26.0, 123.6, 247.2, 416.8, 852.4, 16384.0]
+N_meas  = [1, 10, 33, 100]
+HALO_MB = [26.0, 247.2, 852.4, 16384.0]
 
-VIPER_MB = 2052.0                 # pre-allocated, pinned (measured flat 5-33M)
-HIOM_MB  = 272.0                  # fixed hot-tier capacity, constant in N
+# Viper/CCEH: pre-allocated depth-17 directory, pinned. Measured flat 1-50M
+# (2052/2052/2053/2065); 100M is the mild-split extrapolation (~2100), NOT a
+# resize doubling (that's the contrast with Halo). Plotted as a measured series.
+VIPER_MEAS = [2052.0, 2052.0, 2053.0, 2100.0]   # 100M extrapolated (see docstring)
+VIPER_MB = 2052.0                 # reference (10M), used in the winner table
+HIOM_MB  = 272.02                 # fixed hot-tier capacity, constant in N (measured 1/10/33M)
 CROSS_N  = 10.5                   # 272 MB == Halo @ ~26 B/key
 
 if BW:
@@ -47,10 +64,10 @@ else:
 ls_viper, ls_halo, ls_hiom = "--", "-", "-."
 m_viper, m_halo, m_hiom = "s", "o", "D"
 
-allN = [1, 5, 10, 16, 33, 100]
+allN = [1, 10, 33, 100]
 fig, ax = plt.subplots(figsize=(7, 5))
 
-ax.plot(allN, [VIPER_MB] * len(allN), ls=ls_viper, marker=m_viper, ms=7,
+ax.plot(allN, VIPER_MEAS, ls=ls_viper, marker=m_viper, ms=7,
         color=c_viper, label="Viper/CCEH — pre-alloc, pinned (~2 GB)")
 ax.plot(N_meas, HALO_MB, ls=ls_halo, marker=m_halo, ms=7, color=c_halo,
         label="Halo — DRAM CLHT, resize-doubling (measured)")
@@ -84,5 +101,6 @@ print("wrote", OUT)
 print(f"\n{'N(M)':>6}{'Viper':>9}{'Halo':>9}{'HiOM':>9}  winner")
 for i, n in enumerate(N_meas):
     h = HALO_MB[i]
-    win = "HiOM" if HIOM_MB < min(VIPER_MB, h) else ("Halo" if h < VIPER_MB else "Viper")
-    print(f"{n:>6}{VIPER_MB:>9.0f}{h:>9.1f}{HIOM_MB:>9.0f}  {win}")
+    v = VIPER_MEAS[i]
+    win = "HiOM" if HIOM_MB < min(v, h) else ("Halo" if h < v else "Viper")
+    print(f"{n:>6}{v:>9.0f}{h:>9.1f}{HIOM_MB:>9.0f}  {win}")
