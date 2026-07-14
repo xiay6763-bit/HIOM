@@ -69,6 +69,12 @@ static constexpr version_lock_t CLIENT_BIT    = 0b10000000;
 static constexpr version_lock_t NO_CLIENT_BIT = 0b01111111;
 static constexpr version_lock_t USED_BIT      = 0b01000000;
 static constexpr version_lock_t UNLOCKED_BIT  = 0b11111110;
+// Spin budget before a reader/writer stuck on a locked VPage consults the
+// lock-intent registry for crash-stale repair. A live holder keeps a page
+// lock for a handful of instructions, so ~1024 failed attempts is decisive
+// evidence of a crash-stale lock (or a pathologically stuck writer, which
+// the repair correctly refuses to clear while its intent is registered).
+static constexpr size_t STALE_LOCK_SPIN_THRESHOLD = 1024;
 
 #define IS_LOCKED(lock) ((lock) & 1)
 
@@ -501,6 +507,11 @@ class Viper {
         enum class ReadStatus { kOk, kTransient, kSlotFree };
         inline ReadStatus hiom_read_at_offset_status(KVOffset offset, K* key_out,
                                                      V* value_out) const;
+        // Forwarder to Viper::hiom_repair_stale_lock_at — HiOM's read-retry
+        // path holds a Client, not the Viper instance.
+        inline bool hiom_repair_stale_lock_at(KVOffset offset) const {
+            return this->viper_.hiom_repair_stale_lock_at(offset);
+        }
         // HiOM group-prefetching (Chen et al. SIGMOD'04): issue a software
         // prefetch for the PM record at `offset` without touching (loading)
         // it, so a subsequent hiom_read_at_offset finds the line warm. Used
@@ -715,6 +726,115 @@ class Viper {
             }
         }
         return cleared;
+    }
+
+    // ---- Crash-stale lock-intent registry (DRAM, volatile BY DESIGN) ------
+    //
+    // Bounded-lock-set protocol (2026-07-13): every VPage lock acquisition
+    // first publishes the page's address into this registry (open-addressed,
+    // slot held only while the lock is contended/held) and withdraws it after
+    // unlock. The registry is deliberately NOT persistent: after a crash it
+    // starts empty, so the invariant
+    //
+    //     lock bit set  ∧  page not in registry  ⇒  lock is crash-stale
+    //
+    // lets ANY spinning reader or writer repair a stale lock on first touch
+    // (hiom_try_repair_stale_lock) instead of recovery paying an O(P)
+    // full-pool page-fault scan (hiom_clear_all_stale_page_locks — measured
+    // 1.6–2.1 s at 100M, 77% of total recovery, fault-bound: threads don't
+    // help). With lazy repair, recovery drops the scan and is O(tail) again.
+    //
+    // Soundness of "not registered ⇒ stale": a LIVE holder always publishes
+    // BEFORE its lock CAS. A repairer (a) acquire-loads the lock word and only
+    // proceeds on a locked value — that load synchronizes-with the holder's
+    // CAS, making the holder's earlier publish visible — then (b) scans the
+    // registry. So a live holder's entry is always seen. The reverse race
+    // (repairer clears a lock that a NEW holder just took) needs the 1-byte
+    // version to return to the exact observed odd value between the
+    // repairer's re-scan and its CAS — ≥64 full lock/unlock cycles (≥ ~6 µs
+    // of foreign work) inside a sub-100ns window, physically excluded; the
+    // repair CAS on the exact observed value is the final guard.
+    static constexpr std::size_t kLockIntentSlots = 128;
+
+    // Publish intent to lock `page` (any address uniquely identifying the
+    // page). Returns the registry slot to pass to hiom_lock_intent_clear.
+    inline std::size_t hiom_lock_intent_publish(const void* page) {
+        const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(page);
+        std::size_t i = (p >> 12) & (kLockIntentSlots - 1);
+        for (;;) {
+            std::uintptr_t expected = 0;
+            if (lock_intents_[i].compare_exchange_strong(
+                    expected, p, std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                return i;
+            }
+            i = (i + 1) & (kLockIntentSlots - 1);
+        }
+    }
+    inline void hiom_lock_intent_clear(std::size_t slot) {
+        lock_intents_[slot].store(0, std::memory_order_release);
+    }
+    inline bool hiom_lock_intent_registered(const void* page) const {
+        const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(page);
+        for (std::size_t i = 0; i < kLockIntentSlots; ++i) {
+            if (lock_intents_[i].load(std::memory_order_acquire) == p)
+                return true;
+        }
+        return false;
+    }
+
+    // Try to repair a crash-stale lock on the page whose version-lock word is
+    // `*lock` and whose registry identity is `page`. Returns true when the
+    // lock is (now) free to retry — already unlocked, or stale and cleared
+    // (clear = drop the LSB, preserving version/USED/CLIENT bits — the exact
+    // transform hiom_clear_stale_page_locks applies; same torn-write
+    // precondition documented there). Returns false while a registered live
+    // writer holds it. Safe to call concurrently from any thread.
+    bool hiom_try_repair_stale_lock(const std::atomic<version_lock_t>* lock,
+                                    const void* page) const {
+        // Var-size (std::string) pages are NOT wired into the registry (the
+        // string put/compact specializations take locks without publishing),
+        // so "unregistered" proves nothing there — repair must refuse or it
+        // would clear a live string-writer's lock. String mode keeps the
+        // pre-registry behaviour (upstream Viper semantics). Fixed-size K/V —
+        // HiOM's entire scope — is fully wired.
+        if constexpr (std::is_same_v<K, std::string>) {
+            (void)lock; (void)page;
+            return false;
+        }
+        version_lock_t lv = lock->load(std::memory_order_acquire);
+        if (!IS_LOCKED(lv)) return true;
+        if (hiom_lock_intent_registered(page)) return false;
+        // Double-check: re-load the (still locked) word, then re-scan. Any
+        // holder that acquired after the first scan published before the CAS
+        // that produced the value we re-load, so the second scan sees it.
+        lv = lock->load(std::memory_order_acquire);
+        if (!IS_LOCKED(lv)) return true;
+        if (hiom_lock_intent_registered(page)) return false;
+        auto* mut = const_cast<std::atomic<version_lock_t>*>(lock);
+        if (mut->compare_exchange_strong(
+                lv, static_cast<version_lock_t>(lv & UNLOCKED_BIT))) {
+            internal::pmem_persist(mut, sizeof(*mut));
+            hiom_lazy_lock_repairs_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+    // Diagnostic: stale locks repaired lazily since open (nonzero after a
+    // crash is healthy — the repair did its job on first touch).
+    inline std::size_t hiom_lazy_lock_repairs() const {
+        return hiom_lazy_lock_repairs_.load(std::memory_order_relaxed);
+    }
+
+    // KVOffset convenience wrapper for the lazy repair — for spinners (HiOM's
+    // read retry, update/remove target loops) that only hold an offset.
+    bool hiom_repair_stale_lock_at(KVOffset offset) const {
+        const auto [b, p, s] = offset.get_offsets();
+        (void)s;
+        const VPageBlock* blk = v_blocks_[b];
+        if (blk == nullptr) return false;
+        const VPage& vp = blk->v_pages[p];
+        return hiom_try_repair_stale_lock(&vp.version_lock, &vp);
     }
 
     // Full-scan variant: clear stale locks over all USED VPages, i.e.
@@ -939,6 +1059,12 @@ class Viper {
     std::vector<KVOffset> deadlock_offsets_;
 
     std::atomic<uint8_t> num_active_clients_;
+    // Lock-intent registry backing store + lazy-repair counter (see the
+    // bounded-lock-set protocol block above). mutable: repair is legal from
+    // const read paths — it mutates PM page state and diagnostics, not the
+    // logical map. Zero-initialized (0 = empty slot).
+    mutable std::atomic<std::uintptr_t> lock_intents_[kLockIntentSlots] = {};
+    mutable std::atomic<std::size_t> hiom_lazy_lock_repairs_{0};
     const uint8_t num_recovery_threads_;
 };
 
@@ -1690,6 +1816,10 @@ template <typename K, typename V>
 bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_old,
                               const bool assume_new) {
     WP_DECL();
+    // Bounded-lock-set protocol: publish intent BEFORE the lock CAS. Every
+    // lock acquisition must be registered — an unregistered live lock would
+    // be misjudged crash-stale by a spinning reader and cleared.
+    const std::size_t li_slot = this->viper_.hiom_lock_intent_publish(v_page_);
     v_page_->lock();
     WP_LAP(lock);
 
@@ -1700,6 +1830,7 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
     if (free_slot_idx >= free_slots->size()) {
         // Page is full. Free lock on page and restart.
         v_page_->unlock();
+        this->viper_.hiom_lock_intent_clear(li_slot);
         WP_LAP(slot);
         update_access_information();
         WP_LAP(alloc);
@@ -1783,6 +1914,7 @@ bool Viper<K, V>::Client::put(const K& key, const V& value, const bool delete_ol
     WP_LAP(freeold);
 
     v_page_->unlock();
+    this->viper_.hiom_lock_intent_clear(li_slot);
 
     // We have added one value, so +1
     size_delta_++;
@@ -1924,6 +2056,7 @@ bool Viper<K, V>::Client::get(const K& key, V* value) {
         return this->viper_.check_key_equality(key, offset);
     };
 
+    std::size_t stale_spins = 0;
     while (true) {
         KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
         if (kv_offset.is_tombstone()) {
@@ -1943,6 +2076,15 @@ bool Viper<K, V>::Client::get(const K& key, V* value) {
         if (get_value_from_offset(kv_offset, value)) {
             return true;
         }
+        // Read failed on a locked/version-torn page. A live updater releases
+        // within nanoseconds; past the spin budget, repair a crash-stale lock
+        // via the intent registry instead of spinning forever (pre-registry,
+        // a post-SIGKILL read of a mid-put page hung here indefinitely).
+        if (++stale_spins >= STALE_LOCK_SPIN_THRESHOLD) {
+            stale_spins = 0;
+            this->viper_.hiom_repair_stale_lock_at(kv_offset);
+        }
+        _mm_pause();
     }
 }
 
@@ -1958,6 +2100,7 @@ bool Viper<K, V>::ReadOnlyClient::get(const K& key, V* value) const {
         return this->viper_.check_key_equality(key, offset);
     };
 
+    std::size_t stale_spins = 0;
     while (true) {
         KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
         if (kv_offset.is_tombstone()) {
@@ -1970,6 +2113,12 @@ bool Viper<K, V>::ReadOnlyClient::get(const K& key, V* value) const {
         if (get_const_value_from_offset(kv_offset, value)) {
             return true;
         }
+        // Crash-stale lock repair past the spin budget (see Client::get).
+        if (++stale_spins >= STALE_LOCK_SPIN_THRESHOLD) {
+            stale_spins = 0;
+            this->viper_.hiom_repair_stale_lock_at(kv_offset);
+        }
+        _mm_pause();
     }
 }
 
@@ -2026,14 +2175,21 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
             const auto [block, page, slot] = off.get_offsets();
             VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
             if (v_page.free_slots[slot]) return kKeyMismatch;
-            if (!v_page.lock(false)) return kLockBusy;
+            const std::size_t li_slot =
+                this->viper_.hiom_lock_intent_publish(&v_page);
+            if (!v_page.lock(false)) {
+                this->viper_.hiom_lock_intent_clear(li_slot);
+                return kLockBusy;
+            }
             if (v_page.free_slots[slot]
                 || !(v_page.data[slot].first == key)) {
                 v_page.unlock();
+                this->viper_.hiom_lock_intent_clear(li_slot);
                 return kKeyMismatch;
             }
             update_fn(&(v_page.data[slot].second));
             v_page.unlock();
+            this->viper_.hiom_lock_intent_clear(li_slot);
             return kApplied;
         };
 
@@ -2043,11 +2199,20 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
         // through to the verified hot→cold resolver.
         const KVOffset hot_off = this->viper_.hiom_hot_only_resolver_(key);
         if (!hot_off.is_tombstone()) {
+            std::size_t busy_spins = 0;
             for (;;) {
                 const TriState r = try_at(hot_off);
                 if (r == kApplied) return true;
                 if (r == kKeyMismatch) break;  // → ColdTier fallback
-                // kLockBusy: spin on the same offset.
+                // kLockBusy: spin on the same offset. After a bounded burst,
+                // consult the intent registry — an unregistered lock is
+                // crash-stale and gets repaired here instead of spinning
+                // forever (a live holder is registered and keeps us waiting).
+                if (++busy_spins >= STALE_LOCK_SPIN_THRESHOLD) {
+                    busy_spins = 0;
+                    this->viper_.hiom_repair_stale_lock_at(hot_off);
+                }
+                _mm_pause();
             }
         }
 
@@ -2056,14 +2221,21 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
         // hot-working-set update workload; behaviour is unchanged.
         const KVOffset cold_off = this->viper_.hiom_old_offset_resolver_(key);
         if (cold_off.is_tombstone()) return false;
+        std::size_t busy_spins = 0;
         for (;;) {
             const TriState r = try_at(cold_off);
             if (r == kApplied) return true;
             if (r == kKeyMismatch) return false;  // slot no longer ours
-            // kLockBusy: spin on the same offset.
+            // kLockBusy: spin on the same offset (crash-stale repair as above).
+            if (++busy_spins >= STALE_LOCK_SPIN_THRESHOLD) {
+                busy_spins = 0;
+                this->viper_.hiom_repair_stale_lock_at(cold_off);
+            }
+            _mm_pause();
         }
     }
 
+    std::size_t upd_busy_spins = 0;
     while (true) {
         KVOffset kv_offset = this->viper_.map_.Get(key, key_check_fn);
         // M6.5 full: post-restart with skip_recovery=true, map_ is
@@ -2087,13 +2259,22 @@ bool Viper<K, V>::Client::update(const K& key, UpdateFn update_fn) {
 
         const auto [block, page, slot] = kv_offset.get_offsets();
         VPage& v_page = this->viper_.v_blocks_[block]->v_pages[page];
+        const std::size_t li_slot =
+            this->viper_.hiom_lock_intent_publish(&v_page);
         if (!v_page.lock(false)) {
+            this->viper_.hiom_lock_intent_clear(li_slot);
             // Could not lock page, so the record could be modified and we need to try again
+            // (with crash-stale repair after a bounded burst — see registry).
+            if (++upd_busy_spins >= STALE_LOCK_SPIN_THRESHOLD) {
+                upd_busy_spins = 0;
+                this->viper_.hiom_repair_stale_lock_at(kv_offset);
+            }
             continue;
         }
 
         update_fn(&(v_page.data[slot].second));
         v_page.unlock();
+        this->viper_.hiom_lock_intent_clear(li_slot);
         return true;
     }
 }
@@ -2158,6 +2339,9 @@ void Viper<K, V>::Client::free_occupied_slot(const KVOffset offset_to_delete, co
 
     VPage& v_page = this->viper_.v_blocks_[block_number]->v_pages[page_number];
     std::atomic<version_lock_t>& v_lock = v_page.version_lock;
+    // Bounded-lock-set protocol: register intent for the whole acquire/hold
+    // window (kept across deadlock-resolution rounds — conservative, safe).
+    std::size_t li_slot = this->viper_.hiom_lock_intent_publish(&v_page);
     version_lock_t lock_value = v_lock.load(LOAD_ORDER);
     lock_value &= UNLOCKED_BIT;
 
@@ -2213,6 +2397,17 @@ void Viper<K, V>::Client::free_occupied_slot(const KVOffset offset_to_delete, co
         deadlock_offsets = std::move(new_offsets);
         this->viper_.deadlock_offset_lock_.store(false);
 
+        // Crash-stale repair: the target page may carry a lock left by a
+        // killed process — without this, the CAS above retries forever (the
+        // deadlock queue only resolves locks held by OTHER LIVE clients).
+        // The registry stores page addresses, not holder identities, so our
+        // own registration above would make the repair refuse. We provably
+        // do NOT hold this page's lock on this path (has_lock == false), so
+        // withdraw the intent around the repair attempt and re-publish after.
+        this->viper_.hiom_lock_intent_clear(li_slot);
+        this->viper_.hiom_try_repair_stale_lock(&v_lock, &v_page);
+        li_slot = this->viper_.hiom_lock_intent_publish(&v_page);
+
         if (!encountered_own_offset) {
             // The old offset that this client need to delete was deleted by another client, we can return.
             break;
@@ -2241,6 +2436,7 @@ void Viper<K, V>::Client::free_occupied_slot(const KVOffset offset_to_delete, co
         }
         v_page.unlock();
     }
+    this->viper_.hiom_lock_intent_clear(li_slot);
 
     --size_delta_;
 }
@@ -2516,6 +2712,10 @@ inline bool Viper<std::string, std::string>::Client::get_value_from_offset(const
 template <typename K, typename V>
 void Viper<K, V>::compact(Client& client, VPageBlock* v_block) {
     for (VPage& v_page : v_block->v_pages) {
+        // Bounded-lock-set protocol: register like every other lock site
+        // (reclamation is HiOM-forbidden, but plain Viper can enable it and
+        // an unregistered live lock would be misjudged crash-stale).
+        const std::size_t li_slot = hiom_lock_intent_publish(&v_page);
         v_page.lock();
         auto& free_slots = v_page.free_slots;
         for (size_t slot = 0; slot < v_page.num_slots_per_page; ++slot) {
@@ -2530,6 +2730,7 @@ void Viper<K, V>::compact(Client& client, VPageBlock* v_block) {
             internal::pmem_persist(&v_page.free_slots, sizeof(v_page.free_slots));
         }
         v_page.unlock();
+        hiom_lock_intent_clear(li_slot);
     }
 
 }

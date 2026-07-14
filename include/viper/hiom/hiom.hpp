@@ -261,6 +261,14 @@ class HiOM {
     struct RecoveryConfig {
         bool tail_scan{false};
         std::size_t recovery_threads{32};
+        // O(P) open-time stale-lock scan. Default OFF since the
+        // bounded-lock-set protocol (viper.hpp lock-intent registry):
+        // crash-stale VPage locks are repaired lazily on first touch by any
+        // reader/writer/replayer, so recovery no longer pays the full-pool
+        // page-fault walk (measured 1.6–2.1 s at 100M = 77% of recovery).
+        // Keep `true` available as the A/B ablation and belt-and-suspenders
+        // mode; both paths satisfy the same lost==0 gate.
+        bool stale_lock_scan{false};
     };
 
     HiOM(ViperT& viper, std::size_t hot_buckets_pow2,
@@ -314,24 +322,28 @@ class HiOM {
         // frontier. Done before the flusher / commit-buffer come up
         // so no concurrent writes interleave with replay.
         if (rcfg.tail_scan && cold_ != nullptr) {
-            // Step 1 (correctness-first, O(P)): clear stale VPage write-locks
-            // over ALL used pages, not just the tail. A process killed mid
-            // in-place update leaves a page BELOW the durable frontier locked
-            // (fixed-size update does not move the frontier), so a tail-only
-            // clear misses it and hiom_read_at_offset then hides that whole
-            // page's records as version-torn. There is no concurrent writer at
-            // open, so every set lock bit is stale. Timed separately from the
-            // O(tail) replay so the recovery complexity can be reported
-            // honestly as O(P) lock scan + O(U) replay (NOT pure O(U)).
-            const auto ls_start = std::chrono::steady_clock::now();
-            const std::size_t locks_cleared
-                = viper_.hiom_clear_all_stale_page_locks(rcfg.recovery_threads);
-            const auto ls_end = std::chrono::steady_clock::now();
-            recovery_lock_scan_ms_
-                = std::chrono::duration<double, std::milli>(
-                      ls_end - ls_start).count();
-            stats_.recovery_locks_cleared.fetch_add(
-                locks_cleared, std::memory_order_relaxed);
+            // Step 1 (correctness, now optional): the O(P) stale-lock scan.
+            // Superseded as the default by the bounded-lock-set protocol —
+            // every lock acquisition registers intent in a volatile DRAM
+            // registry (viper.hpp), so post-crash a locked-but-unregistered
+            // page is provably stale and every reader/writer/replayer repairs
+            // it lazily on first touch. The full-pool page-fault walk here
+            // (measured 1.6–2.1 s @100M, 77% of recovery, fault-bound —
+            // threads don't help) is kept behind rcfg.stale_lock_scan as the
+            // A/B ablation + belt-and-suspenders mode; both modes satisfy the
+            // same lost==0 / mismatch==0 crash gate.
+            if (rcfg.stale_lock_scan) {
+                const auto ls_start = std::chrono::steady_clock::now();
+                const std::size_t locks_cleared
+                    = viper_.hiom_clear_all_stale_page_locks(
+                        rcfg.recovery_threads);
+                const auto ls_end = std::chrono::steady_clock::now();
+                recovery_lock_scan_ms_
+                    = std::chrono::duration<double, std::milli>(
+                          ls_end - ls_start).count();
+                stats_.recovery_locks_cleared.fetch_add(
+                    locks_cleared, std::memory_order_relaxed);
+            }
 
             // Step 2 (O(tail)): replay the unsafe suffix into ColdTier. Time it
             // in isolation (recovery-sensitivity benchmark, P1). HotTier alloc
@@ -848,6 +860,14 @@ class HiOM {
             // wrong (e.g. a stuck writer), so fall through to a miss rather
             // than spin forever.
             constexpr int kMaxRetries = 1024;
+            // Crash-stale repair point: a genuinely-held lock releases within
+            // nanoseconds, so hitting a quarter of the budget on the SAME
+            // offset is decisive evidence of a lock left by a killed process
+            // (post-crash the intent registry is empty ⇒ repair succeeds and
+            // the next attempt reads normally). Replaces the O(P) open-time
+            // lock scan as the correctness mechanism; see viper.hpp's
+            // bounded-lock-set protocol block.
+            constexpr int kRepairAttempt = kMaxRetries / 4;
             K pm_key;
             V pm_val;
             for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
@@ -864,6 +884,9 @@ class HiOM {
                 // lock is released within a few instructions, so a single
                 // pause per attempt suffices to avoid hammering the cacheline.
                 HIOM_RSTAT_INC(cold_read_retries);
+                if (attempt == kRepairAttempt) {
+                    viper_.hiom_repair_stale_lock_at(off);
+                }
 #if defined(__x86_64__) || defined(__i386__)
                 __builtin_ia32_pause();
 #endif
