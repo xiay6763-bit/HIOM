@@ -1,105 +1,163 @@
 #!/usr/bin/env python3
-"""
-Memory footprint stacked bar — Viper-paper Fig.9 style, four-system (E1 / C1).
+"""C1 figure: memory footprint — single 1x2 panel (composition + scaling).
 
-Each bar stacks, bottom→top:
-  PMem — data records   (light grey)
-  PMem — index          (dark grey; only HiOM ColdTier + Dash hash table)
-  DRAM — index          (system colour, on top)
+  (a) stacked memory composition @10M (K8/V200): PMem data + PMem index +
+      DRAM index for Viper / CCEH / Halo / HiOM / Dash. Total memory is
+      comparable; WHERE the index lives is the design choice. HiOM keeps the
+      authoritative index in PMem (ColdTier, 96 MB) plus a small fixed DRAM
+      hot tier -> DRAM index cut ~87% vs Viper/CCEH.
+  (b) DRAM index vs dataset size N — the three placement strategies:
+      Viper/CCEH pre-allocated pinned (~2 GB flat, measured 1-50M, 100M
+      extrapolated hollow), Halo on-demand DRAM CLHT (linear then
+      resize-doubling to 16 GB @100M, hollow), HiOM fixed-capacity hot tier
+      (272 MB constant, occupancy-independent).
 
-Story: DRAM is the scarce resource (Viper paper: ~1/8 the capacity, ~9x the
-$/GB). DRAM-index designs (Viper, CCEH) spend ~2 GB DRAM on the offset map;
-HiOM keeps the authoritative index in PMem (ColdTier) plus a small fixed DRAM
-hot tier, cutting DRAM ~87% while total memory stays comparable. Dash is the
-PM-resident end (DRAM ~0) but pays it back in read throughput (see E2).
+Data provenance:
+  - DRAM (index): WHITE-BOX via fixture_dram_bytes(). Viper 2052 / HiOM 272.02
+    RE-MEASURED 2026-07-14 under the re-frozen core (CORE=220fb60), identical
+    to the frozen numbers; Viper measured flat 2052->2065 MB across 1-50M
+    (depth-17 CCEH directory pinned; splits +0.6%), 100M ~2100 extrapolated.
+    HiOM control structs beyond the HotTier audited immaterial (pending ring
+    512 KiB + commit lanes + checkpoint ~KB, ~0.2%). Halo measured 2026-06-15
+    via the Halo hash_api harness (bucket bytes = total_slot/3 * 64 B).
+  - PMem data: ANALYTICAL. raw = N*216 B; VPage layout (Viper/HiOM/Halo) packs
+    ~= raw (Viper paper: 21.2 GB @100M vs 21.6 raw); per-entry PMDK alloc
+    (CCEH/Dash) ~ +10%.
+  - PMem index: ANALYTICAL. HiOM ColdTier 96 MB (32 regions x (8192 main +
+    16384 overflow + 1) x 128 B, verified vs cold.bin); Dash ~210 MB.
 
-Data provenance (10 M records, K8/V200 = 216 B):
-  - DRAM (index): WHITE-BOX measured via fixture_dram_bytes()
-      Viper 2052, CCEH 2052, Halo 247, HiOM 272, Dash ~0 MB.
-      (Viper 2052 + HiOM 272 RE-MEASURED 2026-07-14 under the re-frozen core
-       CORE=220fb60 — identical to prior. HiOM control structs beyond the
-       HotTier audited immaterial: pending ring 512 KiB + commit lanes +
-       checkpoint ~= KB, ~0.2%. Halo: total bucket bytes = total_slot/3 * 64 B,
-       primary + overflow, measured 2026-06-15 via the Halo hash_api harness.
-       At 10M Halo < HiOM — the strategies cross near 11M; see
-       footprint_vs_n_plot.py for the trend.)
-  - PMem data: ANALYTICAL. raw = N*216B = 2.16 GB. VPage layout (Viper/HiOM)
-      packs ~= raw (Viper paper: 21.2 GB @100M vs raw 21.6 GB). Per-entry PMDK
-      allocation (CCEH/Dash) carries ~+10% (Viper paper: Dash 23.8 GB @100M).
-  - PMem index: ANALYTICAL. HiOM ColdTier = 96 MB (struct: 32 regions x
-      (8192 main + 16384 overflow + 1) x 128 B Bucket, verified vs cold.bin).
-      Dash ~210 MB (extendible hashing; Viper paper Dash index 2.1 GB @100M /10).
-      Viper/CCEH keep the index in DRAM -> 0 PMem.
+Output: eval/charts/footprint.{pdf,png}; BW=1 -> paper/figures/footprint.pdf
+(grayscale + hatch for B&W print).
 """
 import os
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
-# BW=1 → grayscale + hatch, written to paper/figures/ (B&W-printed journals).
 BW = os.environ.get("BW") == "1"
-OUT = "/root/viper/paper/figures/footprint.pdf" if BW else "/root/viper/eval/charts/footprint.pdf"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "paper", "figures")
+                           if BW else os.path.join(SCRIPT_DIR, "charts"))
+
+# ---------------------------------------------------------------- style ----
+plt.rcParams.update({
+    # 中文标注:font.family 直接给字体列表才有逐字形回退(sans-serif 别名只取首个)
+    "font.family": ["DejaVu Sans", "Noto Sans CJK JP"],
+    "axes.unicode_minus": False,
+    "font.size": 10,
+    "axes.labelsize": 10.5,
+    "axes.titlesize": 11,
+    "legend.fontsize": 8.2,
+    "xtick.labelsize": 9.5,
+    "ytick.labelsize": 9.5,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.linewidth": 0.9,
+    "grid.linestyle": "--",
+    "grid.alpha": 0.5,
+    "legend.frameon": False,
+})
+
 if BW:
-    C_DATA, C_INDEX, C_DRAM = "0.82", "0.55", "0.15"
-    H_DATA, H_INDEX, H_DRAM = "", "//", "xx"
-    DRAM_TXT = "0.0"
+    C_DATA, C_PMIDX, C_DRAM = "0.86", "0.60", "0.20"
+    H_DATA, H_PMIDX, H_DRAM = "", "//", "xx"
+    C_VIPER = C_HIOM = "0.0"
+    C_HALO = "0.45"
 else:
-    C_DATA, C_INDEX, C_DRAM = "#cfcfcf", "#7f7f7f", "#d62728"
-    H_DATA, H_INDEX, H_DRAM = "", "", ""
-    DRAM_TXT = "#d62728"
+    C_DATA, C_PMIDX, C_DRAM = "#e8e8e8", "#b0b0b0", "#4c72b0"
+    H_DATA, H_PMIDX, H_DRAM = "", "//", ""
+    C_VIPER, C_HALO, C_HIOM = "#1f77b4", "#2ca02c", "#d62728"
 
-DATA_VPAGE = 2120.0      # MB  (Viper/HiOM compact VPage ~ raw, Viper-paper scaled)
-DATA_PERENTRY = 2380.0   # MB  (CCEH/Dash per-entry PMDK alloc, +~10%)
+# ----------------------------------------------------------------- data ----
+DATA_VPAGE = 2120.0     # MB @10M: compact VPage layout ~= raw N*216B
+DATA_PERENTRY = 2380.0  # MB @10M: per-entry PMDK allocation, ~+10%
 
-SYS = [
-    ("Viper", dict(dram=2052, pm_data=DATA_VPAGE,    pm_index=0)),
-    ("CCEH",  dict(dram=2052, pm_data=DATA_PERENTRY, pm_index=0)),
-    ("Halo",  dict(dram=247,  pm_data=DATA_VPAGE,    pm_index=0)),
-    ("HiOM",  dict(dram=272,  pm_data=DATA_VPAGE,    pm_index=96)),
-    ("Dash",  dict(dram=2,    pm_data=DATA_PERENTRY, pm_index=210)),
+SYS = [  # (label, DRAM-index MB, PMem-data MB, PMem-index MB)
+    ("Viper", 2052, DATA_VPAGE,    0),
+    ("CCEH",  2052, DATA_PERENTRY, 0),
+    ("Halo",  247,  DATA_VPAGE,    0),
+    ("HiOM",  272,  DATA_VPAGE,    96),
+    ("Dash",  2,    DATA_PERENTRY, 210),
 ]
 
-labels   = [s[0] for s in SYS]
-pm_data  = [s[1]["pm_data"]  / 1024 for s in SYS]   # GB
-pm_index = [s[1]["pm_index"] / 1024 for s in SYS]
-dram     = [s[1]["dram"]     / 1024 for s in SYS]
+N_GRID = [1, 10, 33, 100]                    # millions
+VIPER_MEAS = [2052.0, 2052.0, 2053.0]        # measured 1/10/33M (flat, pinned)
+VIPER_EXTRAP_100 = 2100.0                    # mild-split extrapolation
+HALO_MEAS = [26.0, 247.2, 852.4]             # measured 1/10/33M (~26 B/key)
+HALO_BLOWUP_100 = 16384.0                    # resize-doubled CLHT, 12% load
+HIOM_MB = 272.02                             # capacity-bound constant
+CROSS_N = 10.5                               # HiOM == Halo crossover
 
-fig, ax = plt.subplots(figsize=(7, 5))
-x = range(len(labels))
-ax.bar(x, pm_data,  color=C_DATA, hatch=H_DATA, edgecolor="0.2", label="PMem — data records")
-ax.bar(x, pm_index, bottom=pm_data, color=C_INDEX, hatch=H_INDEX, edgecolor="0.2",
-       label="PMem — index (HiOM ColdTier / Dash hash)")
-base2 = [a + b for a, b in zip(pm_data, pm_index)]
-ax.bar(x, dram, bottom=base2, color=C_DRAM, hatch=H_DRAM, edgecolor="0.2",
-       label="DRAM — index (offset map)")
+# ----------------------------------------------------------------- plot ----
+# 跨栏浮动图:左右两个子图(1×2)宽扁版式,按 ~15.2cm 跨栏宽设计,
+# 页顶浮动呈现 -> 避免竖长整块在栏尾塞不下而跳栏留白。
+fig, (axa, axb) = plt.subplots(1, 2, figsize=(7.4, 2.7),
+                               gridspec_kw={"width_ratios": [1.0, 1.0]})
 
-for i in x:
-    total = pm_data[i] + pm_index[i] + dram[i]
-    dmb = dram[i] * 1024
-    ax.text(i, total + 0.06,
-            (f"DRAM\n{dmb:.0f} MB" if dmb >= 10 else "DRAM\n~0"),
-            ha="center", va="bottom", fontsize=9, fontweight="bold",
-            color=DRAM_TXT)
+# --- (a) composition @10M -------------------------------------------------
+labels = [s[0] for s in SYS]
+dram = np.array([s[1] for s in SYS]) / 1024.0     # GB
+pmd = np.array([s[2] for s in SYS]) / 1024.0
+pmi = np.array([s[3] for s in SYS]) / 1024.0
+x = np.arange(len(SYS))
 
-# Headroom so the two-line DRAM labels clear the title and the legend box.
-_max_total = max(b + d for b, d in zip(base2, dram))
-ax.set_ylim(0, _max_total * 1.22)
+axa.bar(x, pmd, 0.62, color=C_DATA, hatch=H_DATA, edgecolor="0.35",
+        linewidth=0.6, label="PM 数据")
+axa.bar(x, pmi, 0.62, bottom=pmd, color=C_PMIDX, hatch=H_PMIDX,
+        edgecolor="0.35", linewidth=0.6, label="PM 索引")
+axa.bar(x, dram, 0.62, bottom=pmd + pmi, color=C_DRAM, hatch=H_DRAM,
+        edgecolor="0.35", linewidth=0.6, label="DRAM 索引")
+for i, s in enumerate(SYS):
+    pass  # 柱顶 MB 数值标注已删(单栏窄柱下会重叠;精确值见正文 3.2 节)
+axa.set_xticks(x)
+axa.set_xticklabels(labels)
+axa.set_ylabel("内存占用(GB)")
+axa.set_ylim(0, 5.0)
+axa.grid(axis="y")
+axa.legend(loc="upper right", handlelength=1.4, handleheight=1.1)
+axa.set_xlabel("(a) 内存构成(N=10M)")
 
-ax.set_xticks(list(x))
-ax.set_xticklabels(labels)
-ax.set_ylabel("Memory footprint (GB)")
-ax.set_title("C1: Memory footprint @10M (K8/V200)\n"
-             "DRAM white-box measured · PMem analytical estimate", pad=12)
-ax.legend(loc="upper right", fontsize=8)
-ax.grid(axis="y", alpha=0.3)
-plt.tight_layout()
-plt.savefig(OUT)
-print("wrote", OUT)
+# --- (b) DRAM index vs N ----------------------------------------------------
+axb.plot(N_GRID[:3] + [100], VIPER_MEAS + [VIPER_EXTRAP_100],
+         ls="--", lw=1.8, color=C_VIPER, marker="s", ms=6,
+         markevery=[0, 1, 2], label="Viper/CCEH")
+axb.plot([100], [VIPER_EXTRAP_100], marker="s", ms=7, mfc="none",
+         mec=C_VIPER, mew=1.4, ls="none")
+axb.plot(N_GRID[:3], HALO_MEAS, ls="-", lw=1.8, color=C_HALO, marker="o",
+         ms=6, label="Halo")
+axb.plot([N_GRID[2], 100], [HALO_MEAS[2], HALO_BLOWUP_100], ls=":",
+         lw=1.4, color=C_HALO)
+axb.plot([100], [HALO_BLOWUP_100], marker="o", ms=7, mfc="none", mec=C_HALO,
+         mew=1.4, ls="none")
+axb.plot(N_GRID, [HIOM_MB] * 4, ls="-.", lw=2.0, color=C_HIOM, marker="D",
+         ms=6, label="HiOM")
 
-print(f"\n{'system':7}{'DRAM(MB)':>10}{'PMem(GB)':>10}{'total(GB)':>11}{'DRAM:PMem':>12}")
-print("-" * 50)
-for name, d in SYS:
-    pm = (d["pm_data"] + d["pm_index"]) / 1024
-    tot = pm + d["dram"] / 1024
-    ratio = f"1/{pm * 1024 / max(d['dram'], 1):.0f}"
-    print(f"{name:7}{d['dram']:>10}{pm:>10.2f}{tot:>11.2f}{ratio:>12}")
+# 空心点 = 非实测(外推 / 扩容后);"扩容至 16 GB""(外推)""恒定 272 MB"
+# 三处文字标注均已删(与图例/数据点重叠),这些数值含义见正文 3.2 节
+
+axb.set_xscale("log")
+axb.set_yscale("log")
+axb.set_xticks(N_GRID)
+axb.set_xticklabels([str(n) for n in N_GRID])
+axb.minorticks_off()
+axb.set_xlabel("数据规模 N(百万)\n(b) DRAM 索引占用随 N 变化",
+               linespacing=1.8)
+axb.set_ylabel("DRAM 索引占用(MB)")
+axb.grid(True, which="major")
+axb.legend(loc="upper left", fontsize=7.5, handlelength=1.5,
+           labelspacing=0.3, borderaxespad=0.5)
+
+fig.tight_layout(w_pad=2.0)
+os.makedirs(OUT_DIR, exist_ok=True)
+pdf = os.path.join(OUT_DIR, "footprint.pdf")
+fig.savefig(pdf, bbox_inches="tight")
+if not BW:
+    fig.savefig(os.path.join(OUT_DIR, "footprint.png"), dpi=300,
+                bbox_inches="tight")
+print("wrote", pdf)
+
+print(f"\n{'sys':>6}  DRAM(MB)  PM.data  PM.idx  |  vs-N crossover ~{CROSS_N} M")
+for s in SYS:
+    print(f"{s[0]:>6}  {s[1]:8.0f}  {s[2]:7.0f}  {s[3]:6.0f}")

@@ -26,6 +26,10 @@ from collections import defaultdict
 
 import matplotlib.pyplot as plt
 
+# 中文标注:font.family 直接给列表才有逐字形回退;子图题 (a)-(f) 置于子图下方
+plt.rcParams["font.family"] = ["DejaVu Sans", "Noto Sans CJK JP"]
+plt.rcParams["axes.unicode_minus"] = False
+
 # Anchored to this script's location so output lands in eval/charts/ (and the
 # default input resolves) regardless of the caller's cwd — running from the
 # repo root used to silently create a stray /root/viper/charts/.
@@ -50,11 +54,12 @@ STYLES = {
     "CCEH":  {"color": "#2ca02c", "marker": "^", "ms": 8},   # 绿色 三角
 }
 
-# Grid axes. Rows = distributions, columns = workloads.
-DISTS = [("uniform", "Uniform"), ("zipf", "Zipfian")]
-WORKLOADS = [("100r", "YCSB-C (100% read)"),
-             ("b", "YCSB-B (95/5 read/update)"),
-             ("a", "YCSB-A (50/50 read/update)")]
+# Grid axes. Rows = distributions, columns = workloads(A→C 从左到右)。
+# 读写配比正文已述,子图题只保留负载名+分布;分布名用英文与 Zipf 一致。
+DISTS = [("uniform", "Uniform"), ("zipf", "Zipf")]
+WORKLOADS = [("a", "YCSB-A"),
+             ("b", "YCSB-B"),
+             ("100r", "YCSB-C")]
 THREADS = [1, 2, 4, 8, 16, 24]
 
 
@@ -117,20 +122,18 @@ def main():
                 ax.plot(xs, ys, label=label, **STYLES[label],
                         markeredgewidth=1, lw=2.5)
 
-            # Column titles only on the top row; row (distribution) labels on
-            # the first column.
-            if r == 0:
-                ax.set_title(wl_label, fontsize=15)
+            # 子图题 (a)-(f) 行优先编号,置于每个子图正下方(xlabel 末行)。
+            letter = chr(ord("a") + r * ncols + c)
+            ax.set_xlabel(f"线程数\n({letter}) {wl_label}({dist_label})",
+                          fontsize=13, linespacing=1.7)
             if c == 0:
-                ax.set_ylabel(f"{dist_label}\nThroughput (Mops/s)", fontsize=14)
+                ax.set_ylabel("吞吐量(Mops/s)", fontsize=14)
             ax.set_xticks(THREADS)
-            ax.set_xlim(0, 25)
+            ax.set_xlim(0, 26)  # right padding so the 24 tick label clears the panel edge
             ax.set_ylim(bottom=0)
             ax.grid(axis="y", linestyle="--", alpha=0.5)
             hide_border(ax)
-            ax.tick_params(axis="both", labelsize=11)
-
-    fig.text(0.5, 0.045, "Number of Threads", ha="center", fontsize=17)
+            ax.tick_params(axis="both", labelsize=12)
 
     # Shared legend (dedup), same placement idiom as full_ycsb_plot.py.
     handles, labels = axes[0][0].get_legend_handles_labels()
@@ -139,7 +142,7 @@ def main():
                loc="upper center", bbox_to_anchor=(0.5, 0.99),
                ncol=len(FIXTURES), frameon=False, fontsize=15)
 
-    plt.tight_layout(rect=[0, 0.06, 1, 0.94])
+    plt.tight_layout(rect=[0, 0, 1, 0.95], h_pad=2.2)
     pdf = os.path.join(OUTPUT_DIR, "ycsb_workload_spectrum.pdf")
     png = os.path.join(OUTPUT_DIR, "ycsb_workload_spectrum.png")
     plt.savefig(pdf, format="pdf", bbox_inches="tight")

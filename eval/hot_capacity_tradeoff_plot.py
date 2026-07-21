@@ -29,6 +29,10 @@ import sys
 
 import matplotlib.pyplot as plt
 
+# 中文标注:font.family 直接给列表才有逐字形回退;子图题置于子图下方
+plt.rcParams["font.family"] = ["DejaVu Sans", "Noto Sans CJK JP"]
+plt.rcParams["axes.unicode_minus"] = False
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "charts")
@@ -38,11 +42,12 @@ WORKING_SET = 10_000_000
 SLOTS_PER_BUCKET = 16
 RS_MIN, CM_MAX = 1.0 - 1e-6, 1e-6
 
+DIST_LBL = {"uniform": "Uniform", "zipf": "Zipf"}
 DIST_STYLE = {
     "uniform": {"color": "#d62728", "marker": "o", "ls": "-",
-                "label": "HiOM uniform"},
+                "label": "HiOM(Uniform)"},
     "zipf":    {"color": "#d62728", "marker": "*", "ls": "--", "ms": 11,
-                "label": "HiOM zipf"},
+                "label": "HiOM(Zipf)"},
 }
 REF_STYLE = {
     ("Viper", "uniform"): {"color": "#1f77b4", "ls": "-"},
@@ -131,9 +136,6 @@ def main():
               f"hit={hit:.4f} tput={tput:.2f} M/s")
 
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.6))
-    panels = [("(a) HotTier hit rate", "hot_hit_rate", 1),
-              ("(b) cold-access fraction", "1 − hot_hit_rate", 2),
-              ("(c) read throughput (t=8)", "Mops/s", 3)]
 
     for dist in ("uniform", "zipf"):
         pts = sorted(series[dist])
@@ -149,18 +151,24 @@ def main():
         axes[2].plot(xs, [p[2] for p in pts], label=label,
                      lw=2.2, markeredgewidth=1, **st)
 
-    # Reference hlines (t8 medians from the frozen spectrum).
+    # Reference hlines (t8 medians from the frozen spectrum). t=8 已写进
+    # (c) 的子图题,图例只留 系统(分布)。
     for (system, dist), st in REF_STYLE.items():
         v = spectrum_ref(system, dist)
         if v is not None:
             axes[2].axhline(v, lw=1.6, alpha=0.85,
-                            label=f"{system} {dist} (t8)", **st)
+                            label=f"{system}({DIST_LBL[dist]})", **st)
 
-    for ax, (title, ylab, _) in zip(axes, panels):
+    panels = [("(a) 热层命中率", "热层命中率"),
+              ("(b) 冷层访问占比", "冷层访问占比"),
+              ("(c) 读吞吐量(8线程)", "吞吐量(Mops/s)")]
+    for ax, (subcap, ylab) in zip(axes, panels):
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("HotTier slots / working set")
-        ax.set_title(title, fontsize=13)
-        ax.set_ylabel(ylab)
+        ax.set_xlabel(f"热层槽位数/工作集\n{subcap}", fontsize=12.5,
+                      linespacing=1.7)
+        ax.set_ylabel(ylab, fontsize=12.5)
+        ax.tick_params(axis="both", labelsize=11.5)
+        ax.margins(x=0.06)  # keep the 2^-5 / 2^2 end tick labels off the spines
         ax.grid(axis="y", linestyle="--", alpha=0.5)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
@@ -168,7 +176,7 @@ def main():
     axes[1].set_ylim(0, 1.02)
     axes[2].set_ylim(bottom=0)
     axes[0].legend(frameon=False, fontsize=10, loc="upper left")
-    axes[2].legend(frameon=False, fontsize=8, loc="upper left", ncol=1)
+    axes[2].legend(frameon=False, fontsize=9, loc="upper left", ncol=1)
 
     plt.tight_layout()
     pdf = os.path.join(OUTPUT_DIR, "hot_capacity_tradeoff.pdf")
