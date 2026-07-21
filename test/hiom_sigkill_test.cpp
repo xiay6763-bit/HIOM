@@ -166,7 +166,8 @@ int parent_verify(Shared* sh, int iter, const char* phase) {
         for (std::uint64_t i = 0; i < completed; ++i) {
             ++expected;
             const std::uint64_t key = make_key(t, static_cast<int>(i));
-            if (hiom.cold_tier()->lookup(viper::hiom::key_fingerprint64(key))
+            if (hiom.cold_tier()->lookup(viper::hiom::key_fingerprint64(key),
+                                         viper::hiom::key_id_of(key))
                     .has_value())
                 ++cold_present;
             std::uint64_t got = 0;

@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -152,16 +153,34 @@ inline std::uint64_t key_fingerprint64(const K& key) {
 // both fingerprints are always needed; the read hot path stays on the
 // single-fp32 key_fingerprint() so a hot hit never eagerly computes fp64.
 struct KeyHash {
-    std::uint32_t fp32;  // HotTier fingerprint (biased away from kEmptyFp)
-    std::uint64_t fp64;  // ColdTier fingerprint (biased away from 0)
+    std::uint32_t fp32;    // HotTier fingerprint (biased away from kEmptyFp)
+    std::uint64_t fp64;    // ColdTier routing hash (biased away from 0)
+    std::uint64_t key_id;  // ColdTier full-key identity (match / dedup)
 };
+
+// Full-key identity used as the ColdTier match/dedup key. For fixed-size
+// keys ≤ 8 B (the evaluated configuration) this is the EXACT raw key, so two
+// distinct keys can never alias in the cold index — correctness no longer
+// depends on a hash-collision probability. For keys > 8 B (variable-length
+// support is future work) it falls back to the 64-bit key hash, which keeps
+// the old probabilistic behaviour on that path only; not the eval path.
+template <typename K>
+inline std::uint64_t key_id_of(const K& key) {
+    if constexpr (sizeof(K) <= sizeof(std::uint64_t)) {
+        std::uint64_t id = 0;
+        std::memcpy(&id, &key, sizeof(K));
+        return id;
+    } else {
+        return static_cast<std::uint64_t>(cceh::h(&key, sizeof(K)));
+    }
+}
 
 template <typename K>
 inline KeyHash make_key_hash(const K& key) {
     const std::uint64_t h
         = static_cast<std::uint64_t>(cceh::h(&key, sizeof(K)));
     const std::uint32_t fp = static_cast<std::uint32_t>(h);
-    return KeyHash{fp == 0u ? 1u : fp, h == 0ull ? 1ull : h};
+    return KeyHash{fp == 0u ? 1u : fp, h == 0ull ? 1ull : h, key_id_of(key)};
 }
 
 template <typename K, typename V>
@@ -413,7 +432,7 @@ class HiOM {
                     }
 
                     const std::uint64_t fp64 = key_fingerprint64(key);
-                    auto cold_off = cold_->lookup(fp64);
+                    auto cold_off = cold_->lookup(fp64, key_id_of(key));
                     HWP_LAP(resolv_cold);
                     if (!cold_off) {
                         HWP_CNT(cold_neg_lookups);
@@ -646,7 +665,7 @@ class HiOM {
                 // the §3 invariant I3 surface (HotTier capacity ≥
                 // commit-buffer high watermark).
                 const std::uint64_t fp64 = key_fingerprint64(key);
-                if (auto cold_off = hiom_.cold_->lookup(fp64)) {
+                if (auto cold_off = hiom_.cold_->lookup(fp64, key_id_of(key))) {
                     if (verify_and_read_offset(key, *cold_off, value)) {
                         HIOM_RSTAT_INC(cold_hits);
                         mirror_into_hot_with_offset(key, *cold_off);
@@ -758,7 +777,7 @@ class HiOM {
                 // and the flusher would then write the obsolete put
                 // *after* the remove.
                 push_commit({CommitEntry::Op::kRemove,
-                             {}, kh.fp64,
+                             {}, kh.fp64, kh.key_id,
                              KVOffset{},  // unused for kRemove
                              HotTier::SlotRef{},
                              next_seq()});
@@ -1000,7 +1019,7 @@ class HiOM {
             HWP_LAP(hot_upsert);
 
             if (hiom_.cold_ != nullptr) {
-                push_commit({op, {}, kh.fp64, off, ref,
+                push_commit({op, {}, kh.fp64, kh.key_id, off, ref,
                              next_seq()});
                 // NOTE (profiling): commit_push below is the wall-clock of
                 // the push_commit call; its internal fadd+enqueue / wake
@@ -1247,7 +1266,7 @@ class HiOM {
         std::atomic<std::size_t> warmed{0};
         cold_->parallel_load(
             num_threads,
-            [this, &warmed](std::uint64_t fp64, KVOffset off) {
+            [this, &warmed](std::uint64_t key_id, KVOffset off) {
                 if (off.is_tombstone()) return;
                 const auto [block, page, slot] = off.get_offsets();
                 auto packed = encode(
@@ -1255,10 +1274,19 @@ class HiOM {
                     static_cast<std::uint16_t>(slot),
                     route_to_region_default(), base_map_);
                 if (!packed) return;
-                // Reconstruct the fp32 key_fingerprint() would have produced
-                // (low 32 bits of the same hash, biased away from kEmptyFp).
-                std::uint32_t fp32 = static_cast<std::uint32_t>(fp64);
-                if (fp32 == HotTier::kEmptyFp) fp32 = 1u;
+                // Recompute the HotTier fp32 from the full key. For >8 B keys
+                // key_id is a hash (variable-key support is future work) and
+                // the key can't be reconstructed, so warming is skipped —
+                // best-effort; the key stays ColdTier-resolved.
+                std::uint32_t fp32;
+                if constexpr (sizeof(K) <= sizeof(std::uint64_t)) {
+                    K key{};
+                    std::memcpy(&key, &key_id, sizeof(K));
+                    fp32 = key_fingerprint(key);
+                    if (fp32 == HotTier::kEmptyFp) fp32 = 1u;
+                } else {
+                    return;
+                }
                 hot_.upsert(fp32, *packed);
                 warmed.fetch_add(1, std::memory_order_relaxed);
             });
@@ -1947,6 +1975,10 @@ class HiOM {
         //   record.
         std::vector<typename ColdTier::BulkEntry> puts;
         puts.reserve(batch.size());
+        // Distinct key_ids seen within one fp64 run — tiny (1 normally, >1
+        // only on an fp64 collision inside this batch). Reused across runs to
+        // avoid per-run allocation; keeps the per-key winner split O(run).
+        std::vector<std::uint64_t> kids_in_run;
 
         std::size_t i = 0;
         while (i < batch.size()) {
@@ -1954,120 +1986,126 @@ class HiOM {
             while (j < batch.size() && batch[j].fp64 == batch[i].fp64) {
                 ++j;
             }
-            // batch[i..j) is one fp64 run.
+            // batch[i..j) is one fp64 run. Sub-partition it by full key_id:
+            // two distinct keys that collide on fp64 within the SAME batch
+            // must each produce their own ColdTier winner (entries are matched
+            // on key_id), never be coalesced into one — otherwise the "loser"
+            // key's brand-new / relocated offset is dropped before reaching
+            // cold and its index entry is lost. The common case is a single
+            // key_id per run (no collision), so this collects one key_id and
+            // the winner loop runs once, reproducing the prior behaviour.
             //
-            // Winner-picker (M3 follow-up #2 / 2026-05-09): HotTier
-            // truth as the primary path, alive-and-fp-match descending
+            // Winner-picker (M3 follow-up #2 / 2026-05-09), applied per key_id:
+            // HotTier truth as the primary path, alive-and-key-match descending
             // walk as the fallback.
             //
-            // Why HotTier truth: P0 retired CCEH from the write path,
-            // making HotTier::upsert_pinned the linearization point for
-            // same-fp32 writes. The slot's current (fp32, packed_off)
-            // identifies the latest CAS-winner, which is the canonical
-            // offset for this key. Picking the batch entry whose off
-            // matches that snapshot reproduces the canonical winner
-            // without depending on a global seq's after-CAS ordering.
-            // (Historical context: the original M4 Phase C design used
-            // a global commit_seq_ atomic bumped after the Viper write.
-            // A CAS winner could be preempted between CAS and the
-            // fetch_add and end up with a smaller seq than a later
-            // CAS-loser, producing a flaky picker. HotTier-truth removes
-            // that dependency. The global commit_seq_ was retired in
-            // M3 follow-up #2 Step 1 — seq is now per-Client local,
-            // load-bearing only for the rare fallback walk below.)
-            //
-            // Fallback covers: HotTier slot evicted out of the PINNED
-            // window, fp32 collision (slot now belongs to a different
-            // key), and HotTier holds a future-batch off (canonical
-            // entry not in this batch). The descending walk's existing
-            // alive-and-fp-match logic handles all three correctly,
-            // and seq still acts as the tiebreaker among multiple alive
-            // kPuts (rare, e.g., concurrent same-key writes from
-            // different threads where neither's free_occupied_slot has
-            // landed yet).
-            const CommitEntry* winner = nullptr;
-
-            // Step 1: pick any kPut entry's hot_slot in the run. All
-            // kPuts targeting the same fp32 share the same HotTier slot
-            // (upsert_pinned overwrites in place via CAS), so any
-            // valid hot_slot in the run points at the same atomic.
-            HotTier::SlotRef ref{};
+            // Why HotTier truth: P0 retired CCEH from the write path, making
+            // HotTier::upsert_pinned the linearization point for same-fp32
+            // writes. The slot's current (fp32, packed_off) identifies the
+            // latest CAS-winner, the canonical offset for that key; picking the
+            // batch entry whose off matches that snapshot reproduces the
+            // canonical winner without depending on a global seq's after-CAS
+            // ordering. Because two keys sharing fp64 also share fp32 (hence
+            // ONE HotTier slot), the slot resolves at most one of them — the
+            // other key_id falls through to the descending walk, which is
+            // correct. Fallback also covers: HotTier slot evicted out of the
+            // PINNED window, fp32 collision, and HotTier holding a future-batch
+            // off; seq tiebreaks multiple alive kPuts of the same key.
+            kids_in_run.clear();
             for (std::size_t k = i; k < j; ++k) {
-                if (batch[k].op == CommitEntry::Op::kPut
-                    && batch[k].hot_slot.valid) {
-                    ref = batch[k].hot_slot;
-                    break;
+                const std::uint64_t kid = batch[k].key_id;
+                bool seen = false;
+                for (const std::uint64_t s : kids_in_run) {
+                    if (s == kid) { seen = true; break; }
                 }
+                if (!seen) kids_in_run.push_back(kid);
             }
 
-            // Step 2: HotTier-truth fast path.
-            if (ref.valid) {
-                const auto view = hot_.read_slot(ref);
-                if (view.fp != HotTier::kEmptyFp) {
-                    const auto d = decode(view.packed_off,
-                                          route_to_region_default(),
-                                          base_map_);
-                    const KVOffset canonical_off{
-                        static_cast<viper::block_size_t>(d.block_number),
-                        static_cast<viper::page_size_t>(d.page_number),
-                        static_cast<viper::data_offset_size_t>(
-                            d.data_offset)};
-                    for (std::size_t k = i; k < j; ++k) {
-                        if (batch[k].op != CommitEntry::Op::kPut) continue;
-                        if (batch[k].off != canonical_off) continue;
-                        // fp64 verify catches the (rare) case where the
-                        // batch entry's slot was freed and reused by
-                        // another key whose fp32 happens to also collide
-                        // — without the verify, ColdTier could end up
-                        // pointing at the wrong key's data on PM.
-                        K stored_key;
-                        if (!viper_.hiom_get_slot_key(batch[k].off,
-                                                      &stored_key)) {
-                            continue;
-                        }
-                        if (key_fingerprint64(stored_key) != batch[k].fp64) {
-                            continue;
-                        }
-                        winner = &batch[k];
+            for (const std::uint64_t kid : kids_in_run) {
+                const CommitEntry* winner = nullptr;
+
+                // Step 1: pick any kPut entry's hot_slot for THIS key_id. All
+                // its kPuts share the same fp32 HotTier slot (upsert_pinned
+                // overwrites in place via CAS), so any valid one points at the
+                // same atomic.
+                HotTier::SlotRef ref{};
+                for (std::size_t k = i; k < j; ++k) {
+                    if (batch[k].key_id != kid) continue;
+                    if (batch[k].op == CommitEntry::Op::kPut
+                        && batch[k].hot_slot.valid) {
+                        ref = batch[k].hot_slot;
                         break;
                     }
                 }
-            }
 
-            // Step 3: fallback descending walk (alive-and-fp-match,
-            // seq tiebreaker). Triggered when (a) HotTier slot was
-            // cleared (kRemove won, or eviction post-PINNED), (b) fp32
-            // collision overwrote the slot, or (c) HotTier holds an
-            // off from a future batch.
-            if (winner == nullptr) {
-                for (std::size_t k = j; k > i; --k) {
-                    const CommitEntry& e = batch[k - 1];
-                    if (e.op == CommitEntry::Op::kRemove) {
+                // Step 2: HotTier-truth fast path (this key_id only).
+                if (ref.valid) {
+                    const auto view = hot_.read_slot(ref);
+                    if (view.fp != HotTier::kEmptyFp) {
+                        const auto d = decode(view.packed_off,
+                                              route_to_region_default(),
+                                              base_map_);
+                        const KVOffset canonical_off{
+                            static_cast<viper::block_size_t>(d.block_number),
+                            static_cast<viper::page_size_t>(d.page_number),
+                            static_cast<viper::data_offset_size_t>(
+                                d.data_offset)};
+                        for (std::size_t k = i; k < j; ++k) {
+                            if (batch[k].key_id != kid) continue;
+                            if (batch[k].op != CommitEntry::Op::kPut) continue;
+                            if (batch[k].off != canonical_off) continue;
+                            // Verify the slot still holds THIS exact key before
+                            // trusting the offset — catches a slot that was
+                            // freed and reused by another key, even one that
+                            // also collides on fp64.
+                            K stored_key;
+                            if (!viper_.hiom_get_slot_key(batch[k].off,
+                                                          &stored_key)) {
+                                continue;
+                            }
+                            if (key_id_of(stored_key) != kid) {
+                                continue;
+                            }
+                            winner = &batch[k];
+                            break;
+                        }
+                    }
+                }
+
+                // Step 3: fallback descending walk for THIS key_id
+                // (alive-and-key-match, seq tiebreaker).
+                if (winner == nullptr) {
+                    for (std::size_t k = j; k > i; --k) {
+                        const CommitEntry& e = batch[k - 1];
+                        if (e.key_id != kid) continue;
+                        if (e.op == CommitEntry::Op::kRemove) {
+                            winner = &e;
+                            break;
+                        }
+                        K stored_key;
+                        if (!viper_.hiom_get_slot_key(e.off, &stored_key)) {
+                            continue;  // freed
+                        }
+                        if (key_id_of(stored_key) != kid) {
+                            continue;  // slot reused by a different key
+                        }
                         winner = &e;
                         break;
                     }
-                    K stored_key;
-                    if (!viper_.hiom_get_slot_key(e.off, &stored_key)) {
-                        continue;  // freed
-                    }
-                    if (key_fingerprint64(stored_key) != e.fp64) {
-                        continue;  // slot reused by a different key
-                    }
-                    winner = &e;
-                    break;
                 }
-            }
 
-            if (winner != nullptr) {
-                if (winner->op == CommitEntry::Op::kPut) {
-                    puts.push_back({winner->fp64, winner->off});
-                } else {
-                    // kRemove: dispatch immediately. Single-key path
-                    // is fine — removes are rare relative to puts and
-                    // each one targets an existing chain entry, not
-                    // a clean slot, so a "bulk_remove" wouldn't
-                    // amortise much (no shared-bucket-header flip).
-                    cold_->remove(winner->fp64);
+                if (winner != nullptr) {
+                    if (winner->op == CommitEntry::Op::kPut) {
+                        puts.push_back({winner->fp64, winner->key_id,
+                                        winner->off});
+                    } else {
+                        // kRemove: dispatch immediately. Single-key path is
+                        // fine — removes are rare relative to puts and each
+                        // targets an existing chain entry, not a clean slot,
+                        // so a "bulk_remove" wouldn't amortise much (no
+                        // shared-bucket-header flip).
+                        cold_->remove(winner->fp64, winner->key_id);
+                    }
                 }
             }
             i = j;
@@ -2328,7 +2366,8 @@ class HiOM {
                 viper_.hiom_visit_records(lo, hi,
                     [this, &local](const K& key, const V& /*value*/,
                                    KVOffset off) {
-                        if (!cold_->upsert(key_fingerprint64(key), off)) {
+                        if (!cold_->upsert(key_fingerprint64(key),
+                                           key_id_of(key), off)) {
                             std::fprintf(stderr,
                                 "[HiOM FATAL] ColdTier overflow during "
                                 "recovery replay — index sizing too small\n");

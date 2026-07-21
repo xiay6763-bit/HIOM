@@ -1425,7 +1425,8 @@ int run_multi_producer_correctness() {
         }
 
         const auto fp = viper::hiom::key_fingerprint64(k);
-        const auto cold_off = hiom.cold_tier()->lookup(fp);
+        const auto cold_off = hiom.cold_tier()->lookup(fp,
+                                                       viper::hiom::key_id_of(k));
         if (!cold_off.has_value()) {
             ++cold_missing;
             continue;
@@ -1863,7 +1864,8 @@ int run_p0_update_heavy_multi_thread() {
                     if (leaked_odd < 5) {
                         const auto fp64 = viper::hiom::key_fingerprint64(k);
                         const auto fp32 = viper::hiom::key_fingerprint(k);
-                        const auto cold_off = hiom.cold_tier()->lookup(fp64);
+                        const auto cold_off = hiom.cold_tier()->lookup(
+                            fp64, viper::hiom::key_id_of(k));
                         const auto hot_packed = hiom.hot_tier().lookup(fp32);
                         std::cerr << "    leaked odd k=" << k
                                   << " thread=" << t << " idx=" << i

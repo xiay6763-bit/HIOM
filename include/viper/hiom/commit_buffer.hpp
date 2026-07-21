@@ -61,7 +61,14 @@ struct CommitEntry {
 
     Op op{Op::kPut};
     std::uint8_t pad0[7]{};       // align fp64 to 8 B; reserved
-    std::uint64_t fp64{0};
+    std::uint64_t fp64{0};        // routing/laning hash (region, lane)
+    // Full-key identity for the ColdTier match/dedup. Carried from the
+    // writer (which has the key) so the flusher can (a) partition an
+    // fp64 run by exact key — two distinct keys that collide on fp64 in
+    // the same batch each get their own ColdTier entry instead of one
+    // silently overwriting the other — and (b) target the right entry on
+    // kRemove without re-reading the (possibly already-freed) record.
+    std::uint64_t key_id{0};
     viper::KeyValueOffset off{};
     HotTier::SlotRef hot_slot{};  // unpin target after flush; valid==false skipped
     // Monotonic stamp packed as (client_local_seq << 16) | slot_idx,

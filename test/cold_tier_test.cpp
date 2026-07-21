@@ -71,6 +71,22 @@ std::uint64_t make_fp_r0(std::uint64_t i) {
     return fp;
 }
 
+// -- Full-key API shims ---------------------------------------------------
+// ColdTier now matches on a full-key `key_id` and routes on a separate fp64.
+// These whitebox tests predate that split and use one synthetic value per
+// key; pass it as BOTH the routing hash and the key_id, so each distinct
+// value stays a distinct key exactly as before. (run_fp_collision below
+// exercises the case they diverge: same route, different key_id.)
+bool cupsert(ColdTier& c, std::uint64_t fp, Offset off) {
+    return c.upsert(fp, fp, off);
+}
+std::optional<Offset> clookup(const ColdTier& c, std::uint64_t fp) {
+    return c.lookup(fp, fp);
+}
+bool cremove(ColdTier& c, std::uint64_t fp) {
+    return c.remove(fp, fp);
+}
+
 int run_correctness() {
     std::cout << "=== ColdTier correctness ===" << std::endl;
     cleanup();
@@ -78,12 +94,12 @@ int run_correctness() {
     constexpr std::size_t kN = 100'000;
     std::size_t inserted = 0, full = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        if (ct->upsert(make_fp(i), make_offset(i))) ++inserted;
+        if (cupsert(*ct,make_fp(i), make_offset(i))) ++inserted;
         else ++full;
     }
     std::size_t hits = 0, misses = 0, mismatches = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        auto v = ct->lookup(make_fp(i));
+        auto v = clookup(*ct,make_fp(i));
         if (!v) ++misses;
         else if (v->offset != make_offset(i).offset) ++mismatches;
         else ++hits;
@@ -104,11 +120,11 @@ int run_update() {
     cleanup();
     auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
     constexpr std::size_t kN = 1000;
-    for (std::size_t i = 0; i < kN; ++i) ct->upsert(make_fp(i), make_offset(i));
-    for (std::size_t i = 0; i < kN; ++i) ct->upsert(make_fp(i), make_offset(i + 100000));
+    for (std::size_t i = 0; i < kN; ++i) cupsert(*ct,make_fp(i), make_offset(i));
+    for (std::size_t i = 0; i < kN; ++i) cupsert(*ct,make_fp(i), make_offset(i + 100000));
     std::size_t bad = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        auto v = ct->lookup(make_fp(i));
+        auto v = clookup(*ct,make_fp(i));
         if (!v || v->offset != make_offset(i + 100000).offset) ++bad;
     }
     if (bad) { std::cerr << "  FAIL: " << bad << std::endl; return 1; }
@@ -120,19 +136,19 @@ int run_remove() {
     std::cout << "=== ColdTier remove + reactivate ===" << std::endl;
     cleanup();
     auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
-    for (std::size_t i = 0; i < 1000; ++i) ct->upsert(make_fp(i), make_offset(i));
-    for (std::size_t i = 0; i < 1000; i += 2) ct->remove(make_fp(i));
+    for (std::size_t i = 0; i < 1000; ++i) cupsert(*ct,make_fp(i), make_offset(i));
+    for (std::size_t i = 0; i < 1000; i += 2) cremove(*ct,make_fp(i));
     std::size_t bad = 0;
     for (std::size_t i = 0; i < 1000; ++i) {
-        auto v = ct->lookup(make_fp(i));
+        auto v = clookup(*ct,make_fp(i));
         const bool should = (i % 2 != 0);
         if (should != v.has_value()) ++bad;
     }
     if (bad) { std::cerr << "  FAIL after remove: " << bad << std::endl; return 1; }
-    for (std::size_t i = 0; i < 1000; i += 2) ct->upsert(make_fp(i), make_offset(i + 200000));
+    for (std::size_t i = 0; i < 1000; i += 2) cupsert(*ct,make_fp(i), make_offset(i + 200000));
     bad = 0;
     for (std::size_t i = 0; i < 1000; i += 2) {
-        auto v = ct->lookup(make_fp(i));
+        auto v = clookup(*ct,make_fp(i));
         if (!v || v->offset != make_offset(i + 200000).offset) ++bad;
     }
     if (bad) { std::cerr << "  FAIL after reactivate: " << bad << std::endl; return 1; }
@@ -146,12 +162,12 @@ int run_persistence() {
     constexpr std::size_t kN = 50'000;
     {
         auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
-        for (std::size_t i = 0; i < kN; ++i) ct->upsert(make_fp(i), make_offset(i));
+        for (std::size_t i = 0; i < kN; ++i) cupsert(*ct,make_fp(i), make_offset(i));
     }
     auto ct = ColdTier::open(kPoolFile);
     std::size_t hits = 0, misses = 0, mismatches = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        auto v = ct->lookup(make_fp(i));
+        auto v = clookup(*ct,make_fp(i));
         if (!v) ++misses;
         else if (v->offset != make_offset(i).offset) ++mismatches;
         else ++hits;
@@ -175,7 +191,7 @@ int run_overflow_chain() {
     constexpr std::size_t kN = 200'000;
     std::size_t ok = 0, fail = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        if (ct->upsert(make_fp(i), make_offset(i))) ++ok;
+        if (cupsert(*ct,make_fp(i), make_offset(i))) ++ok;
         else ++fail;
     }
     std::cout << "  inserted " << ok << " of " << kN
@@ -192,7 +208,7 @@ int run_overflow_chain() {
     }
     std::size_t bad = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        auto v = ct->lookup(make_fp(i));
+        auto v = clookup(*ct,make_fp(i));
         if (!v || v->offset != make_offset(i).offset) ++bad;
     }
     if (bad) {
@@ -217,7 +233,7 @@ int run_concurrent_stress() {
         ws.emplace_back([t, &ct, &failures]() {
             for (std::size_t i = 0; i < kPerThread; ++i) {
                 const std::uint64_t key = (t * kPerThread) + i + 1;
-                if (!ct->upsert(make_fp(key), make_offset(key))) {
+                if (!cupsert(*ct,make_fp(key), make_offset(key))) {
                     failures.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -232,7 +248,7 @@ int run_concurrent_stress() {
         rs.emplace_back([t, &ct, &miss, &bad]() {
             for (std::size_t i = 0; i < kPerThread; ++i) {
                 const std::uint64_t key = (t * kPerThread) + i + 1;
-                auto v = ct->lookup(make_fp(key));
+                auto v = clookup(*ct,make_fp(key));
                 if (!v) miss.fetch_add(1, std::memory_order_relaxed);
                 else if (v->offset != make_offset(key).offset)
                     bad.fetch_add(1, std::memory_order_relaxed);
@@ -257,7 +273,7 @@ int run_parallel_load() {
 
     constexpr std::size_t kN = 500'000;
     for (std::size_t i = 0; i < kN; ++i) {
-        ct->upsert(make_fp(i), make_offset(i));
+        cupsert(*ct,make_fp(i), make_offset(i));
     }
     std::cout << "  inserted " << kN << " entries (overflow used = "
               << ct->approx_overflow_used() << ")" << std::endl;
@@ -309,7 +325,7 @@ int run_m2_exit() {
     auto ti0 = std::chrono::steady_clock::now();
     std::size_t fails = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        if (!ct->upsert(make_fp(i), make_offset(i))) ++fails;
+        if (!cupsert(*ct,make_fp(i), make_offset(i))) ++fails;
     }
     auto ti1 = std::chrono::steady_clock::now();
     const double insert_sec = std::chrono::duration<double>(ti1 - ti0).count();
@@ -357,7 +373,7 @@ int run_bulk_upsert() {
         const std::size_t end = std::min(i + kBatch, kN);
         buf.clear();
         for (std::size_t k = i; k < end; ++k) {
-            buf.push_back({fps[k], make_offset(k)});
+            buf.push_back({fps[k], fps[k], make_offset(k)});
         }
         written += ct->bulk_upsert(buf);
     }
@@ -370,7 +386,7 @@ int run_bulk_upsert() {
     // Lookups: every entry must be findable with the same offset.
     std::size_t hits = 0, misses = 0, mismatches = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        auto v = ct->lookup(fps[i]);
+        auto v = clookup(*ct,fps[i]);
         if (!v) ++misses;
         else if (v->offset != make_offset(i).offset) ++mismatches;
         else ++hits;
@@ -386,13 +402,13 @@ int run_bulk_upsert() {
         const std::size_t end = std::min(i + kBatch, kN);
         buf.clear();
         for (std::size_t k = i; k < end; ++k) {
-            buf.push_back({fps[k], make_offset(k + kN)});
+            buf.push_back({fps[k], fps[k], make_offset(k + kN)});
         }
         ct->bulk_upsert(buf);
     }
     std::size_t bad = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        auto v = ct->lookup(fps[i]);
+        auto v = clookup(*ct,fps[i]);
         if (!v || v->offset != make_offset(i + kN).offset) ++bad;
     }
     if (bad) {
@@ -417,7 +433,7 @@ int run_microbench() {
     auto t0 = std::chrono::steady_clock::now();
     std::size_t inserted = 0;
     for (std::size_t i = 0; i < kN; ++i) {
-        if (ct->upsert(fps[i], make_offset(i))) ++inserted;
+        if (cupsert(*ct,fps[i], make_offset(i))) ++inserted;
     }
     auto t1 = std::chrono::steady_clock::now();
     const double ins_ns = static_cast<double>(
@@ -428,7 +444,7 @@ int run_microbench() {
     auto t2 = std::chrono::steady_clock::now();
     std::size_t acc = 0;
     for (std::size_t i = 0; i < kBenchIters; ++i) {
-        auto v = ct->lookup(fps[i & (fps.size() - 1)]);
+        auto v = clookup(*ct,fps[i & (fps.size() - 1)]);
         if (v) acc += v->offset;
     }
     auto t3 = std::chrono::steady_clock::now();
@@ -494,9 +510,9 @@ int run_pow2_rounding() {
     }
     // Sanity: inserts still land + are findable after rounding.
     for (std::uint64_t i = 1; i <= 1000; ++i)
-        if (!ct->upsert(make_fp(i), make_offset(i))) { rc = 1; break; }
+        if (!cupsert(*ct,make_fp(i), make_offset(i))) { rc = 1; break; }
     for (std::uint64_t i = 1; i <= 1000; ++i)
-        if (!ct->lookup(make_fp(i))) { std::cerr << "  FAIL: lost key\n"; rc = 1; break; }
+        if (!clookup(*ct,make_fp(i))) { std::cerr << "  FAIL: lost key\n"; rc = 1; break; }
     if (rc == 0) std::cout << "  PASS" << std::endl;
     return rc;
 }
@@ -517,7 +533,7 @@ int run_overflow_failure() {
     for (std::uint64_t i = 1; i <= 10000 && failed == 0; ++i) {
         const std::uint64_t fp = (make_fp(i) & 0x07FF'FFFF'FFFF'FFFFull) | 0ull;
         if (fp == 0) continue;
-        if (ct->upsert(fp, make_offset(i))) ++ok; else ++failed;
+        if (cupsert(*ct,fp, make_offset(i))) ++ok; else ++failed;
     }
     std::cout << "  inserted " << ok << " before first failure="
               << (failed > 0) << std::endl;
@@ -529,14 +545,14 @@ int run_overflow_failure() {
 #ifdef VIPER_COLD_FAULT_INJECT
 // 4C: precise crash-point injection. Arm a fault point, issue one upsert
 // that stops mid-write leaving PM torn, reopen the tier, and assert the
-// occupancy bit — not the fingerprint — governs visibility.
+// occupancy bit — not the stored key_id — governs visibility.
 int run_fault_injection() {
     std::cout << "=== ColdTier crash-point fault injection ===" << std::endl;
     int rc = 0;
 
     auto reopen_lookup = [](std::uint64_t fp) -> std::optional<Offset> {
         auto ct = ColdTier::open(kPoolFile);
-        return ct->lookup(fp);
+        return clookup(*ct,fp);
     };
 
     // --- Point 1: fp persisted, entry (offset) + occupancy not ---------
@@ -545,8 +561,8 @@ int run_fault_injection() {
         const std::uint64_t fp = make_fp_r0(1);
         {
             auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
-            ColdTier::arm_fault(ColdTier::FaultPoint::kAfterFpBeforeEntry);
-            ct->upsert(fp, make_offset(111));
+            ColdTier::arm_fault(ColdTier::FaultPoint::kAfterKeyIdBeforeEntry);
+            cupsert(*ct,fp, make_offset(111));
             ColdTier::disarm_fault();
         }
         if (reopen_lookup(fp).has_value()) {
@@ -561,7 +577,7 @@ int run_fault_injection() {
         {
             auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
             ColdTier::arm_fault(ColdTier::FaultPoint::kAfterEntryBeforeBit);
-            ct->upsert(fp, make_offset(222));
+            cupsert(*ct,fp, make_offset(222));
             ColdTier::disarm_fault();
         }
         if (reopen_lookup(fp).has_value()) {
@@ -571,7 +587,7 @@ int run_fault_injection() {
         // half-write and become visible with the correct offset.
         {
             auto ct = ColdTier::open(kPoolFile);
-            if (!ct->upsert(fp, make_offset(222))) { std::cerr << "  FAIL P2 replay upsert\n"; rc = 1; }
+            if (!cupsert(*ct,fp, make_offset(222))) { std::cerr << "  FAIL P2 replay upsert\n"; rc = 1; }
         }
         auto v = reopen_lookup(fp);
         if (!v || v->offset != make_offset(222).offset) {
@@ -585,7 +601,7 @@ int run_fault_injection() {
         const std::uint64_t fp = make_fp_r0(3);
         {
             auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
-            ct->upsert(fp, make_offset(333));  // full, no fault
+            cupsert(*ct,fp, make_offset(333));  // full, no fault
         }
         auto v = reopen_lookup(fp);
         if (!v || v->offset != make_offset(333).offset) {
@@ -605,9 +621,9 @@ int run_fault_injection() {
         }
         {
             auto ct = ColdTier::create(kPoolFile, /*main=*/1, /*overflow=*/16);
-            for (std::size_t k = 0; k < 7; ++k) ct->upsert(fps[k], make_offset(k));
+            for (std::size_t k = 0; k < 7; ++k) cupsert(*ct,fps[k], make_offset(k));
             ColdTier::arm_fault(ColdTier::FaultPoint::kAfterOverflowBeforeChain);
-            ct->upsert(fps[7], make_offset(7));  // extends, stops pre-chain
+            cupsert(*ct,fps[7], make_offset(7));  // extends, stops pre-chain
             ColdTier::disarm_fault();
         }
         if (reopen_lookup(fps[7]).has_value()) {
@@ -619,7 +635,7 @@ int run_fault_injection() {
                 std::cerr << "  FAIL P4: main-bucket entry " << k << " lost\n"; rc = 1;
             }
         // Replay the 8th -> chains the bucket -> becomes visible (P5).
-        { auto ct = ColdTier::open(kPoolFile); ct->upsert(fps[7], make_offset(7)); }
+        { auto ct = ColdTier::open(kPoolFile); cupsert(*ct,fps[7], make_offset(7)); }
         if (!reopen_lookup(fps[7]).has_value()) {
             std::cerr << "  FAIL P5: replay did not chain overflow bucket\n"; rc = 1;
         } else std::cout << "  P5 replay -> overflow chained + visible: OK\n";
@@ -631,13 +647,13 @@ int run_fault_injection() {
         const std::uint64_t fp = make_fp_r0(6);
         {
             auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
-            ct->upsert(fp, make_offset(600));
-            if (!ct->remove(fp)) { std::cerr << "  FAIL P6 remove\n"; rc = 1; }
+            cupsert(*ct,fp, make_offset(600));
+            if (!cremove(*ct,fp)) { std::cerr << "  FAIL P6 remove\n"; rc = 1; }
         }
         if (reopen_lookup(fp).has_value()) {
             std::cerr << "  FAIL P6: tombstoned key visible after reopen\n"; rc = 1;
         }
-        { auto ct = ColdTier::open(kPoolFile); ct->upsert(fp, make_offset(666)); }
+        { auto ct = ColdTier::open(kPoolFile); cupsert(*ct,fp, make_offset(666)); }
         auto v = reopen_lookup(fp);
         if (!v || v->offset != make_offset(666).offset) {
             std::cerr << "  FAIL P6: reinsert-after-tombstone not visible\n"; rc = 1;
@@ -648,6 +664,101 @@ int run_fault_injection() {
     return rc;
 }
 #endif  // VIPER_COLD_FAULT_INJECT
+
+// fp64-collision injection: distinct keys that COLLIDE on the routing hash
+// must not alias in the cold index. Natural fp64 collisions are infeasible to
+// construct, so we drive ColdTier directly with a shared routing value and
+// distinct key_ids — exactly the PM state an fp64 collision would produce —
+// and assert both keys coexist, survive an update/remove/bulk of the other,
+// and persist across reopen. This is the correctness experiment behind the
+// full-key discriminator (design/HIOM.md §2.3/§2.6).
+int run_fp_collision() {
+    std::cout << "=== ColdTier fp64-collision injection (full-key discriminator) ==="
+              << std::endl;
+    cleanup();
+    int rc = 0;
+    const std::uint64_t route = make_fp(0xC0111DEull);   // shared routing hash
+    const std::uint64_t kidA = 0xAAAA'0000'0000'0001ull;
+    const std::uint64_t kidB = 0xBBBB'0000'0000'0002ull;  // != kidA, SAME route
+
+    auto ct = ColdTier::create(kPoolFile, kSmallMain, kSmallOverflow);
+
+    // 1. Insert both with the SAME route, DIFFERENT key_id -> coexist.
+    ct->upsert(route, kidA, make_offset(1));
+    ct->upsert(route, kidB, make_offset(2));
+    auto a = ct->lookup(route, kidA);
+    auto b = ct->lookup(route, kidB);
+    if (!a || a->offset != make_offset(1).offset ||
+        !b || b->offset != make_offset(2).offset) {
+        std::cerr << "  FAIL: colliding keys did not coexist\n"; rc = 1;
+    } else std::cout << "  coexist under shared route: OK\n";
+
+    // 2. Update A -> B must be untouched (no aliasing overwrite).
+    ct->upsert(route, kidA, make_offset(11));
+    a = ct->lookup(route, kidA);
+    b = ct->lookup(route, kidB);
+    if (!a || a->offset != make_offset(11).offset ||
+        !b || b->offset != make_offset(2).offset) {
+        std::cerr << "  FAIL: update of one key disturbed the other\n"; rc = 1;
+    } else std::cout << "  update isolates keys: OK\n";
+
+    // 3. Remove A -> B must survive.
+    if (!ct->remove(route, kidA)) { std::cerr << "  FAIL: remove A\n"; rc = 1; }
+    a = ct->lookup(route, kidA);
+    b = ct->lookup(route, kidB);
+    if (a.has_value() || !b || b->offset != make_offset(2).offset) {
+        std::cerr << "  FAIL: remove disturbed the surviving key\n"; rc = 1;
+    } else std::cout << "  remove isolates keys: OK\n";
+
+    // 4. Many distinct keys on ONE route -> fill bucket + overflow chain,
+    //    all must remain individually addressable.
+    constexpr std::size_t kColl = 40;  // > kEntriesPerBucket (7) -> forces chain
+    for (std::size_t i = 0; i < kColl; ++i) {
+        const std::uint64_t kid = 0x5EED'0000'0000'0000ull + i + 1;
+        if (!ct->upsert(route, kid, make_offset(1000 + i))) {
+            std::cerr << "  FAIL: upsert colliding key " << i << "\n"; rc = 1;
+        }
+    }
+    std::size_t coll_ok = 0;
+    for (std::size_t i = 0; i < kColl; ++i) {
+        const std::uint64_t kid = 0x5EED'0000'0000'0000ull + i + 1;
+        auto v = ct->lookup(route, kid);
+        if (v && v->offset == make_offset(1000 + i).offset) ++coll_ok;
+    }
+    if (coll_ok != kColl) {
+        std::cerr << "  FAIL: " << (kColl - coll_ok) << "/" << kColl
+                  << " colliding keys lost\n"; rc = 1;
+    } else std::cout << "  " << kColl << " keys on one route stay distinct: OK\n";
+
+    // 5. bulk_upsert path: two colliding keys in ONE batch must both land
+    //    (this is where the flusher's per-key split is exercised too).
+    {
+        const std::uint64_t r2 = make_fp(0xB01Cull);
+        std::vector<ColdTier::BulkEntry> buf;
+        buf.push_back({r2, 0x1111'0000'0000'0001ull, make_offset(5001)});
+        buf.push_back({r2, 0x2222'0000'0000'0002ull, make_offset(5002)});
+        const std::size_t w = ct->bulk_upsert(buf);
+        auto x = ct->lookup(r2, 0x1111'0000'0000'0001ull);
+        auto y = ct->lookup(r2, 0x2222'0000'0000'0002ull);
+        if (w != 2 || !x || x->offset != make_offset(5001).offset ||
+            !y || y->offset != make_offset(5002).offset) {
+            std::cerr << "  FAIL: bulk_upsert coalesced colliding keys\n"; rc = 1;
+        } else std::cout << "  bulk_upsert keeps colliding keys distinct: OK\n";
+    }
+
+    // 6. Persistence: B must survive a close + reopen.
+    ct.reset();
+    {
+        auto ct2 = ColdTier::open(kPoolFile);
+        auto b2 = ct2->lookup(route, kidB);
+        if (!b2 || b2->offset != make_offset(2).offset) {
+            std::cerr << "  FAIL: colliding key lost across reopen\n"; rc = 1;
+        } else std::cout << "  survives reopen: OK\n";
+    }
+
+    if (rc == 0) std::cout << "  PASS" << std::endl;
+    return rc;
+}
 
 }  // namespace
 
@@ -666,6 +777,7 @@ int main() {
     rc |= run_sizing_for();
     rc |= run_pow2_rounding();
     rc |= run_overflow_failure();
+    rc |= run_fp_collision();
 #ifdef VIPER_COLD_FAULT_INJECT
     rc |= run_fault_injection();
 #endif
