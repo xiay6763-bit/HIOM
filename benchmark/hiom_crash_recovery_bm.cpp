@@ -745,7 +745,8 @@ int reopen_recover_verify(Shared* sh, std::size_t N, int nthreads,
             const auto bn = static_cast<std::uint64_t>(off.block_number);
             const bool cold_has =
                 cold_raw && cold_raw->lookup(
-                    viper::hiom::key_fingerprint64(make_key(id))).has_value();
+                    viper::hiom::key_fingerprint64(make_key(id)),
+                    viper::hiom::key_id_of(make_key(id))).has_value();
             if (cold_has) ++in_cold;
             const bool is_above = bn >= current_block;
             if (is_above) { ++above; above_blocks.insert(bn); }
@@ -893,6 +894,76 @@ int run_one_viper_clean(Shared* /*sh*/, int iter, std::size_t N, int nthreads,
         std::fprintf(stderr, "  GATE FAIL (clean restart should never lose): "
                      "lost=%llu mismatch=%llu\n",
                      (unsigned long long)lost, (unsigned long long)mismatch);
+    return pass ? 0 : 1;
+}
+
+// HiOM clean-restart (option a, apples-to-apples vs the Viper/Halo clean lines):
+// the child prefills N, DRAINS to durable (flush_and_wait + force_checkpoint ->
+// durable frontier == current block => unsafe suffix = 0), then gracefully
+// closes; the parent cold-reopens with the SAME reopen_recover_verify path as
+// the real-SIGKILL run. With suffix=0 the tail replay is empty, so recovery
+// collapses to HiOM's open floor (viper skip_recovery mmap + cold + checkpoint
+// open) — the fair "how fast does a cleanly-closed HiOM reopen" number, to sit
+// beside Viper's O(N) rebuild and Halo's O(N) snapshot restore. (The real crash
+// number stays the headline C3 claim; this is the matched-condition baseline.)
+int run_one_hiom_clean(Shared* sh, int iter, std::size_t N, int nthreads,
+                       std::size_t hot_buckets, Workload wl, std::FILE* csv) {
+    guarded_cleanup();
+    for (int t = 0; t < nthreads; ++t)
+        sh->completed[t].store(0, std::memory_order_relaxed);
+    sh->checkpoints.store(0, std::memory_order_relaxed);
+    sh->child_ready.store(0, std::memory_order_relaxed);
+    sh->prefill_top.store(0, std::memory_order_relaxed);
+
+    const pid_t pid = fork();
+    if (pid < 0) { std::perror("fork"); return 1; }
+    if (pid == 0) {
+        // Clean child: build HiOM, prefill [1,N], drain to durable, close.
+        auto viper_db = ViperT::create(kPoolDir, kPoolSize);
+        const auto sz = viper::hiom::ColdTier::sizing_for(N + N / 4 + 1);
+        auto cold = viper::hiom::ColdTier::create(kColdFile, sz.main_buckets,
+                                                  sz.overflow_slots);
+        auto chkpt = viper::hiom::Checkpoint::create(kChkptFile);
+        HiOMT::CheckpointConfig ccfg;
+        ccfg.cadence_entries = kCadence;
+        {
+            HiOMT hiom(*viper_db, hot_buckets, cold.get(),
+                       HiOMT::FlusherConfig{}, chkpt.get(), ccfg);
+            {
+                auto cl = hiom.get_client();
+                for (std::uint64_t k = 1; k <= N; ++k)
+                    if (!cl.put(make_key(k), make_val(k), /*assume_new=*/true))
+                        std::_Exit(3);
+            }
+            hiom.flush_and_wait();     // drain commit buffers -> ColdTier
+            hiom.force_checkpoint();   // durable frontier == current block
+        }                              // hiom destructs (final quiesce)
+        chkpt.reset();
+        cold.reset();
+        viper_db.reset();              // graceful close, pool marked clean
+        std::_Exit(0);
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) { std::perror("waitpid"); return 1; }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::fprintf(stderr, "  hiom clean-prefill failed (0x%x)\n", status);
+        return 1;
+    }
+
+    Row row{};
+    row.system = "hiomclean";
+    row.workload = "clean_restart";
+    row.iteration = iter;
+    row.kill_delay_ms = 0;
+    const int rc = reopen_recover_verify(sh, N, nthreads, hot_buckets, wl, row);
+    csv_row(csv, row);
+    const bool pass = (rc == 0 && row.lost == 0 && row.mismatch == 0);
+    std::printf("  iter %d [hiom/clean_restart] N=%zu reopen=%.1fms "
+                "(open=%.1f tail=%.1f suffix=%llu blk) recovered=%llu/%llu %s\n",
+                iter, N, row.total_recovery_ms, row.viper_open_ms,
+                row.tail_scan_ms, (unsigned long long)row.unsafe_suffix_blocks,
+                (unsigned long long)row.recovered, (unsigned long long)N,
+                pass ? "OK" : "GATE-FAIL");
     return pass ? 0 : 1;
 }
 
@@ -1048,12 +1119,20 @@ int main(int argc, char** argv) {
     // HiOM always uses real SIGKILL — that IS HiOM's crash-consistency claim.
     const bool viper_sigkill = env_size("HIOM_CR_VIPER_SIGKILL", 0) != 0;
     const bool viper_clean = (sys == System::kViper) && !viper_sigkill;
+    // HiOM matched-condition baseline (option a): HIOM_CR_HIOM_CLEAN=1 measures
+    // HiOM's clean-restart reopen (suffix=0 -> open floor only), the fair
+    // apples-to-apples line vs the Viper/Halo clean-restart lines. Default OFF:
+    // HiOM's headline C3 number is real SIGKILL.
+    const bool hiom_clean =
+        (sys == System::kHiom) && env_size("HIOM_CR_HIOM_CLEAN", 0) != 0;
 
     int failures = 0;
     for (int i = 0; i < iters; ++i) {
         const long d = delay(rng);
         if (viper_clean)
             failures += run_one_viper_clean(sh, i, N, nthreads, wl, csv);
+        else if (hiom_clean)
+            failures += run_one_hiom_clean(sh, i, N, nthreads, hot_buckets, wl, csv);
         else
             failures += run_one(sh, i, N, nthreads, hot_buckets, sys, wl, d, csv);
     }

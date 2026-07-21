@@ -161,7 +161,8 @@ void prefill(std::size_t N, std::uint64_t seed) {
         const std::uint64_t key = i + 1;
         vclient.put(key, rng());
         const auto off = vclient.hiom_peek_offset(key);
-        if (!cold->upsert(viper::hiom::key_fingerprint64(key), off)) {
+        if (!cold->upsert(viper::hiom::key_fingerprint64(key),
+                          viper::hiom::key_id_of(key), off)) {
             std::fprintf(stderr,
                 "\n[HiOM FATAL] ColdTier overflow at key %zu/%zu during "
                 "prefill — index sizing too small\n", i, N);
